@@ -97,7 +97,7 @@ for rejected_fixture in disabled missing malformed api-failure; do
   fi
 done
 
-if PATH="$work/bin:$PATH" SB_GH_ARGS_LOG="$immutable_args" \
+if PATH="$work/bin:$PATH" GITHUB_REPOSITORY='' SB_GH_ARGS_LOG="$immutable_args" \
   bash "$immutable_check" >/dev/null 2>&1; then
   echo 'immutable release preflight accepted an empty repository name' >&2
   exit 1
