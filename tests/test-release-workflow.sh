@@ -5,12 +5,14 @@ cd "$(dirname "$0")/.."
 
 workflow=".github/workflows/ci-release.yml"
 verifier="tools/verify-release-assets.jq"
+immutable_check="tools/check-immutable-release-setting.sh"
 work="$(mktemp -d)"
 cleanup() { rm -rf -- "$work"; }
 trap cleanup EXIT
 
 [[ -f "$workflow" && ! -L "$workflow" ]]
 [[ -f "$verifier" && ! -L "$verifier" ]]
+[[ -f "$immutable_check" && ! -L "$immutable_check" ]]
 
 if grep -Fq -- '--clobber' "$workflow"; then
   echo 'published release assets must never be overwritten' >&2
@@ -26,6 +28,7 @@ release_verify_contract="gh release view \"${literal_dollar}tag\" --json tagName
 release_filter_contract='-f tools/verify-release-assets.jq'
 release_publish_contract="gh release edit \"${literal_dollar}tag\" --draft=false --latest"
 release_delete_contract="gh release delete \"${literal_dollar}tag\" --yes"
+immutable_check_contract="bash tools/check-immutable-release-setting.sh \"${literal_dollar}GITHUB_REPOSITORY\""
 
 for release_contract in \
   "$release_view_contract" \
@@ -34,7 +37,8 @@ for release_contract in \
   "$release_upload_contract" \
   "$release_verify_contract" \
   "$release_filter_contract" \
-  "$release_publish_contract"; do
+  "$release_publish_contract" \
+  "$immutable_check_contract"; do
   grep -Fq -- "$release_contract" "$workflow" || {
     printf 'immutable release workflow contract is missing: %s\n' "$release_contract" >&2
     exit 1
@@ -42,12 +46,14 @@ for release_contract in \
 done
 
 release_create_line="$(grep -nF "$release_create_contract" "$workflow" | cut -d: -f1)"
+immutable_check_line="$(grep -nF "$immutable_check_contract" "$workflow" | cut -d: -f1)"
 release_upload_line="$(grep -nF "$release_upload_contract" "$workflow" | cut -d: -f1)"
 release_verify_line="$(grep -nF "$release_verify_contract" "$workflow" | cut -d: -f1)"
 release_publish_line="$(grep -nF "$release_publish_contract" "$workflow" | cut -d: -f1)"
-[[ "$release_create_line" =~ ^[0-9]+$ && "$release_upload_line" =~ ^[0-9]+$ &&
+[[ "$immutable_check_line" =~ ^[0-9]+$ && "$release_create_line" =~ ^[0-9]+$ && "$release_upload_line" =~ ^[0-9]+$ &&
    "$release_verify_line" =~ ^[0-9]+$ && "$release_publish_line" =~ ^[0-9]+$ ]]
-((release_create_line < release_upload_line &&
+((immutable_check_line < release_create_line &&
+  release_create_line < release_upload_line &&
   release_upload_line < release_verify_line &&
   release_verify_line < release_publish_line)) || {
   echo 'release workflow must create a draft, upload, verify, then publish' >&2
@@ -56,6 +62,46 @@ release_publish_line="$(grep -nF "$release_publish_contract" "$workflow" | cut -
 
 grep -Fq "$release_delete_contract" "$workflow"
 grep -Fq 'release_published=yes' "$workflow"
+
+mkdir -p "$work/bin"
+cat > "$work/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s\n' "$*" > "$SB_GH_ARGS_LOG"
+case "${SB_IMMUTABLE_FIXTURE:-enabled}" in
+  enabled) printf '%s\n' '{"enabled":true}' ;;
+  disabled) printf '%s\n' '{"enabled":false}' ;;
+  missing) printf '%s\n' '{"status":"available"}' ;;
+  malformed) printf '%s\n' 'not-json' ;;
+  api-failure) exit 1 ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod 700 "$work/bin/gh"
+
+immutable_args="$work/immutable-args"
+PATH="$work/bin:$PATH" \
+  GITHUB_REPOSITORY='DTB201/sb-user-manager-public' \
+  SB_GH_ARGS_LOG="$immutable_args" \
+  bash "$immutable_check" >/dev/null
+grep -Fxq 'api --method GET repos/DTB201/sb-user-manager-public/immutable-releases' "$immutable_args"
+
+for rejected_fixture in disabled missing malformed api-failure; do
+  if PATH="$work/bin:$PATH" \
+    GITHUB_REPOSITORY='DTB201/sb-user-manager-public' \
+    SB_GH_ARGS_LOG="$immutable_args" \
+    SB_IMMUTABLE_FIXTURE="$rejected_fixture" \
+    bash "$immutable_check" >/dev/null 2>&1; then
+    printf 'immutable release preflight accepted fixture: %s\n' "$rejected_fixture" >&2
+    exit 1
+  fi
+done
+
+if PATH="$work/bin:$PATH" SB_GH_ARGS_LOG="$immutable_args" \
+  bash "$immutable_check" >/dev/null 2>&1; then
+  echo 'immutable release preflight accepted an empty repository name' >&2
+  exit 1
+fi
 
 manager_digest='sha256:1111111111111111111111111111111111111111111111111111111111111111'
 checksum_digest='sha256:2222222222222222222222222222222222222222222222222222222222222222'
