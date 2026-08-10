@@ -1,6 +1,6 @@
 # 公开仓库迁移准备
 
-本文是把 v4 后续维护迁移到受保护公开仓库的操作边界。它不构成公开授权，也不允许修改当前仓库可见性、改名、创建公开仓库或发布版本。长期决定见 [ADR 0028](DECISIONS/0028-clean-public-repository-transition.md)。
+本文是把 v4 后续维护迁移到受保护公开仓库的操作边界和回退清单。项目所有者已批准执行；公开仓库已由干净快照建立并通过公开 PR 与 `main` CI，当前进入首个公开 Release 和正式名称切换阶段。长期决定见 [ADR 0028](DECISIONS/0028-clean-public-repository-transition.md)。
 
 ## 当前审计基线
 
