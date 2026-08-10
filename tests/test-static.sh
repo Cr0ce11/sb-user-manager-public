@@ -57,7 +57,7 @@ grep -Fq "## $version " CHANGELOG.md
 grep -Fxq 'SCRIPT_EDITION_LABEL="公开版"' sb-user-manager.sh
 grep -Fq 'PORT_MIN=20001' sb-user-manager.sh
 grep -Fq 'PORT_MAX=30000' sb-user-manager.sh
-grep -Fq 'MANAGER_REPOSITORY="DTB201/sb-user-manager"' sb-user-manager.sh
+grep -Fq 'MANAGER_REPOSITORY="DTB201/sb-user-manager-public"' sb-user-manager.sh
 grep -Fq 'SINGBOX_REPOSITORY="SagerNet/sing-box"' sb-user-manager.sh
 grep -Fq 'validate_runtime_config_file()' sb-user-manager.sh
 grep -Fq 'parse_runtime_config()' sb-user-manager.sh

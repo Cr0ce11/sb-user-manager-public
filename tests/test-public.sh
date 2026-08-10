@@ -11,7 +11,7 @@ bash "$ROOT/tools/build-manager.sh" --check
 bash -n "$ROOT/sb-user-manager.sh"
 
 grep -Fxq 'SCRIPT_EDITION_LABEL="公开版"' "$ROOT/sb-user-manager.sh"
-grep -Fxq 'MANAGER_REPOSITORY="DTB201/sb-user-manager"' "$ROOT/sb-user-manager.sh"
+grep -Fxq 'MANAGER_REPOSITORY="DTB201/sb-user-manager-public"' "$ROOT/sb-user-manager.sh"
 grep -Fxq 'MANAGER_ASSET="sb-user-manager.sh"' "$ROOT/sb-user-manager.sh"
 for forbidden in \
   'SCRIPT_EDITION_LABEL="私有版"' \
@@ -52,7 +52,7 @@ chmod 600 "$legacy_config"
       tag_name:"v9.9.9",
       assets:[{
         name:"sb-user-manager.sh",
-        browser_download_url:"https://github.com/DTB201/sb-user-manager/releases/download/v9.9.9/sb-user-manager.sh",
+        browser_download_url:"https://github.com/DTB201/sb-user-manager-public/releases/download/v9.9.9/sb-user-manager.sh",
         digest:$digest
       }]
     }'
@@ -60,7 +60,7 @@ chmod 600 "$legacy_config"
   export GITHUB_TOKEN=must-not-enter-curl
   fetch_latest_manager_release
   [[ "$LATEST_MANAGER_VERSION" == 9.9.9 ]]
-  [[ "$LATEST_MANAGER_URL" == https://github.com/DTB201/sb-user-manager/releases/download/v9.9.9/sb-user-manager.sh ]]
+  [[ "$LATEST_MANAGER_URL" == https://github.com/DTB201/sb-user-manager-public/releases/download/v9.9.9/sb-user-manager.sh ]]
   [[ "$LATEST_MANAGER_SHA256" == "$(printf 'a%.0s' {1..64})" ]]
   if tr '\0' '\n' < "$curl_args" | grep -Fq must-not-enter-curl; then
     echo '匿名更新请求不应包含旧 GitHub Token' >&2
@@ -70,7 +70,7 @@ chmod 600 "$legacy_config"
     echo '匿名更新请求不应包含 Authorization 头' >&2
     exit 1
   fi
-  grep -Fxq 'https://api.github.com/repos/DTB201/sb-user-manager/releases/latest' \
+  grep -Fxq 'https://api.github.com/repos/DTB201/sb-user-manager-public/releases/latest' \
     < <(tr '\0' '\n' < "$curl_args")
 )
 

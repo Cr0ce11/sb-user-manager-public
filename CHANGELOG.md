@@ -8,8 +8,12 @@
 
 ## Unreleased
 
-- 为全新公开仓库准备 MIT 许可的单一源码快照：管理脚本通过公开 GitHub Release 匿名更新，旧配置中的 `GITHUB_TOKEN` 只做兼容解析后丢弃，不再保存、提示或发送令牌。
-- CI、验收和不可变 Release 收敛为唯一的 `sb-user-manager.sh` 及其 SHA-256；新增公开策略审计和确定性快照导出门禁。本项不创建公开仓库、不改变现有仓库可见性，也不发布新版本；由 [Issue #250](https://github.com/DTB201/sb-user-manager/issues/250) 与 [Issue #252](https://github.com/DTB201/sb-user-manager/issues/252) 跟踪。
+## 4.23.1 - 2026-08-11
+
+- 项目以经过审计的干净快照建立受保护公开仓库 `DTB201/sb-user-manager-public`，采用 MIT License；原私有仓库 `DTB201/sb-user-manager` 保持私有和原名，继续保存完整历史及私有版、分享版双版本。
+- 公开版管理脚本固定通过公开仓库的 GitHub Release 匿名更新；旧配置中的 `GITHUB_TOKEN` 只做兼容解析后丢弃，不再保存、提示或发送令牌。
+- 新版本先在公开仓库通过完整本地门禁和公开 CI，再把同版本变更同步提交到私有仓库；公开 Release 只包含脚本和 SHA-256，私有 Release 继续保留双版本及两份摘要。
+- 本版本不改变菜单结构、状态 schema、迁移加密格式、事务顺序或已部署服务器业务行为；不可变 v4.23.0 Release 继续作为代码回退版本。
 
 ## 4.23.0 - 2026-08-09
 

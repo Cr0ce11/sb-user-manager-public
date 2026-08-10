@@ -11,7 +11,7 @@ umask 077
 PROGRAM="sb-user-manager"
 CONF_FILE="${SB_USER_CONF:-/etc/sb-user-manager.conf}"
 SELF_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
-SCRIPT_VERSION="4.23.0"
+SCRIPT_VERSION="4.23.1"
 SCRIPT_EDITION_LABEL="公开版"
 STATE_SCHEMA_VERSION=5
 MIGRATION_FORMAT_VERSION=1
@@ -25,7 +25,7 @@ ENVIRONMENT_LOCK_FILE="${SB_ENVIRONMENT_LOCK_FILE:-/run/lock/sb-user-manager-env
 ENVIRONMENT_BACKUP_PERMISSION_MARKER="${SB_ENVIRONMENT_BACKUP_PERMISSION_MARKER:-/var/lib/sb-user-manager/environment-backup-permissions-v1}"
 BACKUP_RETENTION_MIGRATION_MARKER="${SB_BACKUP_RETENTION_MIGRATION_MARKER:-/var/lib/sb-user-manager/backup-retention-v1}"
 SHARED_PRESET_RUNTIME_MARKER="${SB_SHARED_PRESET_RUNTIME_MARKER:-/var/lib/sb-user-manager/shared-preset-runtime-v2}"
-MANAGER_REPOSITORY="DTB201/sb-user-manager"
+MANAGER_REPOSITORY="DTB201/sb-user-manager-public"
 MANAGER_ASSET="sb-user-manager.sh"
 # 公开版使用固定仓库和资产名匿名检查自身更新。
 : "$MANAGER_REPOSITORY" "$MANAGER_ASSET"
