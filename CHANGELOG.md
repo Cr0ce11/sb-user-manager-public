@@ -8,7 +8,7 @@
 
 ## Unreleased
 
-## 4.23.1 - 2026-08-10
+## 4.23.1 - 2026-08-11
 
 - 项目以经过审计的干净快照建立受保护公开仓库 `DTB201/sb-user-manager-public`，采用 MIT License；原私有仓库 `DTB201/sb-user-manager` 保持私有和原名，继续保存完整历史及私有版、分享版双版本。
 - 公开版管理脚本固定通过公开仓库的 GitHub Release 匿名更新；旧配置中的 `GITHUB_TOKEN` 只做兼容解析后丢弃，不再保存、提示或发送令牌。
