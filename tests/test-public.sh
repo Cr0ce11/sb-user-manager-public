@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 每组 source 都必须在独立子进程中运行，环境修改不应跨用例保留。
+# shellcheck disable=SC2030,SC2031
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -60,8 +62,14 @@ chmod 600 "$legacy_config"
   [[ "$LATEST_MANAGER_VERSION" == 9.9.9 ]]
   [[ "$LATEST_MANAGER_URL" == https://github.com/DTB201/sb-user-manager/releases/download/v9.9.9/sb-user-manager.sh ]]
   [[ "$LATEST_MANAGER_SHA256" == "$(printf 'a%.0s' {1..64})" ]]
-  ! tr '\0' '\n' < "$curl_args" | grep -Fq must-not-enter-curl
-  ! tr '\0' '\n' < "$curl_args" | grep -Fq Authorization:
+  if tr '\0' '\n' < "$curl_args" | grep -Fq must-not-enter-curl; then
+    echo '匿名更新请求不应包含旧 GitHub Token' >&2
+    exit 1
+  fi
+  if tr '\0' '\n' < "$curl_args" | grep -Fq Authorization:; then
+    echo '匿名更新请求不应包含 Authorization 头' >&2
+    exit 1
+  fi
   grep -Fxq 'https://api.github.com/repos/DTB201/sb-user-manager/releases/latest' \
     < <(tr '\0' '\n' < "$curl_args")
 )
