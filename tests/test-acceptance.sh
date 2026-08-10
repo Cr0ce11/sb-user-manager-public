@@ -68,7 +68,7 @@ cat > "$work/manager.sh" <<'EOF'
 set -Eeuo pipefail
 SCRIPT_VERSION="9.9.9"
 SCRIPT_EDITION_LABEL="公开版"
-MANAGER_REPOSITORY="DTB201/sb-user-manager"
+MANAGER_REPOSITORY="DTB201/sb-user-manager-public"
 MANAGER_ASSET="sb-user-manager.sh"
 STATE_SCHEMA_VERSION=3
 CONF_FILE="$FAKE_ROOT/manager.conf"
@@ -110,7 +110,7 @@ cp "$work/manager.sh" "$work/release-asset.sh"
 release_digest="$(sha256sum "$work/release-asset.sh" | awk '{print $1}')"
 jq -n --arg digest "sha256:${release_digest}" '
   {tag_name:"v9.9.9",draft:false,prerelease:false,
-   assets:[{name:"sb-user-manager.sh",browser_download_url:"https://github.com/DTB201/sb-user-manager/releases/download/v9.9.9/sb-user-manager.sh",digest:$digest}]}
+   assets:[{name:"sb-user-manager.sh",browser_download_url:"https://github.com/DTB201/sb-user-manager-public/releases/download/v9.9.9/sb-user-manager.sh",digest:$digest}]}
 ' > "$work/release.json"
 
 if ! PATH="$work/bin:$PATH" \
