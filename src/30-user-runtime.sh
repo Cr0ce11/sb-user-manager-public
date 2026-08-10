@@ -1,0 +1,1497 @@
+
+check_singbox_and_restart() {
+  ensure_safe_ssh_for_singbox_restart rollback || return 1
+  "$SINGBOX_BIN" check -c "$SINGBOX_CONFIG" || return 1
+  systemctl reset-failed "$SINGBOX_SERVICE" 2>/dev/null || true
+  systemctl restart "$SINGBOX_SERVICE" || return 1
+  if ! systemctl is-active --quiet "$SINGBOX_SERVICE"; then
+    log "错误：sing-box 重启后未处于 active 状态"
+    return 1
+  fi
+}
+
+user_exists() {
+  jq -e --arg name "$1" '.users[] | select(.name == $name)' "$STATE_FILE" >/dev/null
+}
+
+port_in_state() {
+  jq -e --argjson port "$1" '.users[] | (if (.endpoints | type) == "array" then .endpoints[] else {port:.port} end) | select(.port == $port)' "$STATE_FILE" >/dev/null
+}
+
+tag_exists_in_config() {
+  local tag="$1"
+  "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" |
+    jq -e --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' >/dev/null
+}
+
+nfuse_account_exists() {
+  nfuse list --json 2>/dev/null | jq -e --arg name "$1" '.[] | select(.name == $name)' >/dev/null
+}
+
+nfuse_port_exists() {
+  nfuse list --json 2>/dev/null | jq -e --argjson port "$1" \
+    '.[] | .ports[]? | select(.start <= $port and .end >= $port)' >/dev/null
+}
+
+generate_ss_password() {
+  case "$1" in
+    2022-blake3-aes-128-gcm)
+      "$SINGBOX_BIN" generate rand --base64 16
+      ;;
+    2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305)
+      "$SINGBOX_BIN" generate rand --base64 32
+      ;;
+    *)
+      die "脚本只支持 Shadowsocks 2022 方法，当前：$1"
+      ;;
+  esac
+}
+
+generate_st_password() {
+  "$SINGBOX_BIN" generate rand --base64 32
+}
+
+make_user_inbounds() {
+  local name="$1" port="$2" st_password="$3" ss_password="$4" method="$5" shadowtls_sni="$6"
+  SB_JQ_ST_PASSWORD="$st_password" SB_JQ_SS_PASSWORD="$ss_password" jq -n \
+    --arg name "$name" \
+    --argjson port "$port" \
+    --arg method "$method" \
+    --arg hs_server "$shadowtls_sni" \
+    --argjson hs_port "$HANDSHAKE_PORT" \
+    --argjson strict "$SHADOWTLS_STRICT_MODE" \
+    '[
+      {
+        "type": "shadowtls",
+        "tag": ("st-" + $name),
+        "listen": "::",
+        "listen_port": $port,
+        "version": 3,
+        "users": [
+          {
+            "name": $name,
+            "password": $ENV.SB_JQ_ST_PASSWORD
+          }
+        ],
+        "handshake": {
+          "server": $hs_server,
+          "server_port": $hs_port
+        },
+        "strict_mode": $strict,
+        "detour": ("ss-" + $name)
+      },
+      {
+        "type": "shadowsocks",
+        "tag": ("ss-" + $name),
+        "network": "tcp",
+        "method": $method,
+        "password": $ENV.SB_JQ_SS_PASSWORD
+      },
+      {
+        "type": "shadowsocks",
+        "tag": ("ss-udp-" + $name),
+        "listen": "::",
+        "listen_port": $port,
+        "network": "udp",
+        "method": $method,
+        "password": $ENV.SB_JQ_SS_PASSWORD
+      }
+    ]'
+}
+
+rewrite_singbox_config() {
+  local filter="$1" config_dir tmp normalized
+  shift
+  config_dir="$(dirname "$SINGBOX_CONFIG")"
+  tmp="$(mktemp "$config_dir/.config.XXXXXX")" || return 1
+  register_temp_path "$tmp"
+  normalized="$(mktemp "$config_dir/.normalized.XXXXXX")" || {
+    rm -f -- "$tmp"
+    return 1
+  }
+  register_temp_path "$normalized"
+  if ! "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" > "$normalized"; then
+    rm -f -- "$tmp" "$normalized"
+    printf '错误：无法解析或格式化 sing-box 配置：%s\n' "$SINGBOX_CONFIG" >&2
+    return 1
+  fi
+  if ! jq "$@" "$filter" "$normalized" > "$tmp"; then
+    rm -f -- "$tmp" "$normalized"
+    printf '错误：无法生成新的 sing-box 配置\n' >&2
+    return 1
+  fi
+  rm -f -- "$normalized"
+  if ! chmod --reference="$SINGBOX_CONFIG" "$tmp" 2>/dev/null; then
+    if ! chmod 600 "$tmp"; then
+      rm -f -- "$tmp"
+      return 1
+    fi
+  fi
+  chown --reference="$SINGBOX_CONFIG" "$tmp" 2>/dev/null || true
+  if ! mv -- "$tmp" "$SINGBOX_CONFIG"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+append_inbounds() {
+  local fragment="$1"
+  SB_JQ_NEW_INBOUNDS="$fragment" rewrite_singbox_config \
+    '($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_inbounds |
+     .inbounds = ((.inbounds // []) + $new_inbounds)'
+}
+
+remove_user_inbounds() {
+  local name="$1"
+  rewrite_singbox_config \
+    '.inbounds = [(.inbounds // [])[] | select(.tag != $st and .tag != $ss and .tag != $ss_udp and .tag != $at and .tag != $sn)]' \
+    --arg st "st-$name" --arg ss "ss-$name" --arg ss_udp "ss-udp-$name" --arg at "anytls-$name" --arg sn "snell-$name"
+}
+
+replace_user_inbounds() {
+  local name="$1" fragment="$2"
+  SB_JQ_NEW_INBOUNDS="$fragment" rewrite_singbox_config \
+     '($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_inbounds |
+     .inbounds = ([((.inbounds // [])[]) | select(.tag != $st and .tag != $ss and .tag != $ss_udp and .tag != $at and .tag != $sn)] + $new_inbounds)' \
+    --arg st "st-$name" --arg ss "ss-$name" --arg ss_udp "ss-udp-$name" --arg at "anytls-$name" --arg sn "snell-$name"
+}
+
+rebuild_protocol_inbounds() {
+  local protocol="$1" row name status endpoint fragment fragments='[]' managed_tags_json='[]'
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    name="$(jq -er '.name' <<<"$row")" || return 1
+    status="$(jq -er '.status' <<<"$row")" || return 1
+    endpoint="$(jq -ec '.endpoint' <<<"$row")" || return 1
+    if [[ "$protocol" == anytls ]]; then
+      managed_tags_json="$(jq -c --arg tag "anytls-$name" '. + [$tag]' <<<"$managed_tags_json")" || return 1
+    else
+      managed_tags_json="$(jq -c --arg st "st-$name" --arg ss "ss-$name" --arg ss_udp "ss-udp-$name" --arg sn "snell-$name" '. + [$st,$ss,$ss_udp,$sn]' <<<"$managed_tags_json")" || return 1
+    fi
+    if [[ "$status" == active ]]; then
+      fragment="$(make_endpoint_inbounds_from_state "$name" "$endpoint")" || return 1
+      fragments="$(SB_JQ_CURRENT="$fragments" SB_JQ_ADDED="$fragment" jq -cn '($ENV.SB_JQ_CURRENT | fromjson) as $current | ($ENV.SB_JQ_ADDED | fromjson) as $added | $current + $added')" || return 1
+    fi
+  done < <(jq -c --arg protocol "$protocol" '
+    .users[] as $user |
+    (if ($user.endpoints | type) == "array" then $user.endpoints[]
+     elif ($user.protocol // "ss2022") == "anytls" then
+       {protocol:"anytls",port:$user.port,anytls_password:$user.anytls_password,tls_sni:$user.tls_sni}
+     else
+       {protocol:"ss2022",port:$user.port,shadowtls_password:$user.shadowtls_password,
+        ss2022_password:$user.ss2022_password,method:$user.method,shadowtls_sni:$user.shadowtls_sni}
+     end) |
+    select(.protocol == $protocol) | {name:$user.name,status:$user.status,endpoint:.}
+  ' "$STATE_FILE")
+  SB_JQ_NEW_INBOUNDS="$fragments" rewrite_singbox_config '
+    ($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_inbounds |
+    .inbounds = ([((.inbounds // [])[]) |
+      .tag as $tag | select(($managed_tags | index($tag)) == null)] + $new_inbounds)
+  ' --argjson managed_tags "$managed_tags_json"
+}
+
+ss2022_udp_inbounds_are_current() {
+  local split rows user user_status rule_tag inbound
+  jq -e --slurpfile config "$SINGBOX_CONFIG" '
+    .users as $users |
+    all($users[]?;
+        . as $user |
+        ([if (.endpoints | type) == "array" then .endpoints[]
+          elif (.protocol // "ss2022") == "ss2022" then
+            {protocol:"ss2022",port:.port,ss2022_password:.ss2022_password,method:.method}
+          else empty end | select(.protocol == "ss2022")] | first) as $endpoint |
+        if $endpoint != null and .status == "active" then
+          any($config[0].inbounds[]?;
+            .tag == ("ss-udp-" + $user.name) and
+            .type == "shadowsocks" and
+            .listen_port == $endpoint.port and
+            .network == "udp" and
+            .method == $endpoint.method and
+            .password == $endpoint.ss2022_password)
+        elif $endpoint != null then
+          all($config[0].inbounds[]?; .tag != ("ss-udp-" + $user.name))
+        else true end)
+  ' "$STATE_FILE" >/dev/null || return 1
+  rows="$(jq -c '.splits[]? | select(.status == "active" and .scope == "user")' "$STATE_FILE")" || return 1
+  while IFS= read -r split; do
+    [[ -n "$split" ]] || continue
+    user="$(jq -r '.user' <<<"$split")" || return 1
+    user_status="$(jq -r --arg name "$user" 'first(.users[]? | select(.name == $name) | .status) // "missing"' "$STATE_FILE")" || return 1
+    [[ "$user_status" == active ]] || continue
+    jq -e --arg name "$user" '.users[]? | select(.name == $name) |
+      if (.endpoints | type) == "array" then any(.endpoints[]; .protocol == "ss2022")
+      else (.protocol // "ss2022") == "ss2022" end' "$STATE_FILE" >/dev/null || continue
+    rule_tag="$(split_runtime_rule_tag_from_json "$split")" || return 1
+    inbound="ss-udp-$user"
+    jq -e --arg rule "$rule_tag" --arg inbound "$inbound" '
+      any(.route.rules[]?; .rule_set == $rule and ((.inbound // []) | index($inbound)))
+    ' "$SINGBOX_CONFIG" >/dev/null || return 1
+  done <<<"$rows"
+}
+
+migrate_legacy_ss2022_udp_inbounds() {
+  [[ -r "$CONF_FILE" ]] || return 0
+  command -v jq >/dev/null || return 0
+  command -v flock >/dev/null || return 0
+  load_runtime_config || return 1
+  [[ -f "$STATE_FILE" && -f "$SINGBOX_CONFIG" && -x "$SINGBOX_BIN" && -x "$NFUSE_BIN" && -S "$NFUSE_SOCKET" ]] || return 0
+  ss2022_udp_inbounds_are_current && return 0
+
+  exec 9>"$LOCK_FILE" || return 1
+  if ! flock -n 9; then
+    release_operation_lock
+    return 1
+  fi
+  if ! recover_pending_transaction || ! init_state; then
+    release_operation_lock
+    return 1
+  fi
+  if ss2022_udp_inbounds_are_current; then
+    release_operation_lock
+    return 0
+  fi
+  if ! ensure_safe_ssh_for_singbox_restart; then
+    release_operation_lock
+    return 0
+  fi
+  if ! start_managed_operation migrate-ss2022-udp; then
+    release_operation_lock
+    return 1
+  fi
+  if ! run_managed_step rebuild_protocol_inbounds ss2022 ||
+     ! run_managed_step rebuild_all_split_configs ||
+     ! run_managed_step check_singbox_and_restart ||
+     ! finish_managed_operation; then
+    release_operation_lock
+    return 1
+  fi
+  log "已为旧版 SS2022 + ShadowTLS 用户启用同端口 UDP 支持"
+  release_operation_lock
+}
+
+make_anytls_inbound() {
+  local name="$1" port="$2" password="$3"
+  SB_JQ_PASSWORD="$password" jq -n --arg name "$name" --argjson port "$port" \
+    '[{"type":"anytls","tag":("anytls-" + $name),"listen":"::","listen_port":$port,"users":[{"name":$name,"password":$ENV.SB_JQ_PASSWORD}],"tls":{"enabled":true,"certificate_path":"/etc/sing-box/cert/anytls.crt","key_path":"/etc/sing-box/cert/anytls.key"}}]'
+}
+
+make_endpoint_inbounds_from_state() {
+  local name="$1" endpoint="$2" port protocol anytls_password st_password ss_password method shadowtls_sni
+  port="$(jq -er '.port | select(type == "number")' <<<"$endpoint")" || return 1
+  protocol="$(jq -er '.protocol | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
+  if [[ "$protocol" == anytls ]]; then
+    anytls_password="$(jq -er '.anytls_password | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
+    make_anytls_inbound "$name" "$port" "$anytls_password"
+  elif [[ "$protocol" == ss2022 ]]; then
+    st_password="$(jq -er '.shadowtls_password | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
+    ss_password="$(jq -er '.ss2022_password | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
+    method="$(jq -er '.method | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
+    shadowtls_sni="$(jq -er '.shadowtls_sni | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
+    make_user_inbounds \
+      "$name" \
+      "$port" \
+      "$st_password" \
+      "$ss_password" \
+      "$method" \
+      "$shadowtls_sni"
+  else
+    return 1
+  fi
+}
+
+make_user_inbounds_from_state() {
+  local user="$1" name endpoint fragment fragments='[]' count=0
+  name="$(jq -er '.name | select(type == "string" and length > 0)' <<<"$user")" || return 1
+  while IFS= read -r endpoint; do
+    [[ -n "$endpoint" ]] || continue
+    fragment="$(make_endpoint_inbounds_from_state "$name" "$endpoint")" || return 1
+    fragments="$(SB_JQ_CURRENT="$fragments" SB_JQ_ADDED="$fragment" jq -cn \
+      '($ENV.SB_JQ_CURRENT | fromjson) + ($ENV.SB_JQ_ADDED | fromjson)')" || return 1
+    count=$((count + 1))
+  done < <(jq -c 'if (.endpoints | type) == "array" then .endpoints[] else
+    if (.protocol // "ss2022") == "anytls" then
+      {protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}
+    else
+      {protocol:"ss2022",port:.port,shadowtls_password:.shadowtls_password,
+       ss2022_password:.ss2022_password,method:.method,shadowtls_sni:.shadowtls_sni}
+    end end' <<<"$user")
+  if ((count == 0)); then
+    return 1
+  fi
+  printf '%s\n' "$fragments"
+}
+
+state_add_user() {
+  local name="$1" port="$2" st_password="$3" ss_password="$4" limit="$5" anchor="$6" metered="$7" expires_at="$8" method="$9" shadowtls_sni="${10}"
+  SB_JQ_ST_PASSWORD="$st_password" SB_JQ_SS_PASSWORD="$ss_password" atomic_state_update '.users += [{
+      name: $name,
+      port: $port,
+      protocol: "ss2022",
+      shadowtls_password: $ENV.SB_JQ_ST_PASSWORD,
+      ss2022_password: $ENV.SB_JQ_SS_PASSWORD,
+      method: $method,
+      shadowtls_sni: $shadowtls_sni,
+      metered: $metered,
+      expires_at: (if $expires_at == "" then null else $expires_at end),
+      limit_gib: (if $metered then ($limit | tonumber) else null end),
+      billing_anchor: (if $metered then ($anchor | tonumber) else null end),
+      usage_offset_bytes: 0,
+      status: "active",
+      created_at: $created_at,
+      endpoints: [{
+        protocol: "ss2022",
+        port: $port,
+        shadowtls_password: $ENV.SB_JQ_ST_PASSWORD,
+        ss2022_password: $ENV.SB_JQ_SS_PASSWORD,
+        method: $method,
+        shadowtls_sni: $shadowtls_sni
+      }]
+    }]' \
+    --arg name "$name" \
+    --argjson port "$port" \
+    --arg method "$method" \
+    --arg shadowtls_sni "$shadowtls_sni" \
+    --arg created_at "$(date -Iseconds)" \
+    --arg limit "$limit" \
+    --arg anchor "$anchor" \
+    --argjson metered "$metered" \
+    --arg expires_at "$expires_at"
+}
+
+state_add_anytls() {
+  SB_JQ_PASSWORD="$3" atomic_state_update '.users += [{name:$name,port:$port,protocol:"anytls",anytls_password:$ENV.SB_JQ_PASSWORD,tls_sni:$tls_sni,metered:$metered,expires_at:(if $expires_at=="" then null else $expires_at end),limit_gib:(if $metered then ($limit|tonumber) else null end),billing_anchor:(if $metered then ($anchor|tonumber) else null end),usage_offset_bytes:0,status:"active",created_at:$created_at,endpoints:[{protocol:"anytls",port:$port,anytls_password:$ENV.SB_JQ_PASSWORD,tls_sni:$tls_sni}]}]' \
+    --arg name "$1" --argjson port "$2" --arg created_at "$(date -Iseconds)" \
+    --arg limit "$4" --arg anchor "$5" --argjson metered "$6" --arg expires_at "$7" --arg tls_sni "$8"
+}
+
+state_add_multi_user() {
+  local name="$1" ss_port="$2" anytls_port="$3" st_password="$4" ss_password="$5" anytls_password="$6"
+  local limit="$7" anchor="$8" metered="$9" expires_at="${10}" method="${11}" shadowtls_sni="${12}" tls_sni="${13}"
+  SB_JQ_ST_PASSWORD="$st_password" SB_JQ_SS_PASSWORD="$ss_password" SB_JQ_ANYTLS_PASSWORD="$anytls_password" \
+    atomic_state_update '.users += [{
+      name:$name,port:$ss_port,protocol:"ss2022",
+      shadowtls_password:$ENV.SB_JQ_ST_PASSWORD,ss2022_password:$ENV.SB_JQ_SS_PASSWORD,
+      method:$method,shadowtls_sni:$shadowtls_sni,
+      metered:$metered,expires_at:(if $expires_at=="" then null else $expires_at end),
+      limit_gib:(if $metered then ($limit|tonumber) else null end),
+      billing_anchor:(if $metered then ($anchor|tonumber) else null end),
+      usage_offset_bytes:0,status:"active",created_at:$created_at,
+      endpoints:[
+        {protocol:"ss2022",port:$ss_port,shadowtls_password:$ENV.SB_JQ_ST_PASSWORD,
+         ss2022_password:$ENV.SB_JQ_SS_PASSWORD,method:$method,shadowtls_sni:$shadowtls_sni},
+        {protocol:"anytls",port:$anytls_port,anytls_password:$ENV.SB_JQ_ANYTLS_PASSWORD,tls_sni:$tls_sni}
+      ]
+    }]' \
+    --arg name "$name" --argjson ss_port "$ss_port" --argjson anytls_port "$anytls_port" \
+    --arg limit "$limit" --arg anchor "$anchor" --argjson metered "$metered" --arg expires_at "$expires_at" \
+    --arg method "$method" --arg shadowtls_sni "$shadowtls_sni" --arg tls_sni "$tls_sni" \
+    --arg created_at "$(date -Iseconds)"
+}
+
+state_add_user_endpoint() {
+  local name="$1" endpoint="$2"
+  SB_JQ_ENDPOINT="$endpoint" atomic_state_update '
+    (.users[] | select(.name == $name) | .endpoints) += [($ENV.SB_JQ_ENDPOINT | fromjson)]
+  ' --arg name "$name"
+}
+
+state_remove_user_endpoint() {
+  local name="$1" protocol="$2"
+  atomic_state_update '
+    .users |= map(
+      if .name == $name then
+        .endpoints = [.endpoints[] | select(.protocol != $protocol)] |
+        .endpoints[0] as $primary |
+        del(.anytls_password,.tls_sni,.shadowtls_password,.ss2022_password,.method,.shadowtls_sni) |
+        .protocol = $primary.protocol | .port = $primary.port |
+        if $primary.protocol == "anytls" then
+          .anytls_password = $primary.anytls_password | .tls_sni = $primary.tls_sni
+        else
+          .shadowtls_password = $primary.shadowtls_password |
+          .ss2022_password = $primary.ss2022_password |
+          .method = $primary.method | .shadowtls_sni = $primary.shadowtls_sni
+        end
+      else . end)
+  ' --arg name "$name" --arg protocol "$protocol"
+}
+
+state_set_status() {
+  atomic_state_update '(.users[] | select(.name == $name) | .status) = $status' \
+    --arg name "$1" --arg status "$2"
+}
+
+state_set_expiry() {
+  atomic_state_update '(.users[] | select(.name == $name) | .expires_at) = $expires_at' \
+    --arg name "$1" --arg expires_at "$2"
+}
+
+state_set_limit() {
+  atomic_state_update '(.users[] | select(.name == $name) | .limit_gib) = ($limit | tonumber)' \
+    --arg name "$1" --arg limit "$2"
+}
+
+state_add_usage_offset() {
+  atomic_state_update '
+    (.users[] | select(.name == $name) | .usage_offset_bytes) |=
+      ((. // 0) + ($bytes | tonumber))
+  ' --arg name "$1" --arg bytes "$2"
+}
+
+ensure_self_nfuse_accounts() {
+  local nfuse_json rows user name port account owner migrated=0
+  nfuse_json="$(nfuse list --json)" || return 1
+  jq -e 'type == "array"' <<<"$nfuse_json" >/dev/null || return 1
+  rows="$(jq -c '.users[] | select((.metered // (.limit_gib != null)) == false)' "$STATE_FILE")" || return 1
+  while IFS= read -r user; do
+    [[ -n "$user" ]] || continue
+    name="$(jq -er '.name' <<<"$user")" || return 1
+    account="$(jq -c --arg name "$name" 'first(.[] | select(.name == $name)) // null' <<<"$nfuse_json")" || return 1
+    if [[ "$account" != null ]]; then
+      if [[ "$(jq -r '.tier' <<<"$account")" != c ]]; then
+        log "提醒：自用用户 ${name} 的流量记录类型不正确，请运行「服务与配置检查」"
+      else
+        while IFS= read -r port; do
+          [[ -n "$port" ]] || continue
+          if ! jq -e --argjson port "$port" '.ports[]? | select(.start <= $port and .end >= $port)' <<<"$account" >/dev/null; then
+            log "提醒：自用用户 ${name} 的端口 ${port} 尚未接入流量统计，请运行「服务与配置检查」"
+          fi
+        done < <(jq -r 'if (.endpoints | type) == "array" then .endpoints[].port else .port end' <<<"$user")
+      fi
+      continue
+    fi
+    while IFS= read -r port; do
+      [[ -n "$port" ]] || continue
+      owner="$(jq -r --argjson port "$port" 'first(.[] | select(any(.ports[]?; .start <= $port and .end >= $port)) | .name) // empty' <<<"$nfuse_json")" || return 1
+      if [[ -n "$owner" ]]; then
+        log "提醒：自用用户 ${name} 的端口 ${port} 已由流量记录 ${owner} 使用，请运行「服务与配置检查」"
+        account=conflict
+        break
+      fi
+    done < <(jq -r 'if (.endpoints | type) == "array" then .endpoints[].port else .port end' <<<"$user")
+    [[ "$account" != conflict ]] || continue
+    start_managed_operation "migrate-self-usage:$name" || return 1
+    run_managed_step nfuse add "$name" --tier c --limit 0 --anchor 1 || return 1
+    while IFS= read -r port; do
+      [[ -n "$port" ]] || continue
+      run_managed_step nfuse port add "$name" "$port" || return 1
+    done < <(jq -r 'if (.endpoints | type) == "array" then .endpoints[].port else .port end' <<<"$user")
+    run_managed_step nfuse persist || return 1
+    finish_managed_operation || return 1
+    migrated=$((migrated + 1))
+    nfuse_json="$(nfuse list --json)" || return 1
+  done <<<"$rows"
+  ((migrated == 0)) || log "已为 ${migrated} 个既有自用用户启用不限额流量统计"
+}
+
+state_replace_user() {
+  SB_JQ_USER="$2" atomic_state_update \
+    'def sync_primary_endpoint:
+       if (.protocol // "ss2022") == "anytls" then
+         .protocol = "anytls" |
+         .endpoints[0] = {protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}
+       else
+         .protocol = "ss2022" |
+         .endpoints[0] = {protocol:"ss2022",port:.port,shadowtls_password:.shadowtls_password,
+                          ss2022_password:.ss2022_password,method:.method,shadowtls_sni:.shadowtls_sni}
+       end;
+     .users = [.users[] | if .name == $name then (($ENV.SB_JQ_USER | fromjson) | sync_primary_endpoint) else . end]' \
+    --arg name "$1"
+}
+
+state_set_protocol_sni() {
+  local protocol="$1" sni="$2"
+  atomic_state_update '
+    .users |= map(
+      if (.endpoints | type) == "array" then
+        .endpoints |= map(
+          if $protocol == "anytls" then
+            if .protocol == "anytls" then .tls_sni = $sni else . end
+          else
+            if .protocol == "ss2022" then .shadowtls_sni = $sni else . end
+          end)
+      else . end |
+      if (.protocol // "ss2022") == $protocol then
+        if $protocol == "anytls" then .tls_sni = $sni else .shadowtls_sni = $sni end
+      else . end)
+  ' --arg protocol "$protocol" --arg sni "$sni"
+}
+
+state_remove_user() {
+  atomic_state_update '.users = [.users[] | select(.name != $name)]' --arg name "$1"
+}
+
+get_user_json() {
+  jq -c --arg name "$1" '.users[] | select(.name == $name)' "$STATE_FILE"
+}
+
+anytls_certificate_ready() {
+  [[ -f /etc/sing-box/cert/anytls.crt && -f /etc/sing-box/cert/anytls.key ]]
+}
+
+check_new_user_conflicts() {
+  local protocol="$1" name="$2" port="$3"
+  case "$protocol" in
+    ss2022|anytls) ;;
+    *) die "内部错误：不支持的新增用户协议：$protocol";;
+  esac
+  user_exists "$name" && die "用户已存在：$name"
+  if port_in_state "$port"; then
+    if [[ "$protocol" == ss2022 ]]; then
+      die "端口已被脚本记录占用：$port"
+    else
+      die "端口已占用"
+    fi
+  fi
+  if port_is_listening "$port"; then
+    if [[ "$protocol" == ss2022 ]]; then
+      die "端口已被其他服务监听：$port"
+    else
+      die "端口已被监听"
+    fi
+  fi
+  if [[ "$protocol" == ss2022 ]]; then
+    tag_exists_in_config "st-$name" && die "sing-box 已存在 tag：st-$name"
+    tag_exists_in_config "ss-$name" && die "sing-box 已存在 tag：ss-$name"
+    tag_exists_in_config "ss-udp-$name" && die "sing-box 已存在 tag：ss-udp-$name"
+  else
+    tag_exists_in_config "anytls-$name" && die "tag 已存在"
+    anytls_certificate_ready || die "AnyTLS 证书不存在，请先重新安装环境"
+  fi
+  if nfuse_account_exists "$name"; then
+    if [[ "$protocol" == ss2022 ]]; then
+      die "同名流量记录已存在，请运行「服务与配置检查」：$name"
+    else
+      die "同名流量记录已存在，请运行「服务与配置检查」"
+    fi
+  fi
+  if nfuse_port_exists "$port"; then
+    if [[ "$protocol" == ss2022 ]]; then
+      die "Nfuse 已管理端口：$port"
+    else
+      die "该端口已被其他用户的流量统计占用"
+    fi
+  fi
+}
+
+register_new_user_nfuse() {
+  local name="$1" port="$2" metered="$3" limit="$4" anchor="$5"
+  register_new_user_nfuse_ports "$name" "$metered" "$limit" "$anchor" "$port"
+}
+
+register_new_user_nfuse_ports() {
+  local name="$1" metered="$2" limit="$3" anchor="$4" port
+  shift 4
+  if [[ "$metered" == true ]]; then
+    run_managed_step nfuse add "$name" --tier a --limit "$limit" --anchor "$anchor" || return 1
+  else
+    run_managed_step nfuse add "$name" --tier c --limit 0 --anchor 1 || return 1
+  fi
+  for port in "$@"; do
+    run_managed_step nfuse port add "$name" "$port" || return 1
+  done
+  run_managed_step nfuse persist || return 1
+}
+
+check_new_endpoint_conflicts() {
+  local protocol="$1" name="$2" port="$3"
+  validate_port "$port"
+  port_in_state "$port" && die "端口已被脚本记录占用：$port"
+  port_is_listening "$port" && die "端口已被其他服务监听：$port"
+  nfuse_port_exists "$port" && die "Nfuse 已管理端口：$port"
+  if [[ "$protocol" == anytls ]]; then
+    anytls_certificate_ready || die "AnyTLS 证书不存在，请先重新安装环境"
+    tag_exists_in_config "anytls-$name" && die "sing-box 已存在 tag：anytls-$name"
+  else
+    tag_exists_in_config "st-$name" && die "sing-box 已存在 tag：st-$name"
+    tag_exists_in_config "ss-$name" && die "sing-box 已存在 tag：ss-$name"
+    tag_exists_in_config "ss-udp-$name" && die "sing-box 已存在 tag：ss-udp-$name"
+  fi
+  return 0
+}
+
+cmd_add() {
+  local mode="$1"; shift
+  local name="${1:-}" port="${2:-}" limit="${3:-}" anchor="${4:-}" months="${5:-}" method shadowtls_sni metered=true expires_at
+  if [[ "$mode" == self ]]; then
+    (( $# == 4 )) || die "用法：$PROGRAM add-me <用户名> <公网端口> <加密方式> <ShadowTLS-SNI>"
+    method="$3"; shadowtls_sni="$4"
+    metered=false
+    expires_at=""
+  else
+    (( $# == 7 )) || die "用法：$PROGRAM add <用户名> <公网端口> <配额GiB> <账单日1-28> <有效期月数> <加密方式> <ShadowTLS-SNI>"
+    method="$6"; shadowtls_sni="$7"
+  fi
+
+  validate_name "$name"
+  validate_port "$port"
+  validate_ss2022_method "$method"
+  validate_shadowtls_sni "$shadowtls_sni"
+  if [[ "$metered" == true ]]; then
+    [[ "$months" =~ ^[1-9][0-9]*$ ]] || die "有效期月数必须是正整数"
+    expires_at="$(date -d "+${months} month" '+%Y-%m-%dT%H:%M:%S%z')"
+  fi
+  if [[ "$metered" == true ]]; then
+    validate_limit "$limit"
+    validate_anchor "$anchor"
+  fi
+  check_new_user_conflicts ss2022 "$name" "$port"
+
+  local st_password ss_password fragment
+  st_password="$(generate_st_password)"
+  ss_password="$(generate_ss_password "$method")"
+  fragment="$(make_user_inbounds "$name" "$port" "$st_password" "$ss_password" "$method" "$shadowtls_sni")"
+  ensure_safe_ssh_for_singbox_restart || return 0
+  start_managed_operation "add-user:$name" || return 1
+
+  run_managed_step state_add_user "$name" "$port" "$st_password" "$ss_password" "$limit" "$anchor" "$metered" "$expires_at" "$method" "$shadowtls_sni" || return 1
+  register_new_user_nfuse "$name" "$port" "$metered" "$limit" "$anchor" || return 1
+  run_managed_step append_inbounds "$fragment" || return 1
+  run_managed_step check_singbox_and_restart || return 1
+
+  finish_managed_operation || return 1
+  if [[ "$metered" == true ]]; then
+    log "用户创建成功：${name}，端口：${port}，每月流量：${limit} GiB，重置日：${anchor}"
+  else
+    log "自用用户创建成功：${name}，端口：${port}（不限流量，仅统计使用量）"
+  fi
+  cmd_export "$name"
+}
+
+cmd_add_anytls() {
+  local mode="$1"; shift
+  local name="${1:-}" port="${2:-}" limit="${3:-}" anchor="${4:-}" months="${5:-}" tls_sni metered=true expires_at=""
+  if [[ "$mode" == self ]]; then (( $# == 3 )) || die "用法：$PROGRAM add-anytls-me <用户名> <公网端口> <TLS-SNI>"; tls_sni="$3"; metered=false
+  else (( $# == 6 )) || die "用法：$PROGRAM add-anytls <用户名> <公网端口> <配额GiB> <账单日> <有效期月数> <TLS-SNI>"; tls_sni="$6"; [[ "$months" =~ ^[1-9][0-9]*$ ]] || die "有效期月数必须是正整数"; expires_at="$(date -d "+${months} month" '+%Y-%m-%dT%H:%M:%S%z')"; validate_limit "$limit"; validate_anchor "$anchor"; fi
+  validate_name "$name"
+  validate_port "$port"
+  validate_shadowtls_sni "$tls_sni"
+  check_new_user_conflicts anytls "$name" "$port"
+  local password fragment
+  password="$(generate_st_password)"
+  fragment="$(make_anytls_inbound "$name" "$port" "$password")"
+  ensure_safe_ssh_for_singbox_restart || return 0
+  start_managed_operation "add-anytls-user:$name" || return 1
+  run_managed_step state_add_anytls "$name" "$port" "$password" "$limit" "$anchor" "$metered" "$expires_at" "$tls_sni" || return 1
+  register_new_user_nfuse "$name" "$port" "$metered" "$limit" "$anchor" || return 1
+  run_managed_step append_inbounds "$fragment" || return 1
+  run_managed_step check_singbox_and_restart || return 1
+  finish_managed_operation || return 1
+  if [[ "$metered" == true ]]; then
+    log "AnyTLS 用户创建成功：${name}，端口：${port}"
+  else
+    log "AnyTLS 自用用户创建成功：${name}，端口：${port}（不限流量，仅统计使用量）"
+  fi
+  cmd_export "$name"
+}
+
+cmd_add_multi() {
+  local mode="$1"; shift
+  local name="${1:-}" ss_port="${2:-}" anytls_port="${3:-}" limit="${4:-}" anchor="${5:-}" months="${6:-}"
+  local method shadowtls_sni tls_sni metered=true expires_at=""
+  if [[ "$mode" == self ]]; then
+    (( $# == 6 )) || die "用法：$PROGRAM add-multi-me <用户名> <SS端口> <AnyTLS端口> <加密方式> <ShadowTLS-SNI> <AnyTLS-SNI>"
+    method="$4"; shadowtls_sni="$5"; tls_sni="$6"; metered=false
+    limit=""; anchor=""
+  else
+    (( $# == 9 )) || die "用法：$PROGRAM add-multi <用户名> <SS端口> <AnyTLS端口> <配额GiB> <账单日> <有效期月数> <加密方式> <ShadowTLS-SNI> <AnyTLS-SNI>"
+    method="$7"; shadowtls_sni="$8"; tls_sni="$9"
+    [[ "$months" =~ ^[1-9][0-9]*$ ]] || die "有效期月数必须是正整数"
+    validate_limit "$limit"
+    validate_anchor "$anchor"
+    expires_at="$(date -d "+${months} month" '+%Y-%m-%dT%H:%M:%S%z')"
+  fi
+  validate_name "$name"
+  validate_port "$ss_port"
+  validate_port "$anytls_port"
+  [[ "$ss_port" != "$anytls_port" ]] || die "两个协议必须使用不同端口"
+  validate_ss2022_method "$method"
+  validate_shadowtls_sni "$shadowtls_sni"
+  validate_shadowtls_sni "$tls_sni"
+  check_new_user_conflicts ss2022 "$name" "$ss_port"
+  check_new_user_conflicts anytls "$name" "$anytls_port"
+
+  local st_password ss_password anytls_password prospective fragment
+  st_password="$(generate_st_password)" || return 1
+  ss_password="$(generate_ss_password "$method")" || return 1
+  anytls_password="$(generate_st_password)" || return 1
+  prospective="$(SB_JQ_ST_PASSWORD="$st_password" SB_JQ_SS_PASSWORD="$ss_password" SB_JQ_ANYTLS_PASSWORD="$anytls_password" jq -cn \
+    --arg name "$name" --argjson ss_port "$ss_port" --argjson anytls_port "$anytls_port" \
+    --arg method "$method" --arg shadowtls_sni "$shadowtls_sni" --arg tls_sni "$tls_sni" '
+      {name:$name,status:"active",endpoints:[
+        {protocol:"ss2022",port:$ss_port,shadowtls_password:$ENV.SB_JQ_ST_PASSWORD,
+         ss2022_password:$ENV.SB_JQ_SS_PASSWORD,method:$method,shadowtls_sni:$shadowtls_sni},
+        {protocol:"anytls",port:$anytls_port,anytls_password:$ENV.SB_JQ_ANYTLS_PASSWORD,tls_sni:$tls_sni}
+      ]}')" || return 1
+  fragment="$(make_user_inbounds_from_state "$prospective")" || return 1
+  ensure_safe_ssh_for_singbox_restart || return 0
+  start_managed_operation "add-multi-user:$name" || return 1
+
+  # 先登记可回滚的账户状态，再把两个端口纳入同一流量账户，最后才开放认证入口。
+  run_managed_step state_add_multi_user "$name" "$ss_port" "$anytls_port" "$st_password" "$ss_password" "$anytls_password" \
+    "$limit" "$anchor" "$metered" "$expires_at" "$method" "$shadowtls_sni" "$tls_sni" || return 1
+  register_new_user_nfuse_ports "$name" "$metered" "$limit" "$anchor" "$ss_port" "$anytls_port" || return 1
+  run_managed_step append_inbounds "$fragment" || return 1
+  run_managed_step check_singbox_and_restart || return 1
+  finish_managed_operation || return 1
+
+  if [[ "$metered" == true ]]; then
+    log "双协议用户创建成功：${name}，SS2022 端口：${ss_port}，AnyTLS 端口：${anytls_port}，共享每月 ${limit} GiB"
+  else
+    log "双协议自用用户创建成功：${name}，SS2022 端口：${ss_port}，AnyTLS 端口：${anytls_port}（共享不限额统计）"
+  fi
+  cmd_export "$name"
+}
+
+cmd_add_user_endpoint() {
+  local name="$1" protocol="$2" port="$3" method="${4:-}" sni="$5"
+  local user status metered expected_tier nfuse_json endpoint prospective fragment password st_password ss_password
+  validate_name "$name"
+  user_exists "$name" || die "用户不存在：$name"
+  user="$(get_user_json "$name")" || return 1
+  jq -e '.endpoints | type == "array" and length < 2' <<<"$user" >/dev/null || die "用户已经拥有全部支持的协议"
+  jq -e --arg protocol "$protocol" 'all(.endpoints[]; .protocol != $protocol)' <<<"$user" >/dev/null || die "用户已经拥有该协议"
+  case "$protocol" in
+    ss2022) validate_ss2022_method "$method";;
+    anytls) [[ -z "$method" ]] || die "AnyTLS 不支持 SS2022 加密方式";;
+    *) die "不支持的协议：$protocol";;
+  esac
+  validate_shadowtls_sni "$sni"
+  check_new_endpoint_conflicts "$protocol" "$name" "$port"
+  status="$(jq -er '.status | select(. == "active" or . == "disabled")' <<<"$user")" || return 1
+  metered="$(jq -er '(.metered // (.limit_gib != null)) | select(type == "boolean")' <<<"$user")" || return 1
+  expected_tier="$([[ "$metered" == true ]] && echo a || echo c)"
+  nfuse_json="$(nfuse list --json)" || die "无法读取流量统计数据，请查看服务状态"
+  jq -e --arg name "$name" --arg tier "$expected_tier" '.[] | select(.name == $name and .tier == $tier)' <<<"$nfuse_json" >/dev/null ||
+    die "找不到用户 $name 的正确流量记录，请先运行「服务与配置检查」"
+
+  if [[ "$protocol" == anytls ]]; then
+    password="$(generate_st_password)" || return 1
+    endpoint="$(SB_JQ_PASSWORD="$password" jq -cn --argjson port "$port" --arg sni "$sni" \
+      '{protocol:"anytls",port:$port,anytls_password:$ENV.SB_JQ_PASSWORD,tls_sni:$sni}')" || return 1
+  else
+    st_password="$(generate_st_password)" || return 1
+    ss_password="$(generate_ss_password "$method")" || return 1
+    endpoint="$(SB_JQ_ST_PASSWORD="$st_password" SB_JQ_SS_PASSWORD="$ss_password" jq -cn \
+      --argjson port "$port" --arg method "$method" --arg sni "$sni" \
+      '{protocol:"ss2022",port:$port,shadowtls_password:$ENV.SB_JQ_ST_PASSWORD,
+       ss2022_password:$ENV.SB_JQ_SS_PASSWORD,method:$method,shadowtls_sni:$sni}')" || return 1
+  fi
+  prospective="$(SB_JQ_ENDPOINT="$endpoint" jq -c '.endpoints += [($ENV.SB_JQ_ENDPOINT | fromjson)]' <<<"$user")" || return 1
+  if [[ "$status" == active ]]; then
+    fragment="$(make_user_inbounds_from_state "$prospective")" || return 1
+    ensure_safe_ssh_for_singbox_restart || return 0
+  fi
+  start_managed_operation "add-user-endpoint:$name:$protocol" || return 1
+  run_managed_step nfuse port add "$name" "$port" || return 1
+  run_managed_step nfuse persist || return 1
+  run_managed_step state_add_user_endpoint "$name" "$endpoint" || return 1
+  if [[ "$status" == active ]]; then
+    run_managed_step replace_user_inbounds "$name" "$fragment" || return 1
+    rebuild_user_splits_if_needed "$name" || return 1
+    run_managed_step check_singbox_and_restart || return 1
+  fi
+  finish_managed_operation || return 1
+  log "已为用户 ${name} 添加协议：$([[ "$protocol" == anytls ]] && echo AnyTLS || echo 'SS2022 + ShadowTLS')（端口 ${port}，共享原流量与有效期）"
+  cmd_export "$name"
+}
+
+cmd_remove_user_endpoint() {
+  local name="$1" protocol="$2" user status port nfuse_json port_id prospective fragment=""
+  validate_name "$name"
+  user_exists "$name" || die "用户不存在：$name"
+  user="$(get_user_json "$name")" || return 1
+  jq -e '.endpoints | type == "array" and length > 1' <<<"$user" >/dev/null || die "不能移除用户唯一的连接协议；如不再需要该用户，请删除用户"
+  jq -e --arg protocol "$protocol" 'any(.endpoints[]; .protocol == $protocol)' <<<"$user" >/dev/null || die "用户没有该协议"
+  port="$(jq -er --arg protocol "$protocol" '.endpoints[] | select(.protocol == $protocol) | .port' <<<"$user")" || return 1
+  nfuse_json="$(nfuse list --json)" || die "无法读取流量统计数据，请查看服务状态"
+  port_id="$(jq -er --arg name "$name" --argjson port "$port" \
+    '.[] | select(.name == $name) | .ports[] | select(.start == $port and .end == $port) | .id' <<<"$nfuse_json")" ||
+    die "协议端口没有正确接入流量统计，请先运行「服务与配置检查」"
+  prospective="$(jq -c --arg protocol "$protocol" '
+    .endpoints = [.endpoints[] | select(.protocol != $protocol)] |
+    .endpoints[0] as $primary |
+    del(.anytls_password,.tls_sni,.shadowtls_password,.ss2022_password,.method,.shadowtls_sni) |
+    .protocol = $primary.protocol | .port = $primary.port |
+    if $primary.protocol == "anytls" then .anytls_password=$primary.anytls_password | .tls_sni=$primary.tls_sni
+    else .shadowtls_password=$primary.shadowtls_password | .ss2022_password=$primary.ss2022_password |
+      .method=$primary.method | .shadowtls_sni=$primary.shadowtls_sni end' <<<"$user")" || return 1
+  status="$(jq -er '.status | select(. == "active" or . == "disabled")' <<<"$user")" || return 1
+  if [[ "$status" == active ]]; then
+    fragment="$(make_user_inbounds_from_state "$prospective")" || return 1
+    ensure_safe_ssh_for_singbox_restart || return 0
+  fi
+  start_managed_operation "remove-user-endpoint:$name:$protocol" || return 1
+  run_managed_step state_remove_user_endpoint "$name" "$protocol" || return 1
+  if [[ "$status" == active ]]; then
+    run_managed_step replace_user_inbounds "$name" "$fragment" || return 1
+    rebuild_user_splits_if_needed "$name" || return 1
+    run_managed_step check_singbox_and_restart || return 1
+  fi
+  # 先关闭监听并重启成功，最后再解除流量端口，避免残留未计费入口。
+  run_managed_step nfuse port rm "$port_id" || return 1
+  run_managed_step nfuse persist || return 1
+  finish_managed_operation || return 1
+  log "已移除用户 ${name} 的协议：$([[ "$protocol" == anytls ]] && echo AnyTLS || echo 'SS2022 + ShadowTLS')；共享账户与用量保持不变"
+  cmd_export "$name"
+}
+
+rebuild_user_splits_if_needed() {
+  local name="$1"
+  if jq -e --arg name "$name" '.splits[]? | select(.scope == "user" and .user == $name)' "$STATE_FILE" >/dev/null; then
+    run_managed_step rebuild_all_split_configs || return 1
+  fi
+}
+
+rebuild_user_splits_if_needed_without_transaction() {
+  local name="$1"
+  if jq -e --arg name "$name" '.splits[]? | select(.scope == "user" and .user == $name)' "$STATE_FILE" >/dev/null; then
+    rebuild_all_split_configs || return 1
+  fi
+}
+
+cmd_disable() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "用法：$PROGRAM disable <用户名>"
+  validate_name "$name"
+  user_exists "$name" || die "用户不存在：$name"
+
+  local status
+  status="$(get_user_json "$name" | jq -r '.status')"
+  [[ "$status" != "disabled" ]] || die "用户已经停用：$name"
+  ensure_safe_ssh_for_singbox_restart || return 0
+  start_managed_operation "disable-user:$name" || return 1
+
+  run_managed_step remove_user_inbounds "$name" || return 1
+  run_managed_step state_set_status "$name" "disabled" || return 1
+  rebuild_user_splits_if_needed "$name" || return 1
+  run_managed_step check_singbox_and_restart || return 1
+
+  finish_managed_operation || return 1
+  if nfuse_account_exists "$name"; then
+    log "用户已停用：${name}（已用流量记录保留）"
+  else
+    log "用户已停用：$name"
+  fi
+}
+
+ENABLE_USAGE_RESET=false
+ENABLE_USER_FRAGMENT=""
+ENABLE_USER_METERED=false
+
+prepare_user_enable() {
+  local name="${1:-}"
+  local user status endpoint protocol port fragment metered nfuse_json expected_tier
+  user="$(get_user_json "$name")" || return 1
+  status="$(jq -er '.status | select(type == "string" and length > 0)' <<<"$user")" || return 1
+  [[ "$status" == "disabled" ]] || die "用户当前不是 disabled 状态：$status"
+
+  while IFS= read -r endpoint; do
+    [[ -n "$endpoint" ]] || continue
+    protocol="$(jq -er '.protocol' <<<"$endpoint")" || return 1
+    if [[ "$protocol" == anytls ]]; then
+      tag_exists_in_config "anytls-$name" && die "sing-box 已存在 AnyTLS tag"
+    else
+      tag_exists_in_config "st-$name" && die "sing-box 已存在 tag：st-$name"
+      tag_exists_in_config "ss-$name" && die "sing-box 已存在 tag：ss-$name"
+      tag_exists_in_config "ss-udp-$name" && die "sing-box 已存在 tag：ss-udp-$name"
+    fi
+  done < <(jq -c 'if (.endpoints | type) == "array" then .endpoints[] else {protocol:(.protocol // "ss2022")} end' <<<"$user")
+  fragment="$(make_user_inbounds_from_state "$user")" || return 1
+  metered="$(jq -r '.metered // (.limit_gib != null)' <<<"$user")" || return 1
+  [[ "$metered" == true || "$metered" == false ]] || return 1
+  expected_tier="$([[ "$metered" == true ]] && echo a || echo c)"
+  nfuse_json="$(nfuse list --json)" || {
+    printf '错误：无法读取流量记录，因此没有启用用户：%s\n' "$name" >&2
+    return 1
+  }
+  if ! jq -e 'type == "array"' <<<"$nfuse_json" >/dev/null; then
+    printf '错误：Nfuse 返回的数据结构无效，未启用用户：%s\n' "$name" >&2
+    return 1
+  fi
+  if ! jq -e --arg name "$name" --arg tier "$expected_tier" \
+    '.[] | select(.name == $name and .tier == $tier and (.used_bytes|type) == "number" and .used_bytes >= 0)' \
+    <<<"$nfuse_json" >/dev/null; then
+    printf '错误：用户的流量统计记录缺失或类型不正确，因此没有启用：%s。请运行「服务与配置检查」\n' "$name" >&2
+    return 1
+  fi
+  while IFS= read -r port; do
+    [[ -n "$port" ]] || continue
+    if ! jq -e --arg name "$name" --argjson port "$port" \
+      '.[] | select(.name == $name) | .ports[]? | select(.start <= $port and .end >= $port)' \
+      <<<"$nfuse_json" >/dev/null; then
+      printf '错误：用户端口尚未接入流量统计，因此没有启用：%s（端口 %s）。请运行「服务与配置检查」\n' "$name" "$port" >&2
+      return 1
+    fi
+  done < <(jq -r 'if (.endpoints | type) == "array" then .endpoints[].port else .port end' <<<"$user")
+  if ! ensure_safe_ssh_for_singbox_restart; then
+    printf '错误：为保护当前 SSH 连接，用户没有启用：%s\n' "$name" >&2
+    return 1
+  fi
+  ENABLE_USER_FRAGMENT="$fragment"
+  ENABLE_USER_METERED="$metered"
+}
+
+enable_user_without_transaction() {
+  local name="$1" usage_reset=false
+  append_inbounds "$ENABLE_USER_FRAGMENT" || return 1
+  state_set_status "$name" "active" || return 1
+  rebuild_user_splits_if_needed_without_transaction "$name" || return 1
+  check_singbox_and_restart || return 1
+
+  if [[ "$ENABLE_USER_METERED" == true ]]; then
+    usage_reset=true
+    nfuse reset "$name" || return 1
+    nfuse persist || return 1
+  fi
+  ENABLE_USAGE_RESET="$usage_reset"
+}
+
+cmd_enable() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "用法：$PROGRAM enable <用户名>"
+  validate_name "$name"
+  user_exists "$name" || die "用户不存在：$name"
+  prepare_user_enable "$name" || return 1
+  start_managed_operation "enable-user:$name" || return 1
+  run_managed_step enable_user_without_transaction "$name" || return 1
+  finish_managed_operation || return 1
+  if [[ "$ENABLE_USAGE_RESET" == true ]]; then
+    log "用户已恢复并清零已用配额：$name"
+  else
+    log "用户已恢复：$name"
+  fi
+}
+
+cmd_renew() {
+  local name="$1" months="$2" user expires status now_epoch expires_epoch base_epoch base_time new_expiry
+  validate_name "$name"
+  [[ "$months" =~ ^[1-9][0-9]*$ ]] || die "续期月数必须是正整数"
+  user_exists "$name" || die "用户不存在：$name"
+  user="$(get_user_json "$name")"
+  expires="$(jq -r '.expires_at // empty' <<<"$user")"
+  [[ -n "$expires" ]] || die "自用用户没有有效期，不能续期"
+  status="$(jq -r '.status' <<<"$user")"
+  now_epoch="$(date +%s)"
+  expires_epoch="$(date -d "$expires" +%s)"
+  if ((expires_epoch > now_epoch)); then base_epoch="$expires_epoch"; else base_epoch="$now_epoch"; fi
+  base_time="$(date -d "@$base_epoch" '+%Y-%m-%d %H:%M:%S')"
+  new_expiry="$(date -d "$base_time +${months} month" '+%Y-%m-%dT%H:%M:%S%z')"
+  if [[ "$status" == disabled ]]; then
+    prepare_user_enable "$name" || return 1
+  fi
+  start_managed_operation "renew-user:$name" || return 1
+  run_managed_step state_set_expiry "$name" "$new_expiry" || return 1
+  if [[ "$status" == disabled ]]; then
+    if ! run_managed_step enable_user_without_transaction "$name"; then
+      log "续期和自动启用失败，已恢复到续期前状态"
+      return 1
+    fi
+  fi
+  finish_managed_operation || return 1
+  log "用户续期成功：${name}，新到期时间：${new_expiry}"
+}
+
+cmd_adjust_traffic() {
+  local name="$1" delta_gib="$2" mode="$3" user meter used limit delta_bytes new_used before_remaining after_remaining old_limit_gib new_limit_gib anchor
+  validate_name "$name"
+  [[ "$delta_gib" =~ ^-?([0-9]+)(\.[0-9]+)?$ ]] || die "调整值必须是正数或负数（GiB）"
+  awk -v value="$delta_gib" 'BEGIN { exit !(value != 0) }' || die "调整值不能为 0"
+  if [[ "$mode" == temporary ]]; then
+    awk -v value="$delta_gib" 'BEGIN { exit !(value > 0) }' || die "临时调整只能输入正数，用于增加剩余流量"
+  fi
+  user_exists "$name" || die "用户不存在：$name"
+  user="$(get_user_json "$name")"
+  [[ "$(jq -r '.metered // (.limit_gib != null)' <<<"$user")" == true ]] || die "自用用户不支持流量调整"
+  meter="$(nfuse list --json | jq -c --arg name "$name" '.[] | select(.name == $name)')"
+  [[ -n "$meter" ]] || die "找不到用户 $name 的流量记录，请先运行「服务与配置检查」"
+  used="$(jq -r '.used_bytes' <<<"$meter")"; limit="$(jq -r '.limit_bytes' <<<"$meter")"
+  [[ "$used" =~ ^[0-9]+$ && "$limit" =~ ^[0-9]+$ ]] || die "Nfuse 流量数据无效：$name"
+  start_managed_operation "adjust-traffic:$name:$mode" || return 1
+  case "$mode" in
+    temporary)
+      delta_bytes="$(awk -v value="$delta_gib" 'BEGIN { printf "%.0f", value * 1073741824 }')"
+      new_used=$((used - delta_bytes))
+      ((new_used < 0)) && new_used=0
+      ((new_used > limit)) && new_used="$limit"
+      before_remaining=$((limit - used)); ((before_remaining < 0)) && before_remaining=0
+      after_remaining=$((limit - new_used))
+      run_managed_step run_quietly nfuse set-usage "$name" "$new_used" || return 1
+      run_managed_step run_quietly nfuse persist || return 1
+      printf '临时流量调整成功：%s\n' "$name"
+      printf '月配额保持：%.2f GiB\n' "$(awk -v bytes="$limit" 'BEGIN { print bytes / 1073741824 }')"
+      printf '调整前剩余：%.2f GiB\n' "$(awk -v bytes="$before_remaining" 'BEGIN { print bytes / 1073741824 }')"
+      printf '调整后剩余：%.2f GiB\n' "$(awk -v bytes="$after_remaining" 'BEGIN { print bytes / 1073741824 }')"
+      ;;
+    permanent)
+      old_limit_gib="$(jq -r '.limit_gib' <<<"$user")"; anchor="$(jq -r '.billing_anchor' <<<"$user")"
+      if ! new_limit_gib="$(awk -v old="$old_limit_gib" -v delta="$delta_gib" 'BEGIN { value=old+delta; if (value <= 0) exit 1; printf "%.6f", value }')"; then
+        rollback_active_operation 1 || true
+        printf '错误：永久调整后的月配额必须大于 0 GiB\n' >&2
+        return 1
+      fi
+      new_limit_gib="$(awk -v value="$new_limit_gib" 'BEGIN { sub(/0+$/, "", value); sub(/\.$/, "", value); print value }')"
+      run_managed_step run_quietly nfuse set-tier "$name" --tier a --limit "$new_limit_gib" --anchor "$anchor" || return 1
+      run_managed_step run_quietly nfuse persist || return 1
+      run_managed_step state_set_limit "$name" "$new_limit_gib" || return 1
+      printf '永久流量调整成功：%s\n' "$name"
+      printf '原月配额：%s GiB\n' "$old_limit_gib"
+      printf '新月配额：%s GiB\n' "$new_limit_gib"
+      ;;
+    *) rollback_active_operation 1 || true; printf '错误：未知流量调整模式\n' >&2; return 1;;
+  esac
+  finish_managed_operation || return 1
+}
+
+cmd_edit_user() {
+  local name="$1" new_port="$2" new_sni="$3" new_method="$4" new_anchor="$5" new_expiry="$6" target_protocol="${7:-}"
+  local user endpoint protocol metered status old_port old_sni old_method old_anchor old_expiry new_user fragment=""
+  local config_changed=false method_changed=false nfuse_changed=false nfuse_json="" old_port_id="" limit expected_tier
+
+  validate_name "$name"
+  user_exists "$name" || die "用户不存在：$name"
+  user="$(get_user_json "$name")" || return 1
+  [[ -n "$target_protocol" ]] || target_protocol="$(jq -er '.protocol // "ss2022"' <<<"$user")"
+  endpoint="$(jq -ec --arg protocol "$target_protocol" '
+    if (.endpoints | type) == "array" then .endpoints[] | select(.protocol == $protocol)
+    elif (.protocol // "ss2022") == "anytls" then
+      {protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni} | select(.protocol == $protocol)
+    else
+      {protocol:"ss2022",port:.port,shadowtls_password:.shadowtls_password,ss2022_password:.ss2022_password,
+       method:.method,shadowtls_sni:.shadowtls_sni} | select(.protocol == $protocol)
+    end
+  ' <<<"$user")" || die "用户没有该协议：$target_protocol"
+  protocol="$(jq -er '.protocol | select(. == "ss2022" or . == "anytls")' <<<"$endpoint")" || return 1
+  metered="$(jq -r '(.metered // (.limit_gib != null)) | select(type == "boolean")' <<<"$user")" || return 1
+  [[ "$metered" == true || "$metered" == false ]] || return 1
+  status="$(jq -er '.status | select(. == "active" or . == "disabled")' <<<"$user")" || return 1
+  old_port="$(jq -er '.port | select(type == "number" and . == floor and . >= 1 and . <= 65535)' <<<"$endpoint")" || return 1
+  if [[ "$new_port" == "$old_port" ]]; then validate_migration_port "$new_port"; else validate_port "$new_port"; fi
+
+  if [[ "$protocol" == anytls ]]; then
+    old_sni="$(jq -er '.tls_sni | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
+    [[ -z "$new_method" ]] || die "AnyTLS 用户不支持 SS2022 加密方式"
+  else
+    old_sni="$(jq -er '.shadowtls_sni | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
+    old_method="$(jq -er '.method | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
+    validate_ss2022_method "$new_method"
+  fi
+  validate_shadowtls_sni "$new_sni"
+
+  if [[ "$metered" == true ]]; then
+    old_anchor="$(jq -er '.billing_anchor | select(type == "number" and . == floor)' <<<"$user")" || return 1
+    old_expiry="$(jq -er '.expires_at | select(type == "string" and length > 0)' <<<"$user")" || return 1
+    validate_anchor "$new_anchor"
+    [[ -n "$new_expiry" ]] || die "计量用户必须保留有效期"
+    date -d "$new_expiry" +%s >/dev/null 2>&1 || die "有效期格式无效"
+  else
+    [[ -z "$new_anchor" && -z "$new_expiry" ]] || die "自用用户不支持账单日或有效期"
+    old_anchor=""
+    old_expiry=""
+  fi
+
+  if [[ "$new_port" != "$old_port" ]]; then
+    port_in_state "$new_port" && die "端口已被脚本记录占用：$new_port"
+    port_is_listening "$new_port" && die "端口已被其他服务监听：$new_port"
+    config_changed=true
+  fi
+  [[ "$new_sni" == "$old_sni" ]] || config_changed=true
+  if [[ "$protocol" == ss2022 && "$new_method" != "$old_method" ]]; then
+    config_changed=true
+    method_changed=true
+  fi
+
+  if [[ "$new_port" != "$old_port" || ( "$metered" == true && "$new_anchor" != "$old_anchor" ) ]]; then
+    nfuse_json="$(nfuse list --json)" || die "无法读取流量统计数据，请查看服务状态"
+    jq -e 'type == "array"' <<<"$nfuse_json" >/dev/null || die "Nfuse 返回的数据结构无效"
+    expected_tier="$([[ "$metered" == true ]] && echo a || echo c)"
+    jq -e --arg name "$name" --arg tier "$expected_tier" '.[] | select(.name == $name and .tier == $tier)' <<<"$nfuse_json" >/dev/null || die "找不到用户 $name 的正确流量记录，请先运行「服务与配置检查」"
+    if [[ "$new_port" != "$old_port" ]]; then
+      jq -e --argjson port "$new_port" \
+        '.[] | .ports[]? | select(.start <= $port and .end >= $port)' \
+        <<<"$nfuse_json" >/dev/null && die "Nfuse 已由其他账户管理端口：$new_port"
+      old_port_id="$(jq -er --arg name "$name" --argjson port "$old_port" \
+        '.[] | select(.name == $name) | .ports[] | select(.start == $port and .end == $port) | .id' \
+        <<<"$nfuse_json")" || die "原端口没有正确接入流量统计，请先运行「服务与配置检查」"
+    fi
+    nfuse_changed=true
+  fi
+
+  if [[ "$new_port" == "$old_port" && "$new_sni" == "$old_sni" && \
+        ( "$protocol" == anytls || "$new_method" == "$old_method" ) && \
+        "$new_anchor" == "$old_anchor" && "$new_expiry" == "$old_expiry" ]]; then
+    log "用户信息没有变化：$name"
+    return 0
+  fi
+
+  new_user="$(jq -c \
+    --arg protocol "$protocol" --argjson port "$new_port" --arg sni "$new_sni" --arg method "$new_method" \
+    --arg anchor "$new_anchor" --arg expiry "$new_expiry" \
+    'if (.endpoints | type) != "array" then
+       if (.protocol // "ss2022") == "anytls" then
+         .endpoints=[{protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}]
+       else .endpoints=[{protocol:"ss2022",port:.port,shadowtls_password:.shadowtls_password,
+         ss2022_password:.ss2022_password,method:.method,shadowtls_sni:.shadowtls_sni}] end
+     else . end |
+     .endpoints |= map(
+       if .protocol == $protocol then
+         .port = $port |
+         if $protocol == "anytls" then .tls_sni = $sni
+         else .shadowtls_sni = $sni | .method = $method end
+       else . end) |
+     if (.protocol // "ss2022") == $protocol then
+       .port = $port |
+       if $protocol == "anytls" then .tls_sni = $sni
+       else .shadowtls_sni = $sni | .method = $method end
+     else . end |
+     if (.metered // (.limit_gib != null)) then
+       .billing_anchor = ($anchor | tonumber) | .expires_at = $expiry
+     else . end' <<<"$user")" || return 1
+  if [[ "$method_changed" == true ]]; then
+    local new_password
+    new_password="$(generate_ss_password "$new_method")" || return 1
+    new_user="$(SB_JQ_PASSWORD="$new_password" jq -c --arg protocol "$protocol" '
+      .endpoints |= map(if .protocol == $protocol then .ss2022_password = $ENV.SB_JQ_PASSWORD else . end) |
+      if (.protocol // "ss2022") == $protocol then .ss2022_password = $ENV.SB_JQ_PASSWORD else . end
+    ' <<<"$new_user")" || return 1
+  fi
+  if [[ "$status" == active && "$config_changed" == true ]]; then
+    fragment="$(make_user_inbounds_from_state "$new_user")" || return 1
+  fi
+
+  if [[ "$config_changed" == true ]]; then ensure_safe_ssh_for_singbox_restart || return 0; fi
+  start_managed_operation "edit-user:$name" || return 1
+  if [[ "$new_port" != "$old_port" ]]; then
+    # 先持久化新端口的流量统计，再开放新监听；旧端口在服务切换完成前继续受控。
+    run_managed_step nfuse port add "$name" "$new_port" || return 1
+    run_managed_step nfuse persist || return 1
+  fi
+  run_managed_step state_replace_user "$name" "$new_user" || return 1
+  if [[ "$status" == active && "$config_changed" == true ]]; then
+    run_managed_step replace_user_inbounds "$name" "$fragment" || return 1
+    run_managed_step check_singbox_and_restart || return 1
+  fi
+  if [[ "$nfuse_changed" == true ]]; then
+    if [[ "$new_port" != "$old_port" ]]; then
+      run_managed_step nfuse port rm "$old_port_id" || return 1
+    fi
+    if [[ "$new_anchor" != "$old_anchor" ]]; then
+      limit="$(jq -er '.limit_gib | select(type == "number" and . > 0)' <<<"$new_user")" || return 1
+      run_managed_step nfuse set-tier "$name" --tier a --limit "$limit" --anchor "$new_anchor" || return 1
+    fi
+    run_managed_step nfuse persist || return 1
+  fi
+  finish_managed_operation || return 1
+
+  log "用户编辑成功：$name"
+  if [[ "$method_changed" == true ]]; then
+    log "SS2022 加密方式已变化并重新生成密钥，旧客户端配置已失效"
+  fi
+  if [[ "$config_changed" == true ]]; then
+    cmd_export "$name"
+  fi
+}
+
+cmd_set_global_sni() {
+  local protocol="$1" new_sni="$2" current_sni total mismatched active_count
+  validate_shadowtls_sni "$new_sni"
+  case "$protocol" in
+    ss2022) current_sni="$SS2022_SHADOWTLS_SNI";;
+    anytls) current_sni="$ANYTLS_SNI";;
+    *) die "未知 SNI 协议：$protocol";;
+  esac
+  total="$(jq --arg protocol "$protocol" '[.users[] |
+    select(any(if (.endpoints | type) == "array" then .endpoints[] else {protocol:(.protocol // "ss2022")} end; .protocol == $protocol))] | length' "$STATE_FILE")" || return 1
+  mismatched="$(jq --arg protocol "$protocol" --arg sni "$new_sni" '[.users[] |
+    (if (.endpoints | type) == "array" then .endpoints[]
+     else {protocol:(.protocol // "ss2022"),tls_sni:.tls_sni,shadowtls_sni:.shadowtls_sni} end) |
+    select(.protocol == $protocol) | select((if $protocol == "anytls" then .tls_sni else .shadowtls_sni end) != $sni)] | length' "$STATE_FILE")" || return 1
+  active_count="$(jq --arg protocol "$protocol" '[.users[] |
+    select(.status == "active" and any(if (.endpoints | type) == "array" then .endpoints[] else {protocol:(.protocol // "ss2022")} end; .protocol == $protocol))] | length' "$STATE_FILE")" || return 1
+  if [[ "$new_sni" == "$current_sni" && "$mismatched" == 0 ]]; then
+    log "全局 SNI 与既有用户已一致，无需修改"
+    return 0
+  fi
+
+  if [[ "$protocol" == ss2022 ]] && ((active_count > 0)); then ensure_safe_ssh_for_singbox_restart || return 0; fi
+  start_managed_operation "set-global-sni:$protocol" || return 1
+  if [[ "$protocol" == ss2022 ]]; then
+    run_managed_step write_global_sni_config "$new_sni" "$ANYTLS_SNI" update || return 1
+  else
+    run_managed_step write_global_sni_config "$SS2022_SHADOWTLS_SNI" "$new_sni" update || return 1
+  fi
+  if ((total > 0)); then
+    run_managed_step state_set_protocol_sni "$protocol" "$new_sni" || return 1
+  fi
+  if [[ "$protocol" == ss2022 ]] && ((active_count > 0)); then
+    run_managed_step rebuild_protocol_inbounds "$protocol" || return 1
+    run_managed_step check_singbox_and_restart || return 1
+  fi
+  finish_managed_operation || return 1
+  log "全局 SNI 修改成功：${new_sni}；同步用户：$total"
+}
+
+cmd_remove() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "用法：$PROGRAM remove <用户名>"
+  validate_name "$name"
+  user_exists "$name" || die "用户不存在：$name"
+
+  local split_name split_names split_count=0 nfuse_json
+  ensure_safe_ssh_for_singbox_restart || return 0
+  start_managed_operation "remove-user:$name" || return 1
+
+  if ! split_names="$(jq -r --arg name "$name" '.splits[]? | select(.scope == "user" and .user == $name) | .name' "$STATE_FILE")"; then
+    rollback_active_operation 1 || true
+    return 1
+  fi
+  while IFS= read -r split_name; do
+    [[ -n "$split_name" ]] || continue
+    run_managed_step remove_split_config "$split_name" || return 1
+    run_managed_step state_remove_split "$split_name" || return 1
+    ((split_count+=1))
+  done <<<"$split_names"
+  run_managed_step remove_user_inbounds "$name" || return 1
+  run_managed_step state_remove_user "$name" || return 1
+  # 关联分流可能与其他用户共享规则集或出口，删除后必须按剩余状态统一重建。
+  if ((split_count > 0)); then run_managed_step rebuild_all_split_configs || return 1; fi
+  run_managed_step check_singbox_and_restart || return 1
+
+  if ! nfuse_json="$(nfuse list --json)" || ! jq -e 'type == "array"' <<<"$nfuse_json" >/dev/null; then
+    rollback_active_operation 1 || true
+    return 1
+  fi
+  if jq -e --arg name "$name" '.[] | select(.name == $name)' <<<"$nfuse_json" >/dev/null; then
+    run_managed_step nfuse rm "$name" --cascade || return 1
+    run_managed_step nfuse persist || return 1
+  fi
+
+  finish_managed_operation || return 1
+
+  if ((split_count>0)); then log "用户已删除：${name}，并清理关联分流 ${split_count} 条"
+  else log "用户已删除：$name"
+  fi
+}
+
+render_user_list() {
+  local usage_json="$1" safe_rows
+  if ! safe_rows="$(jq -r --argjson nfuse "$usage_json" '
+    if (.users | length) == 0 then
+      "暂无用户"
+    else
+      (["用户名", "协议", "端口", "状态", "月配额", "已用", "剩余", "账单日", "到期时间", "创建时间"] | @tsv),
+      (.users[] as $user |
+        (($user.metered // ($user.limit_gib != null))) as $metered |
+        ($nfuse | map(select(.name == $user.name)) | first) as $meter |
+        [$user.name,
+         ([if ($user.endpoints | type) == "array" then $user.endpoints[].protocol else ($user.protocol // "ss2022") end |
+           if . == "anytls" then "AnyTLS" else "SS2022+ShadowTLS" end] | join(" + ")),
+         ([if ($user.endpoints | type) == "array" then $user.endpoints[].port else $user.port end | tostring] | join(" / ")),
+         (if $user.status == "disabled" then "停用"
+          elif $user.status == "active" and $metered and $meter != null and $meter.used_bytes >= $meter.limit_bytes then "配额耗尽"
+          elif $user.status == "active" then "启用"
+          else $user.status end),
+         (if $metered then (($user.limit_gib | tostring) + " GiB") else "不限" end),
+         (if $meter == null then "-" else (((((($meter.used_bytes + ($user.usage_offset_bytes // 0)) / 1073741824) * 100 | round) / 100) | tostring) + " GiB") end),
+         (if ($metered | not) or $meter == null then "-" else ((((([$meter.limit_bytes - $meter.used_bytes, 0] | max) / 1073741824) * 100 | round) / 100 | tostring) + " GiB") end),
+         (if $metered then (($user.billing_anchor | tostring) + " 日") else "-" end),
+         (if $user.expires_at == null then "-" else ($user.expires_at | sub("T"; " ") | sub("[+-][0-9]{2}:[0-9]{2}$"; "")) end),
+         ($user.created_at | sub("T"; " ") | sub("[+-][0-9]{2}:[0-9]{2}$"; ""))]
+        | @tsv)
+    end
+  ' "$STATE_FILE")"; then
+    echo '用户列表暂时无法格式化，敏感字段已隐藏。' >&2
+    return 1
+  fi
+  if ! printf '%s\n' "$safe_rows" | column -t -s $'\t' 2>/dev/null; then
+    printf '%s\n' "$safe_rows"
+  fi
+}
+
+cmd_list() {
+  render_user_list "$(nfuse list --json)"
+}
+
+cmd_expire() {
+  local now name user expires
+  now="$(date +%s)"
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    user="$(get_user_json "$name")"
+    expires="$(jq -r '.expires_at // empty' <<<"$user")"
+    [[ -n "$expires" ]] || continue
+    [[ "$(jq -r '.status' <<<"$user")" == active ]] || continue
+    if (( "$(date -d "$expires" +%s)" <= now )); then
+      log "用户已到期，正在停用：$name"
+      ensure_safe_ssh_for_singbox_restart || return 0
+      start_managed_operation "expire-user:$name" || return 1
+      if nfuse_account_exists "$name"; then
+        local limit_bytes
+        limit_bytes="$(nfuse list --json | jq -r --arg name "$name" '.[] | select(.name == $name) | .limit_bytes')"
+        if [[ ! "$limit_bytes" =~ ^[0-9]+$ ]]; then
+          rollback_active_operation 1 || true
+          return 1
+        fi
+        run_managed_step run_quietly nfuse set-usage "$name" "$limit_bytes" || return 1
+        run_managed_step run_quietly nfuse persist || return 1
+      fi
+      run_managed_step remove_user_inbounds "$name" || return 1
+      run_managed_step state_set_status "$name" disabled || return 1
+      rebuild_user_splits_if_needed "$name" || return 1
+      run_managed_step check_singbox_and_restart || return 1
+      finish_managed_operation || return 1
+      log "用户已停用，已用流量记录继续保留：$name"
+    fi
+  done < <(jq -r '.users[].name' "$STATE_FILE")
+}
+
+url_percent_encode() {
+  local LC_ALL=C input="$1" output="" char hex i
+  for ((i=0; i<${#input}; i++)); do
+    char="${input:i:1}"
+    case "$char" in
+      [a-zA-Z0-9.~_-]) output+="$char" ;;
+      *)
+        printf -v hex '%02X' "'$char"
+        output+="%${hex}"
+        ;;
+    esac
+  done
+  printf '%s' "$output"
+}
+
+base64_without_padding() {
+  base64 | tr -d '\n='
+}
+
+url_authority_host() {
+  local host="$1"
+  if [[ "$host" == \[*\] ]]; then printf '%s' "$host"
+  elif [[ "$host" == *:* ]]; then printf '[%s]' "$host"
+  else printf '%s' "$host"
+  fi
+}
+
+shadowrocket_anytls_url() {
+  local user="$1" override_port="${2:-}" name port password sni host
+  name="$(jq -er '.name' <<<"$user")" || return 1
+  port="$(jq -er '.port' <<<"$user")" || return 1
+  [[ -z "$override_port" ]] || port="$override_port"
+  password="$(jq -er '.anytls_password' <<<"$user")" || return 1
+  sni="$(jq -er '.tls_sni' <<<"$user")" || return 1
+  host="$(url_authority_host "$PUBLIC_SERVER")"
+  printf 'anytls://%s@%s:%s?peer=%s&insecure=1&udp=1#%s' \
+    "$(url_percent_encode "$password")" "$host" "$port" \
+    "$(url_percent_encode "$sni")" "$(url_percent_encode "$name")"
+}
+
+shadowrocket_ss2022_url() {
+  local user="$1" override_port="${2:-}" name port method ss_password st_password sni host credentials plugin_json
+  local credentials_base64 plugin_base64
+  name="$(jq -er '.name' <<<"$user")" || return 1
+  port="$(jq -er '.port' <<<"$user")" || return 1
+  [[ -z "$override_port" ]] || port="$override_port"
+  method="$(jq -er '.method' <<<"$user")" || return 1
+  ss_password="$(jq -er '.ss2022_password' <<<"$user")" || return 1
+  st_password="$(jq -er '.shadowtls_password' <<<"$user")" || return 1
+  sni="$(jq -er '.shadowtls_sni' <<<"$user")" || return 1
+  host="$(url_authority_host "$PUBLIC_SERVER")"
+  credentials="${method}:${ss_password}@${host}:${port}"
+  credentials_base64="$(printf '%s' "$credentials" | base64_without_padding)" || return 1
+  plugin_json="$(SB_JQ_PASSWORD="$st_password" jq -cn --arg host "$sni" \
+    '{version:"3",host:$host,password:$ENV.SB_JQ_PASSWORD}' | sed 's#/#\\/#g')" || return 1
+  plugin_base64="$(printf '%s' "$plugin_json" | base64_without_padding)" || return 1
+  printf 'ss://%s?shadow-tls=%s#%s' \
+    "$credentials_base64" "$(url_percent_encode "$plugin_base64")" "$(url_percent_encode "$name")"
+}
+
+print_shadowrocket_qr() {
+  qrencode -t ANSIUTF8 -l L -m 1 -- "$1"
+}
+
+render_shadowrocket_export() {
+  local url="$1"
+  printf '\n[Shadowrocket]\n导入链接：\n%s\n' "$url"
+  if command -v qrencode >/dev/null 2>&1 && [[ -t 1 && "${TERM:-dumb}" != dumb ]]; then
+    printf '\n二维码（使用 Shadowrocket 扫描）：\n'
+    print_shadowrocket_qr "$url" || echo '二维码生成失败，请复制上方链接导入。'
+  elif command -v qrencode >/dev/null 2>&1 && [[ -t 1 ]]; then
+    printf '\n当前终端不支持显示二维码，请复制上方链接导入。\n'
+  elif [[ -t 1 ]]; then
+    printf '\n二维码组件尚未安装，请复制上方链接导入。\n'
+  fi
+}
+
+ensure_shadowrocket_qr_support() {
+  local choice
+  command -v qrencode >/dev/null 2>&1 && return 0
+  printf '\n首次显示二维码需要安装服务器本地二维码组件，不会把节点信息发送给第三方。\n'
+  read_menu_choice '是否现在安装？[Y/n]：' 'y,Y,n,N' Y '请输入 y、n 或直接回车' || return 1
+  choice="$PROMPT_VALUE"
+  [[ ! "$choice" =~ ^[Nn]$ ]] || return 1
+  if apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y qrencode; then
+    return 0
+  fi
+  echo '二维码组件安装失败，本次仍会显示可复制的完整链接。'
+  return 1
+}
+
+cmd_export() {
+  local name="${1:-}"
+  local format="${2:-all}"
+  [[ -n "$name" ]] || die "用法：$PROGRAM export <用户名> [all|surge|shadowrocket]"
+  (( $# <= 2 )) || die "用法：$PROGRAM export <用户名> [all|surge|shadowrocket]"
+  validate_name "$name"
+  user_exists "$name" || die "用户不存在：$name"
+  case "$format" in
+    all|surge|shadowrocket) ;;
+    *) die "导出格式必须是 all、surge 或 shadowrocket" ;;
+  esac
+
+  local user endpoint endpoint_user protocol endpoint_count node_name port st_password ss_password method shadowtls_sni server_port shadowrocket_url
+  user="$(get_user_json "$name")"
+  endpoint_count="$(jq 'if (.endpoints | type) == "array" then .endpoints | length else 1 end' <<<"$user")" || return 1
+  while IFS= read -r endpoint; do
+    [[ -n "$endpoint" ]] || continue
+    protocol="$(jq -er '.protocol' <<<"$endpoint")" || return 1
+    port="$(jq -er '.port' <<<"$endpoint")" || return 1
+    if ((endpoint_count > 1)); then
+      [[ "$protocol" == anytls ]] && node_name="${name}-AnyTLS" || node_name="${name}-SS2022"
+      server_port="$port"
+    else
+      node_name="$name"
+      server_port="${CLIENT_SERVER_PORT_OVERRIDE:-$port}"
+    fi
+    endpoint_user="$(jq -c --arg name "$node_name" '. + {name:$name}' <<<"$endpoint")" || return 1
+    if [[ "$protocol" == anytls ]]; then
+      if [[ "$format" == all || "$format" == surge ]]; then
+        printf '\n[Surge]\n%s = anytls, %s, %s, password=%s, sni=%s, skip-cert-verify=true\n' "$node_name" "$PUBLIC_SERVER" "$server_port" "$(jq -r '.anytls_password' <<<"$endpoint")" "$(jq -r '.tls_sni' <<<"$endpoint")"
+      fi
+      if [[ "$format" == all || "$format" == shadowrocket ]]; then
+        shadowrocket_url="$(shadowrocket_anytls_url "$endpoint_user" "$server_port")" || die "无法生成 Shadowrocket AnyTLS 导入链接"
+        render_shadowrocket_export "$shadowrocket_url"
+      fi
+      continue
+    fi
+    st_password="$(jq -r '.shadowtls_password' <<<"$endpoint")"
+    ss_password="$(jq -r '.ss2022_password' <<<"$endpoint")"
+    method="$(jq -r '.method' <<<"$endpoint")"
+    shadowtls_sni="$(jq -r '.shadowtls_sni' <<<"$endpoint")"
+    if [[ "$format" == all || "$format" == surge ]]; then
+      printf '\n[Surge]\n'
+      printf '%s = ss, %s, %s, encrypt-method=%s, password=%s, shadow-tls-password=%s, shadow-tls-sni=%s, shadow-tls-version=3, udp-relay=true\n' \
+        "$node_name" "$PUBLIC_SERVER" "$server_port" "$method" "$ss_password" "$st_password" "$shadowtls_sni"
+    fi
+    if [[ "$format" == all || "$format" == shadowrocket ]]; then
+      shadowrocket_url="$(shadowrocket_ss2022_url "$endpoint_user" "$server_port")" || die "无法生成 Shadowrocket SS2022 + ShadowTLS 导入链接"
+      render_shadowrocket_export "$shadowrocket_url"
+    fi
+  done < <(jq -c '
+    if (.endpoints | type) == "array" then .endpoints[]
+    elif (.protocol // "ss2022") == "anytls" then
+      {protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}
+    else
+      {protocol:"ss2022",port:.port,shadowtls_password:.shadowtls_password,
+       ss2022_password:.ss2022_password,method:.method,shadowtls_sni:.shadowtls_sni}
+    end
+  ' <<<"$user")
+}

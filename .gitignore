@@ -1,0 +1,17 @@
+# 本地服务器快照可能包含密码和密钥，禁止提交
+server-snapshots/
+
+# 本地版本备份、日志和临时文件
+*-backups/
+backups/
+*.log
+*.tmp
+*.bak
+.DS_Store
+
+
+# 私钥、证书和环境配置
+*.key
+*.pem
+.env
+.env.*

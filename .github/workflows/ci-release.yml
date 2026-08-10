@@ -1,0 +1,234 @@
+name: CI and Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 jq nftables openssh-client openssh-server openssl procps python3 shellcheck sudo systemd util-linux
+          shellcheck --version
+      - name: Bash syntax
+        run: |
+          for script in sb-user-manager.sh tests/acceptance.sh tests/check-managed-step-errexit.sh tests/test-acceptance.sh tests/test-controller-state.sh tests/test-controller-role.sh tests/test-controller-role-repair.sh tests/test-controller-role-provision.sh tests/test-manager-role-detection.sh tests/test-manager-role-routing.sh tests/test-controller-landing-transport.sh tests/test-controller-landing-registration.sh tests/test-controller-landing-credentials.sh tests/test-controller-landing-onboarding.sh tests/test-controller-landing-onboarding-journal.sh tests/test-landing-apply-protocol.sh tests/test-landing-agent.sh tests/test-landing-channel-install.sh tests/test-landing-bootstrap.sh tests/test-landing-dependency-prep.sh tests/test-landing-singbox-runtime-prep.sh tests/test-landing-readiness-gate.sh tests/test-landing-channel-e2e.sh tests/test-landing-startup-gate.sh tools/build-manager.sh tools/audit-public-readiness.sh tools/export-public-snapshot.sh tests/test-build.sh tests/test-public.sh tests/test-public-readiness.sh tests/test-public-snapshot.sh tests/test-release-workflow.sh; do
+            bash -n "$script"
+          done
+      - name: Verify generated manager
+        run: bash tools/build-manager.sh --check
+      - name: ShellCheck
+        run: |
+          shellcheck -x -e SC1090,SC1091 sb-user-manager.sh tests/acceptance.sh tests/check-managed-step-errexit.sh tests/test-acceptance.sh tests/test-controller-state.sh tests/test-controller-role.sh tests/test-controller-role-repair.sh tests/test-controller-role-provision.sh tests/test-manager-role-detection.sh tests/test-manager-role-routing.sh tests/test-controller-landing-transport.sh tests/test-controller-landing-registration.sh tests/test-controller-landing-credentials.sh tests/test-controller-landing-onboarding.sh tests/test-controller-landing-onboarding-journal.sh tests/test-landing-apply-protocol.sh tests/test-landing-agent.sh tests/test-landing-channel-install.sh tests/test-landing-bootstrap.sh tests/test-landing-dependency-prep.sh tests/test-landing-singbox-runtime-prep.sh tests/test-landing-readiness-gate.sh tests/test-landing-channel-e2e.sh tests/test-landing-startup-gate.sh tools/build-manager.sh tools/audit-public-readiness.sh tools/export-public-snapshot.sh tests/test-build.sh tests/test-public-readiness.sh tests/test-public-snapshot.sh tests/test-release-workflow.sh
+          # 测试桩由动态 source 的公开版函数间接调用，ShellCheck 无法静态追踪。
+          shellcheck -x -e SC1090,SC1091,SC2034,SC2317 tests/test-public.sh
+      - name: Static release checks
+        run: bash tests/test-static.sh
+      - name: Deterministic manager build checks
+        run: bash tests/test-build.sh
+      - name: Refactor unit checks
+        run: bash tests/test-unit.sh
+      - name: Controller state checks
+        run: bash tests/test-controller-state.sh
+      - name: Entry controller role checks
+        run: bash tests/test-controller-role.sh
+      - name: Entry controller dependency repair checks
+        run: bash tests/test-controller-role-repair.sh
+      - name: Entry controller role provision checks
+        run: bash tests/test-controller-role-provision.sh
+      - name: Manager role detection checks
+        run: bash tests/test-manager-role-detection.sh
+      - name: Manager role routing checks
+        run: bash tests/test-manager-role-routing.sh
+      - name: Controller landing transport checks
+        run: bash tests/test-controller-landing-transport.sh
+      - name: Controller landing registration checks
+        run: bash tests/test-controller-landing-registration.sh
+      - name: Controller landing credential checks
+        run: bash tests/test-controller-landing-credentials.sh
+      - name: Controller landing onboarding checks
+        run: bash tests/test-controller-landing-onboarding.sh
+      - name: Controller landing onboarding journal checks
+        run: bash tests/test-controller-landing-onboarding-journal.sh
+      - name: Landing root bootstrap checks
+        run: bash tests/test-landing-bootstrap.sh
+      - name: Landing dependency preparation checks
+        run: bash tests/test-landing-dependency-prep.sh
+      - name: Landing sing-box runtime preparation checks
+        run: bash tests/test-landing-singbox-runtime-prep.sh
+      - name: Landing readiness gate checks
+        run: bash tests/test-landing-readiness-gate.sh
+      - name: Landing apply protocol checks
+        run: SB_LANDING_APPLY_TEST_FORCE_LINK_METHOD=proc SB_LANDING_APPLY_TEST_EXPECT_LINK_METHOD=proc bash tests/test-landing-apply-protocol.sh
+      - name: Landing apply direct anonymous publication checks as root
+        run: /usr/bin/sudo /usr/bin/env PATH=/usr/sbin:/usr/bin:/sbin:/bin SB_LANDING_APPLY_TEST_EXPECT_LINK_METHOD=direct /bin/bash tests/test-landing-apply-protocol.sh
+      - name: Landing agent checks
+        run: bash tests/test-landing-agent.sh
+      - name: Landing channel installation checks
+        run: bash tests/test-landing-channel-install.sh
+      - name: Landing startup recovery gate checks
+        run: SB_REQUIRE_LANDING_STARTUP_SYSTEMD_VERIFY=true bash tests/test-landing-startup-gate.sh
+      - name: Landing startup recovery gate runtime checks
+        run: /usr/bin/sudo /usr/bin/env PATH=/usr/sbin:/usr/bin:/sbin:/bin SB_REQUIRE_LANDING_STARTUP_SYSTEMD_VERIFY=true SB_REQUIRE_LANDING_STARTUP_SYSTEMD_RUNTIME=true /bin/bash tests/test-landing-startup-gate.sh
+      - name: Landing channel SSH and sudo boundary checks
+        run: /usr/bin/sudo /usr/bin/env PATH=/usr/sbin:/usr/bin:/sbin:/bin SB_REQUIRE_LANDING_CHANNEL_E2E=true SB_LANDING_CHANNEL_E2E_NORMALIZE_LOCAL_BIN=true /bin/bash tests/test-landing-channel-e2e.sh
+      - name: Acceptance harness checks
+        run: bash tests/test-acceptance.sh
+      - name: Public edition checks
+        run: bash tests/test-public.sh
+      - name: Public repository readiness audit checks
+        run: bash tests/test-public-readiness.sh
+      - name: Public source snapshot checks
+        run: bash tests/test-public-snapshot.sh
+      - name: Immutable release workflow checks
+        run: bash tests/test-release-workflow.sh
+
+  jq16-compat:
+    runs-on: ubuntu-24.04
+    container: debian:bookworm-20260713-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+    env:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+    steps:
+      - name: Install Debian 12 validation tools
+        run: apt-get update && apt-get install -y bash bsdextrautils ca-certificates coreutils diffutils findutils gawk git grep hostname jq openssh-client openssl python3 sed systemd tar util-linux
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Verify jq 1.6 migration compatibility
+        shell: bash
+        run: |
+          test "$(jq --version)" = jq-1.6
+          trace="$(mktemp)"
+          if ! bash -x tests/test-unit.sh >"$trace" 2>&1; then
+            tail -n 200 "$trace"
+            exit 1
+          fi
+          tail -n 2 "$trace"
+          rm -f "$trace"
+          bash tests/test-controller-state.sh
+          bash tests/test-controller-role.sh
+          bash tests/test-controller-role-repair.sh
+          bash tests/test-controller-role-provision.sh
+          bash tests/test-manager-role-detection.sh
+          bash tests/test-manager-role-routing.sh
+          bash tests/test-controller-landing-transport.sh
+          bash tests/test-controller-landing-registration.sh
+          bash tests/test-controller-landing-credentials.sh
+          bash tests/test-controller-landing-onboarding.sh
+          bash tests/test-controller-landing-onboarding-journal.sh
+          bash tests/test-landing-bootstrap.sh
+          bash tests/test-landing-dependency-prep.sh
+          bash tests/test-landing-singbox-runtime-prep.sh
+          bash tests/test-landing-readiness-gate.sh
+          bash tests/test-landing-apply-protocol.sh
+          bash tests/test-landing-agent.sh
+          bash tests/test-landing-channel-install.sh
+          SB_REQUIRE_LANDING_STARTUP_SYSTEMD_VERIFY=true bash tests/test-landing-startup-gate.sh
+          bash tests/test-release-workflow.sh
+
+  debian-landing-e2e:
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:bookworm-20260713-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+      options: --cap-add=NET_ADMIN
+    env:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      SB_LANDING_CHANNEL_E2E_CONTAINER: 'true'
+    steps:
+      - name: Install Debian 12 landing-channel test tools
+        run: apt-get update && apt-get install -y bash coreutils findutils gawk git grep iproute2 jq nftables openssh-client openssh-server openssl passwd procps python3 sudo systemd util-linux
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Verify generated manager
+        shell: bash
+        run: bash tools/build-manager.sh --check
+      - name: Verify real Debian 12 landing dependency paths
+        shell: bash
+        run: SB_REQUIRE_LANDING_DEPENDENCY_PREP_PRODUCTION=true bash tests/test-landing-dependency-prep.sh
+      - name: Landing channel SSH and sudo boundary checks on Debian 12
+        shell: bash
+        run: /usr/bin/env PATH=/usr/sbin:/usr/bin:/sbin:/bin SB_REQUIRE_LANDING_CHANNEL_E2E=true /bin/bash tests/test-landing-channel-e2e.sh
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [validate, jq16-compat, debian-landing-e2e]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Verify generated manager
+        run: bash tools/build-manager.sh --check
+      - name: Verify tag matches script and changelog
+        run: |
+          version="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)"/\1/p' sb-user-manager.sh | head -n1)"
+          test "v$version" = "${GITHUB_REF_NAME}"
+          grep -Fq "## $version " CHANGELOG.md
+      - name: Build checksum
+        run: sha256sum sb-user-manager.sh > sb-user-manager.sh.sha256
+      - name: Publish immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          tag="$GITHUB_REF_NAME"
+          assets=(
+            sb-user-manager.sh
+            sb-user-manager.sh.sha256
+          )
+          release_created=no
+          release_published=no
+
+          cleanup_draft() {
+            local rc=$?
+            trap - EXIT
+            if [[ "$release_created" == yes && "$release_published" != yes ]]; then
+              gh release delete "$tag" --yes >/dev/null 2>&1 || true
+            fi
+            exit "$rc"
+          }
+          trap cleanup_draft EXIT
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            printf 'Release %s 已存在；拒绝覆盖或复用同一版本。\n' "$tag" >&2
+            exit 1
+          fi
+
+          gh release create "$tag" \
+            --verify-tag \
+            --draft \
+            --title "sb-user-manager $tag" \
+            --generate-notes
+          release_created=yes
+
+          gh release upload "$tag" "${assets[@]}"
+
+          release_json=
+          for attempt in 1 2 3 4 5; do
+            release_json="$(gh release view "$tag" --json tagName,isDraft,isPrerelease,assets)"
+            if jq -e \
+              --arg tag "$tag" \
+              --arg manager_digest "sha256:$(sha256sum sb-user-manager.sh | awk '{print $1}')" \
+              --arg checksum_digest "sha256:$(sha256sum sb-user-manager.sh.sha256 | awk '{print $1}')" \
+              -f tools/verify-release-assets.jq <<<"$release_json" >/dev/null; then
+              break
+            fi
+            [[ "$attempt" != 5 ]] || {
+              printf '草稿 Release 的附件数量或摘要校验失败；不会发布正式版本。\n' >&2
+              exit 1
+            }
+            sleep 2
+          done
+
+          gh release edit "$tag" --draft=false --latest
+          release_published=yes
+          trap - EXIT

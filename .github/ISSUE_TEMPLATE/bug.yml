@@ -1,0 +1,41 @@
+name: 问题报告
+description: 报告功能异常、提示错误或操作结果不符合预期
+title: "[问题] "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: observed
+    attributes:
+      label: 实际发生了什么？
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 你原本期待什么？
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 如何出现这个问题？
+      description: 写出你选择过的菜单和输入；不要粘贴密码、令牌或完整用户配置。
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 管理脚本版本
+      placeholder: 例如 4.16.0
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 脱敏诊断报告
+      description: 建议先通过脚本查看报告内容，确认无敏感信息后再提供。
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: 安全确认
+      options:
+        - label: 我已确认内容中没有密码、访问令牌或用户连接配置。
+          required: true

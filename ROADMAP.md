@@ -1,0 +1,85 @@
+# 项目路线图
+
+路线图只记录影响上线和长期维护的阶段目标。新功能只有在解决明确用户问题、不会挤占更高优先级工作时才进入开发。
+
+## 优先级原则
+
+1. 防止数据损坏、秘密泄露和无法恢复的服务中断。
+2. 完成正式上线所需的验证、部署和回退能力。
+3. 修复影响普通用户使用的缺陷和不一致体验。
+4. 降低重复维护成本。
+5. 最后才考虑新的协议、界面或高级功能。
+
+## 阶段 0：建立治理基线（已完成）
+
+目标：让项目状态、决策、任务、部署和发布证据不再依赖单次聊天。
+
+- 建立项目状态、路线图、待办和部署回退文档。
+- 统一项目所有者、AI 产品与技术负责人和 Codex 执行代理的职责。
+- 所有开发从 Issue 开始，经独立分支、草稿 PR、CI 和产品验收结束。
+- 仓库、Issue、PR 和验收报告中不保存服务器凭据或用户配置。
+
+退出条件：Issue #46 合并，文档之间没有职责或流程冲突，本地门禁和 GitHub CI 通过。
+
+## 阶段 1：上线前稳定性验收（已完成）
+
+目标：证明正式 Release 可以在支持环境中安全安装、更新、运行和恢复。
+
+长期目标是建立可重复、可审计、可回退的完整真实服务器发布验收流程。第一轮采用最小可行方案：优先复用仓库现有的 `audit`、`lifecycle` 和 `full`，由人工补充版本升级、备份恢复和结果记录；不要求在进入本阶段时一次完成跨服务器编排、故障注入和全部自动化。
+
+当前进度：v4.17.0 的只读 `audit` 基线、用户生命周期、分流生命周期、迁移备份与恢复以及正式版菜单更新验收已经通过，失败项均为 0，测试结束后数据恢复到验收前基线。[Issue #63](https://github.com/DTB201/sb-user-manager/issues/63) 已证明真实菜单更新可保持用户、分流、配置与 Nfuse 用量。[Issue #68](https://github.com/DTB201/sb-user-manager/issues/68) 已建立首次正式上线检查单。v4.17.1、v4.17.2 与 v4.17.3 已完成修补、发布和测试机验收。[Issue #76](https://github.com/DTB201/sb-user-manager/issues/76) 已增加只读 `release` 模式。[Issue #78](https://github.com/DTB201/sb-user-manager/issues/78) 已随 v4.17.3 正式发布并通过 nube2 验收。[Issue #81](https://github.com/DTB201/sb-user-manager/issues/81) 已随 v4.17.4 正式发布：nube2 提供同端口 UDP，克隆机真实 UDP DNS 成功，Nfuse 用量增长 1145 字节，配额耗尽后查询被立即阻断，测试结束后完整恢复原环境；Surge 与 Shadowrocket 实机 UDP 均通过，nube2 已通过真实菜单更新到 v4.17.4，发布后 `release` 只读验收失败项为 0。[Issue #84](https://github.com/DTB201/sb-user-manager/issues/84) 已把无变化启动耗时从约 0.7 秒降到约 0.1 秒；[Issue #85](https://github.com/DTB201/sb-user-manager/issues/85) 已按 Shadowrocket 当前版本自身生成的样本实现 URL 与本地二维码导出，AnyTLS 与 SS2022 + ShadowTLS 的真实扫码、TCP 和 UDP 均已通过。v4.18.0 已正式发布，nube2 已通过真实菜单从 v4.17.4 更新，私有版和分享版 `release` 验收失败项均为 0。[Issue #91](https://github.com/DTB201/sb-user-manager/issues/91) 已随 v4.18.1 正式发布：air 原故障路径在数据修改前被正确拦截且 SSH 未断开，nube2 通过真实菜单从 v4.18.0 更新，安装脚本、服务、配置、Nfuse、事务、数据一致性和最近完整快照的 `release` 验收失败项为 0。[Issue #88](https://github.com/DTB201/sb-user-manager/issues/88) 的 Mihomo 导出按项目所有者决定暂缓，不进入目标版本。SEC-001 按项目所有者决定暂缓。
+
+阶段成果按优先级推进：
+
+- 形成上一正式版升级到当前 Release 的真实证据。
+- 形成用户、流量、分流和服务联动的脱敏验收证据。
+- 证明迁移备份可验证、可恢复，严重失败后存在可执行的回退路径。
+- 整理已知限制、正式环境前置条件和首日观察清单。
+
+具体事项和状态只在 [`TODO.md`](TODO.md) 维护；部署、验收和回退操作只在 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) 维护。
+
+后续迭代再根据第一轮证据逐步补齐跨干净环境恢复、受控中断、诊断脱敏和统一报告等自动化能力，避免在尚未验证基本流程前建设过重的测试系统。
+
+退出条件：已满足。第一轮最小可行验收的适用项目均已通过，失败恢复状态有记录，当前没有阻止上线的未解决 P0/P1 问题；结论由 [Issue #94](https://github.com/DTB201/sb-user-manager/issues/94) 记录。完整流程的后续自动化作为独立任务持续推进，不阻塞首次正式上线。
+
+## 阶段 2：首次正式上线（已完成）
+
+目标：以已经验收的固定 Release 部署第一台正式服务器。
+
+项目所有者选定首台正式服务器并明确授权后，已按 [Issue #96](https://github.com/DTB201/sb-user-manager/issues/96) 使用固定 v4.18.1 Release 完成全新部署和完整上线检查。
+
+- 上线前冻结目标版本，不在服务器上临时修改脚本。
+- 确认没有需要迁移的正式数据；部署前建立可验证的空环境快照并保留回退路径。
+- 按 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) 完成安装、服务检查、一致性检查和客户端连通验证。
+- 记录部署版本、时间、验收结果和回退版本，不记录凭据。
+- 上线后观察服务、到期任务、流量统计和分流结果。
+
+退出条件：已满足。项目所有者确认 AnyTLS 与 SS2022 + ShadowTLS 的 TCP、UDP 和用量统计可用；上线后 30 分钟与 24 小时观察通过，`release` 只读验收失败项为 0，观察期内没有数据一致性、事务、服务重启或相关错误问题。结论由 [Issue #96](https://github.com/DTB201/sb-user-manager/issues/96) 记录并关闭。
+
+## 阶段 3：上线后维护
+
+目标：保持稳定发布节奏，以真实问题驱动迭代。
+
+当前阶段：v4.23.0 已由 [Issue #242](https://github.com/DTB201/sb-user-manager/issues/242) 与 [PR #243](https://github.com/DTB201/sb-user-manager/pull/243) 准备并进入不可变 [Release](https://github.com/DTB201/sb-user-manager/releases/tag/v4.23.0)。入口控制器、多落地通道、原子 apply 与恢复、角色初始化和 readiness 能力仍保持 dormant，不开放入口数据面或多落地业务菜单，不改变 standalone 用户行为。本地门禁、PR、合并后 main 与标签 CI、Debian 12、jq 1.6 和四附件独立复核全部通过，本次未登录或修改服务器；v4.22.9 继续作为不可变代码回退版本。正式业务服务器继续稳定运行 v4.22.1，升级需要独立 Issue、回退准备和明确授权；当前没有未解决的 P0 或 P1 缺陷。
+
+- 缺陷和需求统一进入 Issue，按用户影响和风险排序。
+- 每次 Release 执行发布后更新测试和只读验收。
+- 定期验证备份可解密、恢复流程可执行。
+- 把单文件源码机械拆成模块并由确定性构建步骤生成，保持最终单脚本与现有行为逐字节一致。
+- 推进 Release 独立签名、构建证明和标签保护，降低供应链风险。
+- [Issue #126](https://github.com/DTB201/sb-user-manager/issues/126) 与 [PR #127](https://github.com/DTB201/sb-user-manager/pull/127) 已完成当前套餐可用的最小方案：草稿 Release 上传并校验全部附件后再发布，禁止覆盖同版本，并已启用 GitHub 不可变 Release。当前套餐不可用的私有仓库 Artifact Attestations 与 Ruleset 不纳入本阶段，也不为此升级付费。
+
+## 候选阶段 4：入口集中管理与多出口共享配额（设计验证中）
+
+目标：在不破坏 v4 `standalone` 的前提下，让一个可信入口完成 AnyTLS 认证、认证后共享配额、现有分流和多个落地的集中管理。
+
+[Issue #197](https://github.com/DTB201/sb-user-manager/issues/197) 和 [ADR 0005](docs/DECISIONS/0005-entry-authenticated-multi-egress-controller.md) 记录已经确认的产品边界。开始运行代码实现前，必须先按 [v5 POC 验收方案](docs/V5-ENTRY-CONTROLLER-POC.md) 证明：错误认证零计费、所有有效出口恰好计费一次、两个用户相互隔离、受管落地与现有 AnyTLS 分流共享同一用户配额，以及受限远程应用可以幂等回退。
+
+本阶段仍是候选阶段，不改变项目当前处于阶段 3 的事实，也不授权登录、部署或修改任何服务器。POC 未全绿时继续维护 v4，不退回认证前计费的透明 TLS 方案。
+
+## 暂不优先
+
+- 没有明确用户需求的新协议。
+- 仅为了技术美观的大规模重构。
+- 需要新增长期服务或复杂依赖的管理面板。
+- 没有真实瓶颈证据、与稳定性无关的性能微调。

@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全问题
+    url: https://github.com/DTB201/sb-user-manager/security/advisories/new
+    about: 涉及令牌、密码泄露、远程执行或权限绕过时，请私下报告，不要创建公开 Issue。

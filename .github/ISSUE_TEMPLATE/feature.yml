@@ -1,0 +1,39 @@
+name: 产品需求
+description: 用普通语言提出新功能或体验改进
+title: "[需求] "
+labels: ["product"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决什么问题？
+      description: 描述现在遇到的不便，不需要提供技术方案。
+    validations:
+      required: true
+  - type: textarea
+    id: experience
+    attributes:
+      label: 希望用户如何操作？
+      description: 可以描述菜单、默认选择和你期待看到的结果。
+    validations:
+      required: true
+  - type: textarea
+    id: preserve
+    attributes:
+      label: 哪些现有行为不能改变？
+      description: 不确定可以填写“由 AI 产品与技术负责人评估”。
+  - type: dropdown
+    id: priority
+    attributes:
+      label: 产品优先级
+      options:
+        - 下一版本必须完成
+        - 希望近期完成
+        - 可以以后再做
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 怎样才算完成？
+      description: 用用户视角描述验收结果；技术风险和测试由 AI 产品与技术负责人及 Codex 补充。
