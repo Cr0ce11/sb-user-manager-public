@@ -5,7 +5,7 @@ umask 077
 export LC_ALL=C
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
-MODE=write
+MODE='write'
 TARGET=
 WORK=
 
@@ -31,8 +31,8 @@ cleanup() {
 trap cleanup EXIT
 
 case "${1:-}" in
-  --output) MODE=write ;;
-  --check) MODE=check ;;
+  --output) MODE='write' ;;
+  --check) MODE='check' ;;
   -h|--help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac

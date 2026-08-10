@@ -201,7 +201,7 @@ if [[ "$CHECK_PUBLIC_TREE" == true ]]; then
     fi
     while IFS= read -r line; do
       reference="${line#*uses:}"
-      reference="${reference#${reference%%[![:space:]]*}}"
+      reference="${reference#"${reference%%[![:space:]]*}"}"
       [[ "$reference" == ./* ]] && continue
       [[ "$reference" =~ @([0-9a-f]{40})([[:space:]]|$) ]] || printf '%s\n' "$line" >> "$workflow_result"
     done < <(grep -REn '^[[:space:]]*-?[[:space:]]*uses:' "$ROOT/.github/workflows" 2>/dev/null || true)
@@ -209,7 +209,7 @@ if [[ "$CHECK_PUBLIC_TREE" == true ]]; then
       workflow_content="${line#*:}"
       workflow_content="${workflow_content#*:}"
       image_reference="${workflow_content#*:}"
-      image_reference="${image_reference#${image_reference%%[![:space:]]*}}"
+      image_reference="${image_reference#"${image_reference%%[![:space:]]*}"}"
       [[ -z "$image_reference" ]] && continue
       [[ "$image_reference" =~ @sha256:[0-9a-f]{64}([[:space:]]|$) ]] || printf '%s\n' "$line" >> "$workflow_result"
     done < <(grep -REn '^[[:space:]]*(container|image):' "$ROOT/.github/workflows" 2>/dev/null || true)
