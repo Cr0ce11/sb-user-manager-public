@@ -191,7 +191,11 @@ if [[ "$CHECK_PUBLIC_TREE" == true ]]; then
       grep -Eq '^[[:space:]]*permissions:[[:space:]]*$' "$workflow_file" &&
         grep -Eq '^[[:space:]]*contents:[[:space:]]*read[[:space:]]*$' "$workflow_file" ||
         printf '%s\n' "$relative_workflow" >> "$workflow_result"
-      if grep -Eq '\$\{\{[[:space:]]*secrets\.|(^|[[:space:],[])self-hosted([][:space:],]|$)' "$workflow_file"; then
+      if grep -Eq '(^|[[:space:],[])self-hosted([][:space:],]|$)' "$workflow_file"; then
+        printf '%s\n' "$relative_workflow" >> "$workflow_result"
+      fi
+      if grep -E '\$\{\{[[:space:]]*secrets\.' "$workflow_file" |
+        grep -Ev '^[[:space:]]*GH_TOKEN:[[:space:]]*\$\{\{[[:space:]]*secrets\.IMMUTABLE_RELEASES_READ_TOKEN[[:space:]]*\}\}[[:space:]]*$' >/dev/null; then
         printf '%s\n' "$relative_workflow" >> "$workflow_result"
       fi
     done < <(find "$ROOT/.github/workflows" -type f \( -name '*.yml' -o -name '*.yaml' \) -print)

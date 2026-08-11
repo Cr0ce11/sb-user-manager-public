@@ -45,4 +45,6 @@
 
 SHA-256 只能证明下载内容与 Release 元数据一致，不能阻止发布后用同一版本号替换附件。Release 必须先以草稿形式上传唯一公开脚本及其 SHA-256 文件，核对 GitHub digest 后一次性发布；同版本已经存在时拒绝覆盖或复用。
 
+发布前读取仓库不可变 Release 设置必须使用只授权当前仓库、仅有 Repository Administration 只读权限的短期 Actions Secret；该密钥不得用于创建、上传或发布 Release。密钥缺失、过期、接口拒绝或设置未启用时必须在创建 Release 前失败关闭。
+
 仓库使用 GitHub 不可变 Release 锁定未来正式版的标签与附件。迁移到公开仓库后重新评估 Artifact Attestations 和 Ruleset；在正式启用前不宣称具备这些保护，也不引入需要自行保管的长期签名私钥。

@@ -35,6 +35,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@1111111111111111111111111111111111111111
+      - name: Read immutable release setting
+        env:
+          GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+        run: test -n "$GH_TOKEN"
 EOF
 git -C "$repo" add .
 git -C "$repo" commit -qm 'clean fixture'
@@ -82,6 +86,8 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    env:
+      UNSAFE_TOKEN: ${{ secrets.ANOTHER_REPOSITORY_TOKEN }}
     steps:
       - uses: actions/checkout@v7
 EOF
