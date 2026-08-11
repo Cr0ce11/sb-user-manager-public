@@ -29,9 +29,9 @@ release_filter_contract='-f tools/verify-release-assets.jq'
 release_publish_contract="gh release edit \"${literal_dollar}tag\" --draft=false --latest"
 release_delete_contract="gh release delete \"${literal_dollar}tag\" --yes"
 immutable_check_contract="bash tools/check-immutable-release-setting.sh \"${literal_dollar}GITHUB_REPOSITORY\""
-immutable_token_contract='GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}'
-release_token_contract='GH_TOKEN: ${{ github.token }}'
-missing_token_contract='if [[ -z "${GH_TOKEN:-}" ]]; then'
+immutable_token_contract="GH_TOKEN: ${literal_dollar}{{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}"
+release_token_contract="GH_TOKEN: ${literal_dollar}{{ github.token }}"
+missing_token_contract="if [[ -z \"${literal_dollar}{GH_TOKEN:-}\" ]]; then"
 
 for release_contract in \
   "$release_view_contract" \
