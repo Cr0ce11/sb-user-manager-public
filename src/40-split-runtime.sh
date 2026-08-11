@@ -355,11 +355,13 @@ split_user_inbound_tags() {
   jq -c --arg name "$user" '
     first(.users[]? | select(.name == $name)) as $user |
     if $user == null then []
-    else [
-      (if ($user.endpoints | type) == "array" then $user.endpoints[]
-       else {protocol:($user.protocol // "ss2022"),transport:($user.transport // "shadowtls")} end) |
+    else (if ($user.endpoints | type) == "array" then $user.endpoints
+          else [{protocol:($user.protocol // "ss2022"),transport:($user.transport // "shadowtls")}] end) as $endpoints |
+    ($endpoints | any(.protocol == "ss2022" and .transport == "shadowtls")) as $has_legacy |
+    [ $endpoints[] |
       if .protocol == "anytls" then "anytls-" + $name
       elif .transport == "shadowtls" then "st-" + $name, "ss-" + $name, "ss-udp-" + $name
+      elif $has_legacy then "ss-direct-" + $name
       else "ss-" + $name end
     ] | unique end
   ' "$STATE_FILE"

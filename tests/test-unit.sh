@@ -95,7 +95,7 @@ EOF
   cmd_export multi surge > "$work/state-multi-export.txt"
   grep -Fq 'multi-SS2022 = ss, 203.0.113.10, 23003' "$work/state-multi-export.txt"
   grep -Fq 'multi-AnyTLS = anytls, 203.0.113.10, 23004' "$work/state-multi-export.txt"
-  state_remove_user_endpoint multi ss2022
+  state_remove_user_endpoint multi ss2022-direct
   jq -e '
     .users[0].protocol == "anytls" and .users[0].port == 23004 and
     .users[0].anytls_password == "at-secret" and
@@ -103,6 +103,91 @@ EOF
     .users[0].limit_gib == 88 and .users[0].billing_anchor == 12
   ' "$STATE_FILE" >/dev/null
 )
+
+# 同一账户可受限共存一个旧版 ShadowTLS、一个原生 SS2022 和一个 AnyTLS；
+# 三类入口必须使用独立标签、独立导出名称，并能精确编辑或移除其中一个。
+(
+  STATE_FILE="$work/state-three-endpoints.json"
+  HANDSHAKE_PORT=443
+  SHADOWTLS_STRICT_MODE=true
+  cat > "$STATE_FILE" <<'EOF'
+{"schema_version":7,"users":[{"name":"triple","port":23101,"protocol":"ss2022","transport":"shadowtls","shadowtls_password":"legacy-st","ss2022_password":"legacy-ss","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"legacy.example.com","metered":false,"expires_at":null,"limit_gib":null,"billing_anchor":null,"usage_offset_bytes":0,"status":"disabled","created_at":"2026-08-11T00:00:00+08:00","endpoints":[{"protocol":"ss2022","transport":"shadowtls","port":23101,"shadowtls_password":"legacy-st","ss2022_password":"legacy-ss","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"legacy.example.com"},{"protocol":"ss2022","transport":"direct","port":23102,"ss2022_password":"direct-ss","method":"2022-blake3-aes-128-gcm"},{"protocol":"anytls","port":23103,"anytls_password":"any-secret","tls_sni":"any.example.com"}]}],"splits":[],"outbound_presets":[],"rule_presets":[]}
+EOF
+  validate_state_user_endpoints "$STATE_FILE"
+  jq -n --slurpfile state "$STATE_FILE" '{format_version:1,created_at:"2026-08-11T00:00:00+08:00",
+    script_version:"4.25.0",source_hostname:"test",state:$state[0],nfuse_usage:[]}' \
+    > "$work/state-three-migration-payload.json"
+  validate_migration_payload_structure "$work/state-three-migration-payload.json"
+  fragment="$(make_user_inbounds_from_state "$(jq -c '.users[0]' "$STATE_FILE")")"
+  jq -e '
+    length == 5 and
+    ([.[].tag] | sort) == ["anytls-triple","ss-direct-triple","ss-triple","ss-udp-triple","st-triple"] and
+    any(.[]; .tag == "ss-direct-triple" and .listen_port == 23102) and
+    any(.[]; .tag == "st-triple" and .listen_port == 23101)
+  ' <<<"$fragment" >/dev/null
+  jq -e '. == ["anytls-triple","ss-direct-triple","ss-triple","ss-udp-triple","st-triple"]' \
+    <<<"$(split_user_inbound_tags triple)" >/dev/null
+  PUBLIC_SERVER=203.0.113.10
+  cmd_export triple surge > "$work/state-three-endpoints-export.txt"
+  grep -Fq 'triple-SS2022-ShadowTLS = ss, 203.0.113.10, 23101' "$work/state-three-endpoints-export.txt"
+  grep -Fq 'triple-SS2022 = ss, 203.0.113.10, 23102' "$work/state-three-endpoints-export.txt"
+  grep -Fq 'triple-AnyTLS = anytls, 203.0.113.10, 23103' "$work/state-three-endpoints-export.txt"
+
+  cp "$STATE_FILE" "$work/state-three-remove-direct.json"
+  STATE_FILE="$work/state-three-remove-direct.json"
+  state_remove_user_endpoint triple ss2022-direct
+  jq -e '
+    [.users[0].endpoints[] |
+      if .protocol == "anytls" then "anytls" else "ss2022-" + .transport end] ==
+      ["ss2022-shadowtls","anytls"] and
+    .users[0].shadowtls_password == "legacy-st" and .users[0].usage_offset_bytes == 0
+  ' "$STATE_FILE" >/dev/null
+
+  cp "$work/state-three-endpoints.json" "$work/state-three-remove-legacy.json"
+  STATE_FILE="$work/state-three-remove-legacy.json"
+  state_remove_user_endpoint triple ss2022-shadowtls
+  jq -e '
+    .users[0].protocol == "ss2022" and .users[0].transport == "direct" and .users[0].port == 23102 and
+    .users[0].ss2022_password == "direct-ss" and
+    [.users[0].endpoints[].protocol] == ["ss2022","anytls"]
+  ' "$STATE_FILE" >/dev/null
+
+  cp "$work/state-three-endpoints.json" "$work/state-three-edit-direct.json"
+  STATE_FILE="$work/state-three-edit-direct.json"
+  ensure_safe_ssh_for_singbox_restart() { return 0; }
+  start_managed_operation() { :; }
+  finish_managed_operation() { :; }
+  generate_ss_password() { printf 'new-direct-secret\n'; }
+  cmd_export() { :; }
+  cmd_edit_user triple 23102 '' 2022-blake3-aes-256-gcm '' '' ss2022-direct >/dev/null
+  jq -e '
+    (.users[0].endpoints[] | select(.transport == "shadowtls") |
+      .method == "2022-blake3-aes-128-gcm" and .ss2022_password == "legacy-ss") and
+    (.users[0].endpoints[] | select(.transport == "direct") |
+      .method == "2022-blake3-aes-256-gcm" and .ss2022_password == "new-direct-secret")
+  ' "$STATE_FILE" >/dev/null
+)
+
+# 同类入口仍然禁止重复，避免把受限迁移模型退化为任意多开。
+(
+  duplicate_state="$work/state-three-duplicate.json"
+  jq '.users[0].endpoints[2] = (.users[0].endpoints[1] | .port = 23103)' \
+    "$work/state-three-endpoints.json" > "$duplicate_state"
+  if validate_state_user_endpoints "$duplicate_state"; then
+    echo 'state validation accepted two native SS2022 endpoints' >&2
+    exit 1
+  fi
+)
+
+(
+  STATE_FILE="$work/state-three-remove-direct.json"
+  MENU_RETURNED=false
+  prepare_core() { :; }
+  prompt_manage_user_protocols <<<$'1\n0'
+  [[ "$MENU_RETURNED" == true ]]
+) > "$work/state-three-protocol-menu.txt"
+grep -Fq '添加原生 SS2022' "$work/state-three-protocol-menu.txt"
+! grep -Fq '添加 SS2022 + ShadowTLS' "$work/state-three-protocol-menu.txt"
 
 multi_add_body="$(declare -f cmd_add_multi)"
 multi_state_line="$(grep -n 'run_managed_step state_add_multi_user' <<<"$multi_add_body" | cut -d: -f1)"
@@ -211,6 +296,26 @@ listen-port 23003
 nfuse-port 23003
 certificate
 tag anytls-alice
+EOF
+  ) "$trace"
+)
+
+# 为旧版 ShadowTLS 用户补原生 SS2022 时，旧标签属于同一用户，只有新的独立标签需要查重。
+(
+  trace="$work/new-endpoint-preflight-legacy"
+  STATE_FILE="$work/state-three-remove-direct.json"
+  PORT_MIN=20001
+  PORT_MAX=30000
+  port_in_state() { printf 'state-port %s\n' "$1" >> "$trace"; return 1; }
+  port_is_listening() { printf 'listen-port %s\n' "$1" >> "$trace"; return 1; }
+  nfuse_port_exists() { printf 'nfuse-port %s\n' "$1" >> "$trace"; return 1; }
+  tag_exists_in_config() { printf 'tag %s\n' "$1" >> "$trace"; return 1; }
+  check_new_endpoint_conflicts ss2022-direct triple 23102
+  diff -u <(cat <<'EOF'
+state-port 23102
+listen-port 23102
+nfuse-port 23102
+tag ss-direct-triple
 EOF
   ) "$trace"
 )
@@ -835,7 +940,7 @@ SB_USER_CONF="$deploy_conf" EXPECTED_STATE="$deploy_state" SB_USER_MANAGER_LIBRA
   initialize_deployed_state
   [[ -f "$EXPECTED_STATE" ]]
   jq -e '\''
-    .schema_version == 6 and
+    .schema_version == 7 and
     .users == [] and
     .splits == [] and
     .outbound_presets == [] and
@@ -853,7 +958,7 @@ SB_USER_CONF="$deploy_conf" SB_USER_MANAGER_LIBRARY=true bash -c '
   source ./sb-user-manager.sh
   initialize_deployed_state true
 '
-jq -e '.schema_version == 6 and .users == [] and .splits == [] and .outbound_presets == [] and .rule_presets == []' "$deploy_state" >/dev/null
+jq -e '.schema_version == 7 and .users == [] and .splits == [] and .outbound_presets == [] and .rule_presets == []' "$deploy_state" >/dev/null
 
 printf '%s\n' '{"schema_version":999,"users":[],"splits":[]}' > "$deploy_state"
 deploy_rollback_marker="$deploy_state_root/rollback-marker"
@@ -1606,16 +1711,16 @@ printf '%s\n' '{"users":[{"name":"alice","port":20001,"status":"active","protoco
 chmod 600 "$STATE_FILE"
 
 migrate_state >/dev/null
-[[ "$(jq -r '.schema_version' "$STATE_FILE")" == 6 ]]
+[[ "$(jq -r '.schema_version' "$STATE_FILE")" == 7 ]]
 [[ "$(jq -r '.users[0].tls_sni' "$STATE_FILE")" == anytls.example.com ]]
 [[ "$(jq -r '.users[0].usage_offset_bytes' "$STATE_FILE")" == 0 ]]
 jq -e '.users[0].endpoints == [{protocol:"anytls",port:20001,anytls_password:"legacy-anytls-secret",tls_sni:"anytls.example.com"}]' "$STATE_FILE" >/dev/null
-[[ "$(find "$BACKUP_DIR" -type f -name 'managed-users.pre-schema-0-to-6-*.json' | wc -l | tr -d ' ')" == 1 ]]
+[[ "$(find "$BACKUP_DIR" -type f -name 'managed-users.pre-schema-0-to-7-*.json' | wc -l | tr -d ' ')" == 1 ]]
 
 printf '%s\n' '{"schema_version":1,"users":[{"name":"legacy","port":20004,"status":"active","shadowtls_password":"st","ss2022_password":"ss"},{"name":"legacy-disabled","port":20005,"status":"disabled","shadowtls_password":"st2","ss2022_password":"ss2","method":"2022-blake3-aes-256-gcm"}],"splits":[]}' > "$STATE_FILE"
 migrate_state >/dev/null
 jq -e '
-  .schema_version == 6 and
+  .schema_version == 7 and
   .outbound_presets == [] and .rule_presets == [] and
   .users[0].method == "2022-blake3-aes-256-gcm" and
   .users[0].shadowtls_sni == "legacy.example.com" and
@@ -1628,8 +1733,17 @@ jq -e '
 
 printf '%s\n' '{"schema_version":4,"users":[{"name":"legacy-current","port":20006,"protocol":"anytls","status":"active","metered":false,"expires_at":null,"limit_gib":null,"billing_anchor":null,"created_at":"2026-07-15T00:00:00+08:00","anytls_password":"legacy-secret","tls_sni":"legacy.example.com"}],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
 migrate_state >/dev/null
-jq -e '.schema_version == 6 and .users[0].usage_offset_bytes == 0 and .users[0].endpoints[0] == {protocol:"anytls",port:20006,anytls_password:"legacy-secret",tls_sni:"legacy.example.com"}' "$STATE_FILE" >/dev/null
-[[ "$(find "$BACKUP_DIR" -type f -name 'managed-users.pre-schema-4-to-6-*.json' | wc -l | tr -d ' ')" == 1 ]]
+jq -e '.schema_version == 7 and .users[0].usage_offset_bytes == 0 and .users[0].endpoints[0] == {protocol:"anytls",port:20006,anytls_password:"legacy-secret",tls_sni:"legacy.example.com"}' "$STATE_FILE" >/dev/null
+[[ "$(find "$BACKUP_DIR" -type f -name 'managed-users.pre-schema-4-to-7-*.json' | wc -l | tr -d ' ')" == 1 ]]
+
+printf '%s\n' '{"schema_version":6,"users":[{"name":"schema6-direct","port":20007,"protocol":"ss2022","transport":"direct","status":"disabled","metered":false,"expires_at":null,"limit_gib":null,"billing_anchor":null,"usage_offset_bytes":0,"created_at":"2026-08-11T00:00:00+08:00","ss2022_password":"keep-direct","method":"2022-blake3-aes-128-gcm","endpoints":[{"protocol":"ss2022","transport":"direct","port":20007,"ss2022_password":"keep-direct","method":"2022-blake3-aes-128-gcm"}]}],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
+migrate_state >/dev/null
+jq -e '
+  .schema_version == 7 and .users[0].transport == "direct" and
+  .users[0].endpoints == [{protocol:"ss2022",transport:"direct",port:20007,
+    ss2022_password:"keep-direct",method:"2022-blake3-aes-128-gcm"}]
+' "$STATE_FILE" >/dev/null
+[[ "$(find "$BACKUP_DIR" -type f -name 'managed-users.pre-schema-6-to-7-*.json' | wc -l | tr -d ' ')" == 1 ]]
 
 multi_endpoint_state="$work/multi-endpoint-state.json"
 printf '%s\n' '{"schema_version":6,"users":[{"name":"multi","port":21001,"protocol":"anytls","status":"active","metered":true,"expires_at":null,"limit_gib":10,"billing_anchor":1,"usage_offset_bytes":0,"created_at":"2026-08-10T00:00:00+08:00","anytls_password":"at-secret","tls_sni":"at.example.com","endpoints":[{"protocol":"anytls","port":21001,"anytls_password":"at-secret","tls_sni":"at.example.com"},{"protocol":"ss2022","transport":"shadowtls","port":21002,"shadowtls_password":"st-secret","ss2022_password":"ss-secret","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"ss.example.com"}]}],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$multi_endpoint_state"
@@ -3309,7 +3423,7 @@ EOF
 chmod 700 "$diagnostic_bin/sing-box" "$diagnostic_bin/nfuse"
 cat > "$diagnostic_state" <<'EOF'
 {
-  "schema_version": 6,
+  "schema_version": 7,
   "users": [{
     "name": "crocell", "status": "active", "protocol": "anytls", "port": 20001,
     "metered": true, "limit_gib": 10, "anytls_password": "secret-crocell-123",
@@ -3744,7 +3858,7 @@ legacy_v412_payload="$work/migration-v4.12.json"
 printf '%s\n' '{"format_version":1,"created_at":"2026-07-15T00:00:00+08:00","script_version":"4.12.0","source_hostname":"legacy-source","state":{"schema_version":3,"users":[{"name":"legacy-metered","port":20031,"status":"active","metered":true,"expires_at":"2026-12-15T00:00:00+08:00","limit_gib":10,"billing_anchor":15,"created_at":"2026-07-15T00:00:00+08:00","shadowtls_password":"st","ss2022_password":"ss","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"ss.example.com"},{"name":"legacy-self","port":20032,"protocol":"anytls","status":"disabled","metered":false,"expires_at":null,"limit_gib":null,"billing_anchor":null,"created_at":"2026-07-15T00:00:00+08:00","anytls_password":"at","tls_sni":"at.example.com"}],"splits":[]},"nfuse_usage":[{"name":"legacy-metered","used_bytes":123}]}' > "$legacy_v412_payload"
 validate_migration_payload_structure "$legacy_v412_payload"
 jq -e '
-  .state.schema_version == 6 and .state.outbound_presets == [] and .state.rule_presets == [] and
+  .state.schema_version == 7 and .state.outbound_presets == [] and .state.rule_presets == [] and
   all(.state.users[]; .usage_offset_bytes == 0)
 ' "$legacy_v412_payload" >/dev/null
 jq '.state.users[0].usage_offset_bytes = null' "$legacy_v412_payload" > "$work/migration-invalid-offset.json"
@@ -3976,7 +4090,7 @@ batch_state_before="$(sha256sum "$STATE_FILE" "$SINGBOX_CONFIG")"
 decrypt_retry_output="$work/decrypt-retry-output"
 printf '%s\n' 'wrong-password' 'unit-test-password' | decrypt_migration_backup "$bundle" "$decrypted" >"$decrypt_retry_output"
 jq -e --slurpfile original "$migration_payload" '
-  .state.schema_version == 6 and .state.outbound_presets == [] and .state.rule_presets == [] and
+  .state.schema_version == 7 and .state.outbound_presets == [] and .state.rule_presets == [] and
   (.state.users | map(del(.endpoints) | if .protocol == "ss2022" then del(.protocol,.transport) else . end)) == $original[0].state.users and
   all(.state.users[]; (.endpoints | length) == 1 and .endpoints[0].port == .port) and
   all(.state.users[] | select(.protocol == "ss2022"); .transport == "shadowtls" and .endpoints[0].transport == "shadowtls") and
@@ -4010,7 +4124,7 @@ mkdir -p "$created_materialized"
 materialize_migration_bundle "$created_bundle" "$created_materialized"
 SB_BACKUP_PASSWORD='unit-test-password' openssl enc -d -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 \
   -in "$MATERIALIZED_MIGRATION_ENCRYPTED" -out "$created_plain" -pass env:SB_BACKUP_PASSWORD
-jq -e '.state.schema_version == 6 and .state.users[0].usage_offset_bytes == 0' "$created_plain" >/dev/null
+jq -e '.state.schema_version == 7 and .state.users[0].usage_offset_bytes == 0' "$created_plain" >/dev/null
 
 MIGRATION_BACKUP_DIR="$work/rejected-created"
 jq '.users[0].usage_offset_bytes = null' "$STATE_FILE" > "$work/invalid-created-migration-state.json"
