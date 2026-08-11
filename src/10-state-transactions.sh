@@ -207,6 +207,11 @@ restore_state_backup_atomically() {
 validate_state_user_endpoints() {
   local file="${1:-$STATE_FILE}"
   jq -e '
+    def endpoint_kind:
+      if .protocol == "anytls" then "anytls"
+      elif .protocol == "ss2022" and .transport == "direct" then "ss2022-direct"
+      elif .protocol == "ss2022" and .transport == "shadowtls" then "ss2022-shadowtls"
+      else null end;
     def valid_ss2022_endpoint:
       (.transport == "direct" or .transport == "shadowtls") and
       (.method == "2022-blake3-aes-128-gcm" or .method == "2022-blake3-aes-256-gcm") and
@@ -222,8 +227,8 @@ validate_state_user_endpoints() {
     all(.users[];
       (has("usage_offset_bytes") and (.usage_offset_bytes | type == "number") and
        .usage_offset_bytes == (.usage_offset_bytes | floor) and .usage_offset_bytes >= 0) and
-      (.endpoints | type == "array" and length >= 1 and length <= 2) and
-      ([.endpoints[].protocol] | length == (unique | length)) and
+      (.endpoints | type == "array" and length >= 1 and length <= 3) and
+      ([.endpoints[] | endpoint_kind] | all(. != null) and length == (unique | length)) and
       ([.endpoints[].port] | length == (unique | length)) and
       (.protocol == .endpoints[0].protocol) and (.port == .endpoints[0].port) and
       all(.endpoints[];
@@ -370,6 +375,13 @@ migrate_state() {
     fi
     schema=6
   fi
+  if ((schema == 6)); then
+    if ! atomic_state_update '.schema_version = 7'; then
+      restore_state_backup_atomically "$backup" || die "多入口共存数据升级失败，且无法自动恢复原数据；备份：$backup"
+      die "多入口共存数据升级失败，原数据已自动恢复；备份：$backup"
+    fi
+    schema=7
+  fi
   if ((schema == STATE_SCHEMA_VERSION)) && [[ "$needs_usage_offset" == true && "$original_schema" == "$STATE_SCHEMA_VERSION" ]]; then
     if ! atomic_state_update '
       .users |= map(if has("usage_offset_bytes") then . else .usage_offset_bytes = 0 end)
@@ -383,6 +395,11 @@ migrate_state() {
     die "当前脚本无法升级这份旧用户数据，请先安装兼容版本（数据版本 ${schema}）"
   }
   jq -e --argjson schema "$STATE_SCHEMA_VERSION" '
+    def endpoint_kind:
+      if .protocol == "anytls" then "anytls"
+      elif .protocol == "ss2022" and .transport == "direct" then "ss2022-direct"
+      elif .protocol == "ss2022" and .transport == "shadowtls" then "ss2022-shadowtls"
+      else null end;
     def valid_ss2022_endpoint:
       (.transport == "direct" or .transport == "shadowtls") and
       (.method == "2022-blake3-aes-128-gcm" or .method == "2022-blake3-aes-256-gcm") and
@@ -399,8 +416,8 @@ migrate_state() {
     all(.users[];
       (has("usage_offset_bytes") and (.usage_offset_bytes | type == "number") and
        .usage_offset_bytes == (.usage_offset_bytes | floor) and .usage_offset_bytes >= 0) and
-      (.endpoints | type == "array" and length >= 1 and length <= 2) and
-      ([.endpoints[].protocol] | length == (unique | length)) and
+      (.endpoints | type == "array" and length >= 1 and length <= 3) and
+      ([.endpoints[] | endpoint_kind] | all(. != null) and length == (unique | length)) and
       ([.endpoints[].port] | length == (unique | length)) and
       (.protocol == .endpoints[0].protocol) and (.port == .endpoints[0].port) and
       all(.endpoints[];

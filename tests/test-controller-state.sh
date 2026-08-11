@@ -81,7 +81,7 @@ expect_invalid_json() {
 
 # 仅加载脚本不能创建 v5 状态，确保当前 v4 服务器行为不变。
 [[ ! -e "$CONTROLLER_STATE_FILE" && ! -L "$CONTROLLER_STATE_FILE" ]]
-[[ "$STATE_SCHEMA_VERSION" == 6 ]]
+[[ "$STATE_SCHEMA_VERSION" == 7 ]]
 [[ "$MIGRATION_FORMAT_VERSION" == 1 && "$MIGRATION_BUNDLE_VERSION" == 1 ]]
 if grep -Fq 'init_controller_state' <<<"$(declare -f main)"; then
   fail 'main must not initialize the controller state'

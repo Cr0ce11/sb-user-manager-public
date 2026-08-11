@@ -489,6 +489,9 @@ normalize_migration_payload_schema() {
           if .protocol == "ss2022" then .transport = (.transport // "shadowtls") else . end
         ) |
         .state.schema_version = 6
+      else . end |
+      if .state.schema_version == 6 and $schema >= 7 then
+        .state.schema_version = 7
       else . end
     ' "$file" > "$tmp"; then
       rm -f -- "$tmp"
@@ -560,6 +563,11 @@ validate_migration_payload_structure() {
   local payload="$1" rule_url
   normalize_migration_payload_schema "$payload" || return 1
   jq -e --argjson schema "$STATE_SCHEMA_VERSION" '
+    def endpoint_kind:
+      if .protocol == "anytls" then "anytls"
+      elif .protocol == "ss2022" and .transport == "direct" then "ss2022-direct"
+      elif .protocol == "ss2022" and .transport == "shadowtls" then "ss2022-shadowtls"
+      else null end;
     def valid_ss2022_endpoint:
       (.transport == "direct" or .transport == "shadowtls") and
       (.ss2022_password | type == "string" and length > 0) and
@@ -617,8 +625,8 @@ validate_migration_payload_structure() {
       (has("usage_offset_bytes") and ((.usage_offset_bytes|type) == "number") and (.usage_offset_bytes == (.usage_offset_bytes|floor)) and (.usage_offset_bytes >= 0)) and
       (has("created_at") and ((.created_at|type) == "string" and length>0)) and
       (if .metered then (((.limit_gib|type) == "number") and .limit_gib>0) and (((.billing_anchor|type) == "number") and .billing_anchor==(.billing_anchor|floor) and .billing_anchor>=1) else true end) and
-      (.endpoints | type == "array" and length >= 1 and length <= 2) and
-      ([.endpoints[].protocol] | length == (unique | length)) and
+      (.endpoints | type == "array" and length >= 1 and length <= 3) and
+      ([.endpoints[] | endpoint_kind] | all(. != null) and length == (unique | length)) and
       ([.endpoints[].port] | length == (unique | length)) and
       (.protocol == .endpoints[0].protocol) and (.port == .endpoints[0].port) and
       all(.endpoints[];
@@ -784,10 +792,11 @@ EOF
 
 migration_user_conflict() {
   local payload="$1" candidate="$2" replace_name="$3" normalized="$4"
-  local name port protocol tag owner endpoint
+  local name port protocol tag owner endpoint has_legacy=false
   local -a tags
   MIGRATION_CONFLICT_REASON=""
   name="$(jq -r '.name' <<<"$candidate")"
+  jq -e 'any(.endpoints[]?; .protocol == "ss2022" and .transport == "shadowtls")' <<<"$candidate" >/dev/null && has_legacy=true
   if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$ ]]; then
     MIGRATION_CONFLICT_REASON="用户名不符合规则：$name"; return 0
   fi
@@ -823,6 +832,8 @@ migration_user_conflict() {
       tags=("anytls-$name")
     elif [[ "$(jq -r '.transport // "shadowtls"' <<<"$endpoint")" == shadowtls ]]; then
       tags=("st-$name" "ss-$name" "ss-udp-$name")
+    elif [[ "$has_legacy" == true ]]; then
+      tags=("ss-direct-$name")
     else
       tags=("ss-$name")
     fi
@@ -1223,11 +1234,15 @@ current_state_owns_tag() {
   local tag="$1" rows split runtime_tag
   jq -e --arg tag "$tag" '
     any(.users[]?;
-      . as $user | any(if (.endpoints | type) == "array" then .endpoints[]
-        else {protocol:(.protocol // "ss2022"),transport:(.transport // "shadowtls")} end;
+      . as $user |
+      (if (.endpoints | type) == "array" then .endpoints
+       else [{protocol:(.protocol // "ss2022"),transport:(.transport // "shadowtls")}] end) as $endpoints |
+      ($endpoints | any(.protocol == "ss2022" and .transport == "shadowtls")) as $has_legacy |
+      any($endpoints[];
         if .protocol == "anytls" then $tag==("anytls-"+$user.name)
         elif .transport == "shadowtls" then
           ($tag==("st-"+$user.name) or $tag==("ss-"+$user.name) or $tag==("ss-udp-"+$user.name))
+        elif $has_legacy then $tag==("ss-direct-"+$user.name)
         else $tag==("ss-"+$user.name) end)) or
     any(.splits[]?;
       $tag==(.outbound_tag // ("managed-out-"+.name)) or
@@ -1255,7 +1270,7 @@ add_migration_conflict() {
 }
 
 collect_migration_conflicts() {
-  local payload="$1" normalized user name port tag split out_tag rule_tag protocol transport_tag endpoint
+  local payload="$1" normalized user name port tag split out_tag rule_tag protocol transport_tag endpoint has_legacy
   local -a tags
   MIGRATION_CONFLICTS=()
   if ! validate_migration_payload_structure "$payload"; then
@@ -1268,6 +1283,8 @@ collect_migration_conflicts() {
   fi
   while IFS= read -r user; do
     name="$(jq -r '.name' <<<"$user")"
+    has_legacy=false
+    jq -e 'any(.endpoints[]?; .protocol == "ss2022" and .transport == "shadowtls")' <<<"$user" >/dev/null && has_legacy=true
     if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$ ]]; then
       add_migration_conflict "用户名不符合规则：$name"; continue
     fi
@@ -1287,6 +1304,8 @@ collect_migration_conflicts() {
         tags=("anytls-$name")
       elif [[ "$(jq -r '.transport // "shadowtls"' <<<"$endpoint")" == shadowtls ]]; then
         tags=("st-$name" "ss-$name" "ss-udp-$name")
+      elif [[ "$has_legacy" == true ]]; then
+        tags=("ss-direct-$name")
       else
         tags=("ss-$name")
       fi

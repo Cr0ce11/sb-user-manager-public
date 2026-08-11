@@ -289,7 +289,8 @@ print_standard_user_rows() {
 }
 
 prompt_manage_user_protocols() {
-  local row name ports protocol_label status user count existing missing port method="" sni choice answer
+  local row name ports protocol_label status user count port method="" sni answer selected action kind label
+  local -a action_types=() action_kinds=() action_labels=()
   prepare_core
   load_standard_user_rows
   if ((${#USER_ROWS[@]} == 0)); then echo '暂无可管理用户。'; return 0; fi
@@ -302,16 +303,46 @@ prompt_manage_user_protocols() {
   IFS=$'\t' read -r name ports protocol_label status <<<"$row"
   : "$ports"
   user="$(get_user_json "$name")" || return 1
+  user="$(normalize_user_endpoints_json "$user")" || return 1
   count="$(jq '.endpoints | length' <<<"$user")" || return 1
-  if ((count == 1)); then
-    existing="$(jq -r '.endpoints[0].protocol' <<<"$user")" || return 1
-    [[ "$existing" == anytls ]] && missing=ss2022 || missing=anytls
-    printf '\n用户 %s 当前只有 %s。\n' "$name" "$protocol_label"
-    read -r -p "是否添加 $([[ "$missing" == anytls ]] && echo AnyTLS || echo SS2022)，并共享现有流量、有效期和启停状态？[y/N]：" answer
+  if ! jq -e 'any(.endpoints[]; .protocol == "ss2022" and .transport == "direct")' <<<"$user" >/dev/null; then
+    action_types+=(add); action_kinds+=(ss2022-direct); action_labels+=('添加原生 SS2022')
+  fi
+  if ! jq -e 'any(.endpoints[]; .protocol == "anytls")' <<<"$user" >/dev/null; then
+    action_types+=(add); action_kinds+=(anytls); action_labels+=('添加 AnyTLS')
+  fi
+  if ((count > 1)); then
+    while IFS=$'\t' read -r kind label; do
+      [[ -n "$kind" ]] || continue
+      action_types+=(remove); action_kinds+=("$kind"); action_labels+=("移除 ${label}")
+    done < <(jq -r '.endpoints[] |
+      if .protocol == "anytls" then ["anytls","AnyTLS"]
+      elif .transport == "direct" then ["ss2022-direct","原生 SS2022"]
+      else ["ss2022-shadowtls","SS2022 + ShadowTLS（旧版）"] end | @tsv' <<<"$user")
+  fi
+
+  printf '\n用户 %s 当前连接入口：\n' "$name"
+  jq -r '.endpoints[] |
+    "  - " + (if .protocol == "anytls" then "AnyTLS"
+      elif .transport == "direct" then "原生 SS2022"
+      else "SS2022 + ShadowTLS（旧版）" end) + "｜端口 " + (.port | tostring)' <<<"$user"
+  echo
+  for selected in "${!action_labels[@]}"; do
+    printf '  %d. %s\n' "$((selected + 1))" "${action_labels[$selected]}"
+  done
+  echo '  0. 返回用户管理'
+  if ! read_numbered_index '请选择操作：' "${#action_labels[@]}"; then MENU_RETURNED=true; return 0; fi
+  selected="$SELECTED_INDEX"
+  action="${action_types[$selected]}"
+  kind="${action_kinds[$selected]}"
+  label="$(endpoint_kind_label "$kind")" || return 1
+
+  if [[ "$action" == add ]]; then
+    read -r -p "确认添加 ${label}，并共享现有流量、有效期和启停状态？[y/N]：" answer
     [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消。'; return 0; }
     if ! prompt_available_user_port '新协议公网端口'; then MENU_RETURNED=true; return 0; fi
     port="$PROMPT_VALUE"
-    if [[ "$missing" == ss2022 ]]; then
+    if [[ "$kind" == ss2022-direct ]]; then
       cat <<'EOF'
 选择 SS2022 加密方式：
   1. 2022-blake3-aes-128-gcm（默认）
@@ -319,30 +350,20 @@ prompt_manage_user_protocols() {
   0. 取消
 EOF
       read_menu_choice '请选择加密方式 [1]：' '0,1,2' 1 '请输入 1、2 或 0' || return 1
-      choice="$PROMPT_VALUE"
-      [[ "$choice" != 0 ]] || { MENU_RETURNED=true; return 0; }
-      [[ "$choice" == 1 ]] && method=2022-blake3-aes-128-gcm || method=2022-blake3-aes-256-gcm
+      [[ "$PROMPT_VALUE" != 0 ]] || { MENU_RETURNED=true; return 0; }
+      [[ "$PROMPT_VALUE" == 1 ]] && method=2022-blake3-aes-128-gcm || method=2022-blake3-aes-256-gcm
       sni=""
     else
       if ! read_validated_value "AnyTLS SNI（留空使用 ${ANYTLS_SNI}；输入 0 取消）：" "$ANYTLS_SNI" 0 validate_shadowtls_sni; then MENU_RETURNED=true; return 0; fi
       sni="$PROMPT_VALUE"
     fi
-    cmd_add_user_endpoint "$name" "$missing" "$port" "$method" "$sni"
+    cmd_add_user_endpoint "$name" "$kind" "$port" "$method" "$sni"
     return 0
   fi
 
-  printf '\n用户 %s 当前同时拥有两个协议。移除协议不会改变账户累计用量、配额或有效期。\n' "$name"
-  cat <<'EOF'
-  1. 移除 SS2022
-  2. 移除 AnyTLS
-  0. 取消
-EOF
-  read_menu_choice '请选择：' '0,1,2' '' '请输入 1、2 或 0' || return 1
-  choice="$PROMPT_VALUE"
-  case "$choice" in 1) missing=ss2022;; 2) missing=anytls;; 0) MENU_RETURNED=true; return 0;; esac
-  read -r -p '确认移除该协议入口？客户端中的对应连接将立即失效。[y/N]：' answer
+  read -r -p "确认移除 ${label}？客户端中的对应连接将立即失效，但共享账户与用量保持不变。[y/N]：" answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消。'; return 0; }
-  cmd_remove_user_endpoint "$name" "$missing"
+  cmd_remove_user_endpoint "$name" "$kind"
 }
 
 read_numbered_index() {
@@ -405,8 +426,9 @@ prompt_remove_user() {
 }
 
 prompt_edit_user() {
-  local row name port protocol_label status user endpoint endpoint_count protocol transport="" metered old_sni old_method old_anchor old_expiry
+  local row name port protocol_label status user endpoint endpoint_count protocol kind transport="" metered old_sni old_method old_anchor old_expiry endpoint_row
   local new_port new_sni new_method new_anchor new_expiry input choice answer changed=false
+  local -a endpoint_rows=()
   prepare_core
   load_standard_user_rows
   if ((${#USER_ROWS[@]} == 0)); then
@@ -425,27 +447,34 @@ prompt_edit_user() {
   row="${USER_ROWS[$SELECTED_INDEX]}"
   IFS=$'\t' read -r name port protocol_label status <<<"$row"
   user="$(get_user_json "$name")" || return 1
+  user="$(normalize_user_endpoints_json "$user")" || return 1
   endpoint_count="$(jq 'if (.endpoints | type) == "array" then .endpoints | length else 1 end' <<<"$user")" || return 1
+  while IFS= read -r endpoint_row; do endpoint_rows+=("$endpoint_row"); done < <(jq -r '.endpoints[] |
+    if .protocol == "anytls" then ["anytls","AnyTLS"]
+    elif .transport == "direct" then ["ss2022-direct","原生 SS2022"]
+    else ["ss2022-shadowtls","SS2022 + ShadowTLS（旧版）"] end | @tsv' <<<"$user")
   if ((endpoint_count > 1)); then
-    cat <<'EOF'
-
-请选择要编辑的连接协议：
-  1. SS2022
-  2. AnyTLS
-  0. 取消编辑
-EOF
-    read_menu_choice '请选择：' '0,1,2' '' '请输入 1、2 或 0' || return 1
-    choice="$PROMPT_VALUE"
-    case "$choice" in 1) protocol=ss2022; protocol_label=SS2022;; 2) protocol=anytls; protocol_label=AnyTLS;; 0) MENU_RETURNED=true; return 0;; esac
+    echo
+    echo '请选择要编辑的连接入口：'
+    for choice in "${!endpoint_rows[@]}"; do
+      IFS=$'\t' read -r kind protocol_label <<<"${endpoint_rows[$choice]}"
+      printf '  %d. %s\n' "$((choice + 1))" "$protocol_label"
+    done
+    echo '  0. 取消编辑'
+    if ! read_numbered_index '请选择：' "${#endpoint_rows[@]}"; then MENU_RETURNED=true; return 0; fi
+    IFS=$'\t' read -r kind protocol_label <<<"${endpoint_rows[$SELECTED_INDEX]}"
   else
-    protocol="$(jq -r 'if (.endpoints | type) == "array" then .endpoints[0].protocol else (.protocol // "ss2022") end' <<<"$user")" || return 1
+    IFS=$'\t' read -r kind protocol_label <<<"${endpoint_rows[0]}"
   fi
-  endpoint="$(jq -ec --arg protocol "$protocol" '
-    if (.endpoints | type) == "array" then .endpoints[] | select(.protocol == $protocol)
-    elif $protocol == "anytls" then {protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}
-    else {protocol:"ss2022",transport:(.transport // "shadowtls"),port:.port,shadowtls_password:.shadowtls_password,ss2022_password:.ss2022_password,
-      method:.method,shadowtls_sni:.shadowtls_sni} end
+  endpoint="$(jq -ec --arg kind "$kind" '
+    def endpoint_kind:
+      if .protocol == "anytls" then "anytls"
+      elif .protocol == "ss2022" and .transport == "direct" then "ss2022-direct"
+      elif .protocol == "ss2022" and .transport == "shadowtls" then "ss2022-shadowtls"
+      else null end;
+    .endpoints[] | select(endpoint_kind == $kind)
   ' <<<"$user")" || return 1
+  protocol="$(jq -er '.protocol' <<<"$endpoint")" || return 1
   port="$(jq -r '.port' <<<"$endpoint")" || return 1
   metered="$(jq -r '.metered // (.limit_gib != null)' <<<"$user")"
   new_port="$port"
@@ -542,7 +571,7 @@ EOF
   if [[ "$status" == 停用 ]]; then echo '  用户保持停用；本次编辑不会自动启用。'; fi
   read -r -p '确认保存以上修改？[y/N]：' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消编辑。'; return 0; }
-  cmd_edit_user "$name" "$new_port" "$new_sni" "$new_method" "$new_anchor" "$new_expiry" "$protocol"
+  cmd_edit_user "$name" "$new_port" "$new_sni" "$new_method" "$new_anchor" "$new_expiry" "$kind"
 }
 
 prompt_renew_user() {
@@ -682,7 +711,7 @@ EOF
 }
 
 audit_consistency() {
-  local config_json nfuse_json user_rows split_rows split name status protocol transport port metered expected expected_tier tag split_status rule_tag out_tag scope scope_user scope_tags
+  local config_json nfuse_json user_rows split_rows split name status protocol transport port metered has_legacy expected expected_tier tag split_status rule_tag out_tag scope scope_user scope_tags
   local preset_link_rows preset_kind preset_reason managed_tags legacy_cleanup legacy_count
   AUDIT_ISSUES=0
   AUDIT_REPAIRABLE=0
@@ -695,14 +724,16 @@ audit_consistency() {
     (if ($user.endpoints | type) == "array" then $user.endpoints[]
      else {protocol:($user.protocol // "ss2022"),transport:($user.transport // "shadowtls"),port:$user.port} end) |
     [$user.name,$user.status,.protocol,(.transport // "-"),(.port|tostring),
-     (($user.metered // ($user.limit_gib != null))|tostring)] | @tsv
+     (($user.metered // ($user.limit_gib != null))|tostring),
+     (any($user.endpoints[]?; .protocol == "ss2022" and .transport == "shadowtls") | tostring)] | @tsv
   ' "$STATE_FILE")" || return 1
   split_rows="$(jq -c '.splits[]?' "$STATE_FILE")" || return 1
   printf '\n服务与配置检查结果\n\n'
-  while IFS=$'\t' read -r name status protocol transport port metered; do
+  while IFS=$'\t' read -r name status protocol transport port metered has_legacy; do
     [[ -n "$name" ]] || continue
     if [[ "$protocol" == anytls ]]; then expected="anytls-$name"
     elif [[ "$transport" == shadowtls ]]; then expected="st-$name ss-$name ss-udp-$name"
+    elif [[ "$has_legacy" == true ]]; then expected="ss-direct-$name"
     else expected="ss-$name"
     fi
     for tag in $expected; do
@@ -723,13 +754,13 @@ audit_consistency() {
       ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
     fi
     if [[ "$protocol" == ss2022 && "$transport" == direct && "$status" == active ]] &&
-       ! jq -e --arg tag "ss-$name" --argjson port "$port" '
+       ! jq -e --arg tag "$expected" --argjson port "$port" '
          .inbounds[]? | select(.tag == $tag and .type == "shadowsocks" and .listen_port == $port and ((.network // "") == ""))
        ' <<<"$config_json" >/dev/null; then
       printf '  [可自动修复] 用户 %s 的原生 SS2022 连接配置不正确\n' "$name"
       ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
     fi
-    if [[ "$protocol" == ss2022 && "$transport" == direct ]] &&
+    if [[ "$protocol" == ss2022 && "$transport" == direct && "$has_legacy" != true ]] &&
        jq -e --arg st "st-$name" --arg udp "ss-udp-$name" '
          any(.inbounds[]?; .tag == $st or .tag == $udp)
        ' <<<"$config_json" >/dev/null; then

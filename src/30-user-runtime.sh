@@ -100,14 +100,15 @@ make_user_inbounds() {
 }
 
 make_ss2022_inbound() {
-  local name="$1" port="$2" ss_password="$3" method="$4"
+  local name="$1" port="$2" ss_password="$3" method="$4" tag="${5:-ss-$1}"
   SB_JQ_SS_PASSWORD="$ss_password" jq -n \
     --arg name "$name" \
+    --arg tag "$tag" \
     --argjson port "$port" \
     --arg method "$method" \
     '[{
       "type": "shadowsocks",
-      "tag": ("ss-" + $name),
+      "tag": $tag,
       "listen": "::",
       "listen_port": $port,
       "method": $method,
@@ -160,20 +161,22 @@ append_inbounds() {
 remove_user_inbounds() {
   local name="$1"
   rewrite_singbox_config \
-    '.inbounds = [(.inbounds // [])[] | select(.tag != $st and .tag != $ss and .tag != $ss_udp and .tag != $at and .tag != $sn)]' \
-    --arg st "st-$name" --arg ss "ss-$name" --arg ss_udp "ss-udp-$name" --arg at "anytls-$name" --arg sn "snell-$name"
+    '.inbounds = [(.inbounds // [])[] | select(.tag != $st and .tag != $ss and .tag != $ss_direct and .tag != $ss_udp and .tag != $at and .tag != $sn)]' \
+    --arg st "st-$name" --arg ss "ss-$name" --arg ss_direct "ss-direct-$name" \
+    --arg ss_udp "ss-udp-$name" --arg at "anytls-$name" --arg sn "snell-$name"
 }
 
 replace_user_inbounds() {
   local name="$1" fragment="$2"
   SB_JQ_NEW_INBOUNDS="$fragment" rewrite_singbox_config \
      '($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_inbounds |
-     .inbounds = ([((.inbounds // [])[]) | select(.tag != $st and .tag != $ss and .tag != $ss_udp and .tag != $at and .tag != $sn)] + $new_inbounds)' \
-    --arg st "st-$name" --arg ss "ss-$name" --arg ss_udp "ss-udp-$name" --arg at "anytls-$name" --arg sn "snell-$name"
+     .inbounds = ([((.inbounds // [])[]) | select(.tag != $st and .tag != $ss and .tag != $ss_direct and .tag != $ss_udp and .tag != $at and .tag != $sn)] + $new_inbounds)' \
+    --arg st "st-$name" --arg ss "ss-$name" --arg ss_direct "ss-direct-$name" \
+    --arg ss_udp "ss-udp-$name" --arg at "anytls-$name" --arg sn "snell-$name"
 }
 
 rebuild_protocol_inbounds() {
-  local protocol="$1" row name status endpoint fragment fragments='[]' managed_tags_json='[]'
+  local protocol="$1" row name status endpoint fragment direct_tag fragments='[]' managed_tags_json='[]'
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
     name="$(jq -er '.name' <<<"$row")" || return 1
@@ -182,10 +185,16 @@ rebuild_protocol_inbounds() {
     if [[ "$protocol" == anytls ]]; then
       managed_tags_json="$(jq -c --arg tag "anytls-$name" '. + [$tag]' <<<"$managed_tags_json")" || return 1
     else
-      managed_tags_json="$(jq -c --arg st "st-$name" --arg ss "ss-$name" --arg ss_udp "ss-udp-$name" --arg sn "snell-$name" '. + [$st,$ss,$ss_udp,$sn]' <<<"$managed_tags_json")" || return 1
+      managed_tags_json="$(jq -c --arg st "st-$name" --arg ss "ss-$name" --arg ss_direct "ss-direct-$name" \
+        --arg ss_udp "ss-udp-$name" --arg sn "snell-$name" '. + [$st,$ss,$ss_direct,$ss_udp,$sn]' <<<"$managed_tags_json")" || return 1
     fi
     if [[ "$status" == active ]]; then
-      fragment="$(make_endpoint_inbounds_from_state "$name" "$endpoint")" || return 1
+      direct_tag=""
+      if [[ "$(jq -r '.has_legacy_ss2022 // false' <<<"$row")" == true &&
+            "$(jq -r '.protocol == "ss2022" and .transport == "direct"' <<<"$endpoint")" == true ]]; then
+        direct_tag="ss-direct-$name"
+      fi
+      fragment="$(make_endpoint_inbounds_from_state "$name" "$endpoint" "$direct_tag")" || return 1
       fragments="$(SB_JQ_CURRENT="$fragments" SB_JQ_ADDED="$fragment" jq -cn '($ENV.SB_JQ_CURRENT | fromjson) as $current | ($ENV.SB_JQ_ADDED | fromjson) as $added | $current + $added')" || return 1
     fi
   done < <(jq -c --arg protocol "$protocol" '
@@ -197,7 +206,9 @@ rebuild_protocol_inbounds() {
        {protocol:"ss2022",transport:"shadowtls",port:$user.port,shadowtls_password:$user.shadowtls_password,
         ss2022_password:$user.ss2022_password,method:$user.method,shadowtls_sni:$user.shadowtls_sni}
      end) |
-    select(.protocol == $protocol) | {name:$user.name,status:$user.status,endpoint:.}
+    select(.protocol == $protocol) |
+    {name:$user.name,status:$user.status,endpoint:.,
+     has_legacy_ss2022:(any($user.endpoints[]?; .protocol == "ss2022" and .transport == "shadowtls"))}
   ' "$STATE_FILE")
   SB_JQ_NEW_INBOUNDS="$fragments" rewrite_singbox_config '
     ($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_inbounds |
@@ -292,7 +303,7 @@ make_anytls_inbound() {
 }
 
 make_endpoint_inbounds_from_state() {
-  local name="$1" endpoint="$2" port protocol transport anytls_password st_password ss_password method shadowtls_sni
+  local name="$1" endpoint="$2" direct_tag="${3:-}" port protocol transport anytls_password st_password ss_password method shadowtls_sni
   port="$(jq -er '.port | select(type == "number")' <<<"$endpoint")" || return 1
   protocol="$(jq -er '.protocol | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
   if [[ "$protocol" == anytls ]]; then
@@ -303,7 +314,7 @@ make_endpoint_inbounds_from_state() {
     ss_password="$(jq -er '.ss2022_password | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
     method="$(jq -er '.method | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
     if [[ "$transport" == direct ]]; then
-      make_ss2022_inbound "$name" "$port" "$ss_password" "$method"
+      make_ss2022_inbound "$name" "$port" "$ss_password" "$method" "${direct_tag:-ss-$name}"
       return
     fi
     st_password="$(jq -er '.shadowtls_password | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
@@ -321,11 +332,19 @@ make_endpoint_inbounds_from_state() {
 }
 
 make_user_inbounds_from_state() {
-  local user="$1" name endpoint fragment fragments='[]' count=0
+  local user="$1" name endpoint fragment direct_tag has_legacy=false fragments='[]' count=0
   name="$(jq -er '.name | select(type == "string" and length > 0)' <<<"$user")" || return 1
+  if jq -e 'any(.endpoints[]?; .protocol == "ss2022" and .transport == "shadowtls")' <<<"$user" >/dev/null; then
+    has_legacy=true
+  fi
   while IFS= read -r endpoint; do
     [[ -n "$endpoint" ]] || continue
-    fragment="$(make_endpoint_inbounds_from_state "$name" "$endpoint")" || return 1
+    direct_tag=""
+    if [[ "$has_legacy" == true &&
+          "$(jq -r '.protocol == "ss2022" and .transport == "direct"' <<<"$endpoint")" == true ]]; then
+      direct_tag="ss-direct-$name"
+    fi
+    fragment="$(make_endpoint_inbounds_from_state "$name" "$endpoint" "$direct_tag")" || return 1
     fragments="$(SB_JQ_CURRENT="$fragments" SB_JQ_ADDED="$fragment" jq -cn \
       '($ENV.SB_JQ_CURRENT | fromjson) + ($ENV.SB_JQ_ADDED | fromjson)')" || return 1
     count=$((count + 1))
@@ -413,11 +432,16 @@ state_add_user_endpoint() {
 }
 
 state_remove_user_endpoint() {
-  local name="$1" protocol="$2"
+  local name="$1" kind="$2"
   atomic_state_update '
+    def endpoint_kind:
+      if .protocol == "anytls" then "anytls"
+      elif .protocol == "ss2022" and .transport == "direct" then "ss2022-direct"
+      elif .protocol == "ss2022" and .transport == "shadowtls" then "ss2022-shadowtls"
+      else null end;
     .users |= map(
       if .name == $name then
-        .endpoints = [.endpoints[] | select(.protocol != $protocol)] |
+        .endpoints = [.endpoints[] | select(endpoint_kind != $kind)] |
         .endpoints[0] as $primary |
         del(.anytls_password,.tls_sni,.transport,.shadowtls_password,.ss2022_password,.method,.shadowtls_sni) |
         .protocol = $primary.protocol | .port = $primary.port |
@@ -432,7 +456,7 @@ state_remove_user_endpoint() {
           else . end
         end
       else . end)
-  ' --arg name "$name" --arg protocol "$protocol"
+  ' --arg name "$name" --arg kind "$kind"
 }
 
 state_set_status() {
@@ -506,20 +530,16 @@ ensure_self_nfuse_accounts() {
 state_replace_user() {
   SB_JQ_USER="$2" atomic_state_update \
     'def sync_primary_endpoint:
-       if (.protocol // "ss2022") == "anytls" then
-         .protocol = "anytls" |
-         .endpoints[0] = {protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}
+       .endpoints[0] as $primary |
+       del(.anytls_password,.tls_sni,.transport,.shadowtls_password,.ss2022_password,.method,.shadowtls_sni) |
+       .protocol = $primary.protocol | .port = $primary.port |
+       if $primary.protocol == "anytls" then
+         .anytls_password = $primary.anytls_password | .tls_sni = $primary.tls_sni
        else
-         .protocol = "ss2022" |
-         .transport = (.transport // "shadowtls") |
+         .transport = ($primary.transport // "shadowtls") | .ss2022_password = $primary.ss2022_password | .method = $primary.method |
          if .transport == "shadowtls" then
-           .endpoints[0] = {protocol:"ss2022",transport:"shadowtls",port:.port,
-                            shadowtls_password:.shadowtls_password,ss2022_password:.ss2022_password,
-                            method:.method,shadowtls_sni:.shadowtls_sni}
-         else
-           .endpoints[0] = {protocol:"ss2022",transport:"direct",port:.port,
-                            ss2022_password:.ss2022_password,method:.method}
-         end
+           .shadowtls_password = $primary.shadowtls_password | .shadowtls_sni = $primary.shadowtls_sni
+         else . end
        end;
      .users = [.users[] | if .name == $name then (($ENV.SB_JQ_USER | fromjson) | sync_primary_endpoint) else . end]' \
     --arg name "$1"
@@ -622,18 +642,24 @@ register_new_user_nfuse_ports() {
 }
 
 check_new_endpoint_conflicts() {
-  local protocol="$1" name="$2" port="$3"
+  local kind="$1" name="$2" port="$3" has_legacy=false
   validate_port "$port"
   port_in_state "$port" && die "端口已被脚本记录占用：$port"
   port_is_listening "$port" && die "端口已被其他服务监听：$port"
   nfuse_port_exists "$port" && die "Nfuse 已管理端口：$port"
-  if [[ "$protocol" == anytls ]]; then
+  if [[ "$kind" == anytls ]]; then
     anytls_certificate_ready || die "AnyTLS 证书不存在，请先重新安装环境"
     tag_exists_in_config "anytls-$name" && die "sing-box 已存在 tag：anytls-$name"
   else
-    tag_exists_in_config "st-$name" && die "sing-box 已存在 tag：st-$name"
-    tag_exists_in_config "ss-$name" && die "sing-box 已存在 tag：ss-$name"
-    tag_exists_in_config "ss-udp-$name" && die "sing-box 已存在 tag：ss-udp-$name"
+    jq -e --arg name "$name" 'any(.users[]? | select(.name == $name) | .endpoints[]?;
+      .protocol == "ss2022" and .transport == "shadowtls")' "$STATE_FILE" >/dev/null && has_legacy=true
+    if [[ "$has_legacy" == true ]]; then
+      tag_exists_in_config "ss-direct-$name" && die "sing-box 已存在 tag：ss-direct-$name"
+    else
+      tag_exists_in_config "st-$name" && die "sing-box 已存在 tag：st-$name"
+      tag_exists_in_config "ss-$name" && die "sing-box 已存在 tag：ss-$name"
+      tag_exists_in_config "ss-udp-$name" && die "sing-box 已存在 tag：ss-udp-$name"
+    fi
   fi
   return 0
 }
@@ -767,21 +793,53 @@ cmd_add_multi() {
   cmd_export "$name"
 }
 
+endpoint_kind_label() {
+  case "$1" in
+    anytls) printf 'AnyTLS\n';;
+    ss2022-direct) printf '原生 SS2022\n';;
+    ss2022-shadowtls) printf 'SS2022 + ShadowTLS（旧版）\n';;
+    *) return 1;;
+  esac
+}
+
+normalize_user_endpoints_json() {
+  jq -c '
+    if (.endpoints | type) == "array" then .
+    elif (.protocol // "ss2022") == "anytls" then
+      .endpoints=[{protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}]
+    else
+      .endpoints=[{protocol:"ss2022",transport:(.transport // "shadowtls"),port:.port,
+        shadowtls_password:.shadowtls_password,ss2022_password:.ss2022_password,
+        method:.method,shadowtls_sni:.shadowtls_sni}]
+    end
+  ' <<<"$1"
+}
+
 cmd_add_user_endpoint() {
-  local name="$1" protocol="$2" port="$3" method="${4:-}" sni="$5"
+  local name="$1" kind="$2" port="$3" method="${4:-}" sni="$5"
   local user status metered expected_tier nfuse_json endpoint prospective fragment password ss_password
+  [[ "$kind" != ss2022 ]] || kind=ss2022-direct
   validate_name "$name"
   user_exists "$name" || die "用户不存在：$name"
   user="$(get_user_json "$name")" || return 1
-  jq -e '.endpoints | type == "array" and length < 2' <<<"$user" >/dev/null || die "用户已经拥有全部支持的协议"
-  jq -e --arg protocol "$protocol" 'all(.endpoints[]; .protocol != $protocol)' <<<"$user" >/dev/null || die "用户已经拥有该协议"
-  case "$protocol" in
-    ss2022) validate_ss2022_method "$method";;
+  user="$(normalize_user_endpoints_json "$user")" || return 1
+  jq -e '.endpoints | type == "array" and length < 3' <<<"$user" >/dev/null || die "用户已经拥有全部支持的连接入口"
+  jq -e --arg kind "$kind" '
+    def endpoint_kind:
+      if .protocol == "anytls" then "anytls"
+      elif .protocol == "ss2022" and .transport == "direct" then "ss2022-direct"
+      elif .protocol == "ss2022" and .transport == "shadowtls" then "ss2022-shadowtls"
+      else null end;
+    all(.endpoints[]; endpoint_kind != $kind)
+  ' <<<"$user" >/dev/null || die "用户已经拥有该连接入口"
+  case "$kind" in
+    ss2022-direct) validate_ss2022_method "$method";;
     anytls) [[ -z "$method" ]] || die "AnyTLS 不支持 SS2022 加密方式";;
-    *) die "不支持的协议：$protocol";;
+    ss2022-shadowtls) die "不再支持新增 ShadowTLS；只能保留或管理已有旧版入口";;
+    *) die "不支持的连接入口：$kind";;
   esac
-  if [[ "$protocol" == anytls ]]; then validate_shadowtls_sni "$sni"; fi
-  check_new_endpoint_conflicts "$protocol" "$name" "$port"
+  if [[ "$kind" == anytls ]]; then validate_shadowtls_sni "$sni"; fi
+  check_new_endpoint_conflicts "$kind" "$name" "$port"
   status="$(jq -er '.status | select(. == "active" or . == "disabled")' <<<"$user")" || return 1
   metered="$(jq -er '(.metered // (.limit_gib != null)) | select(type == "boolean")' <<<"$user")" || return 1
   expected_tier="$([[ "$metered" == true ]] && echo a || echo c)"
@@ -789,7 +847,7 @@ cmd_add_user_endpoint() {
   jq -e --arg name "$name" --arg tier "$expected_tier" '.[] | select(.name == $name and .tier == $tier)' <<<"$nfuse_json" >/dev/null ||
     die "找不到用户 $name 的正确流量记录，请先运行「服务与配置检查」"
 
-  if [[ "$protocol" == anytls ]]; then
+  if [[ "$kind" == anytls ]]; then
     password="$(generate_st_password)" || return 1
     endpoint="$(SB_JQ_PASSWORD="$password" jq -cn --argjson port "$port" --arg sni "$sni" \
       '{protocol:"anytls",port:$port,anytls_password:$ENV.SB_JQ_PASSWORD,tls_sni:$sni}')" || return 1
@@ -805,7 +863,7 @@ cmd_add_user_endpoint() {
     fragment="$(make_user_inbounds_from_state "$prospective")" || return 1
     ensure_safe_ssh_for_singbox_restart || return 0
   fi
-  start_managed_operation "add-user-endpoint:$name:$protocol" || return 1
+  start_managed_operation "add-user-endpoint:$name:$kind" || return 1
   run_managed_step nfuse port add "$name" "$port" || return 1
   run_managed_step nfuse persist || return 1
   run_managed_step state_add_user_endpoint "$name" "$endpoint" || return 1
@@ -815,24 +873,41 @@ cmd_add_user_endpoint() {
     run_managed_step check_singbox_and_restart || return 1
   fi
   finish_managed_operation || return 1
-  log "已为用户 ${name} 添加协议：$([[ "$protocol" == anytls ]] && echo AnyTLS || echo SS2022)（端口 ${port}，共享原流量与有效期）"
+  log "已为用户 ${name} 添加连接入口：$(endpoint_kind_label "$kind")（端口 ${port}，共享原流量与有效期）"
   cmd_export "$name"
 }
 
 cmd_remove_user_endpoint() {
-  local name="$1" protocol="$2" user status port nfuse_json port_id prospective fragment=""
+  local name="$1" kind="$2" user status port nfuse_json port_id prospective fragment="" matches
   validate_name "$name"
   user_exists "$name" || die "用户不存在：$name"
   user="$(get_user_json "$name")" || return 1
   jq -e '.endpoints | type == "array" and length > 1' <<<"$user" >/dev/null || die "不能移除用户唯一的连接协议；如不再需要该用户，请删除用户"
-  jq -e --arg protocol "$protocol" 'any(.endpoints[]; .protocol == $protocol)' <<<"$user" >/dev/null || die "用户没有该协议"
-  port="$(jq -er --arg protocol "$protocol" '.endpoints[] | select(.protocol == $protocol) | .port' <<<"$user")" || return 1
+  if [[ "$kind" == ss2022 ]]; then
+    matches="$(jq '[.endpoints[] | select(.protocol == "ss2022")] | length' <<<"$user")" || return 1
+    ((matches == 1)) || die "用户有两个 SS2022 入口，请明确选择原生或旧版 ShadowTLS 入口"
+    kind="$(jq -r '.endpoints[] | select(.protocol == "ss2022") |
+      if .transport == "direct" then "ss2022-direct" else "ss2022-shadowtls" end' <<<"$user")" || return 1
+  fi
+  port="$(jq -er --arg kind "$kind" '
+    def endpoint_kind:
+      if .protocol == "anytls" then "anytls"
+      elif .protocol == "ss2022" and .transport == "direct" then "ss2022-direct"
+      elif .protocol == "ss2022" and .transport == "shadowtls" then "ss2022-shadowtls"
+      else null end;
+    .endpoints[] | select(endpoint_kind == $kind) | .port
+  ' <<<"$user")" || die "用户没有该连接入口：$kind"
   nfuse_json="$(nfuse list --json)" || die "无法读取流量统计数据，请查看服务状态"
   port_id="$(jq -er --arg name "$name" --argjson port "$port" \
     '.[] | select(.name == $name) | .ports[] | select(.start == $port and .end == $port) | .id' <<<"$nfuse_json")" ||
     die "协议端口没有正确接入流量统计，请先运行「服务与配置检查」"
-  prospective="$(jq -c --arg protocol "$protocol" '
-    .endpoints = [.endpoints[] | select(.protocol != $protocol)] |
+  prospective="$(jq -c --arg kind "$kind" '
+    def endpoint_kind:
+      if .protocol == "anytls" then "anytls"
+      elif .protocol == "ss2022" and .transport == "direct" then "ss2022-direct"
+      elif .protocol == "ss2022" and .transport == "shadowtls" then "ss2022-shadowtls"
+      else null end;
+    .endpoints = [.endpoints[] | select(endpoint_kind != $kind)] |
     .endpoints[0] as $primary |
     del(.anytls_password,.tls_sni,.transport,.shadowtls_password,.ss2022_password,.method,.shadowtls_sni) |
     .protocol = $primary.protocol | .port = $primary.port |
@@ -847,8 +922,8 @@ cmd_remove_user_endpoint() {
     fragment="$(make_user_inbounds_from_state "$prospective")" || return 1
     ensure_safe_ssh_for_singbox_restart || return 0
   fi
-  start_managed_operation "remove-user-endpoint:$name:$protocol" || return 1
-  run_managed_step state_remove_user_endpoint "$name" "$protocol" || return 1
+  start_managed_operation "remove-user-endpoint:$name:$kind" || return 1
+  run_managed_step state_remove_user_endpoint "$name" "$kind" || return 1
   if [[ "$status" == active ]]; then
     run_managed_step replace_user_inbounds "$name" "$fragment" || return 1
     rebuild_user_splits_if_needed "$name" || return 1
@@ -858,7 +933,7 @@ cmd_remove_user_endpoint() {
   run_managed_step nfuse port rm "$port_id" || return 1
   run_managed_step nfuse persist || return 1
   finish_managed_operation || return 1
-  log "已移除用户 ${name} 的协议：$([[ "$protocol" == anytls ]] && echo AnyTLS || echo SS2022)；共享账户与用量保持不变"
+  log "已移除用户 ${name} 的连接入口：$(endpoint_kind_label "$kind")；共享账户与用量保持不变"
   cmd_export "$name"
 }
 
@@ -907,23 +982,16 @@ ENABLE_USER_METERED=false
 
 prepare_user_enable() {
   local name="${1:-}"
-  local user status endpoint protocol port fragment metered nfuse_json expected_tier
+  local user status port fragment tag metered nfuse_json expected_tier
   user="$(get_user_json "$name")" || return 1
   status="$(jq -er '.status | select(type == "string" and length > 0)' <<<"$user")" || return 1
   [[ "$status" == "disabled" ]] || die "用户当前不是 disabled 状态：$status"
 
-  while IFS= read -r endpoint; do
-    [[ -n "$endpoint" ]] || continue
-    protocol="$(jq -er '.protocol' <<<"$endpoint")" || return 1
-    if [[ "$protocol" == anytls ]]; then
-      tag_exists_in_config "anytls-$name" && die "sing-box 已存在 AnyTLS tag"
-    else
-      tag_exists_in_config "st-$name" && die "sing-box 已存在 tag：st-$name"
-      tag_exists_in_config "ss-$name" && die "sing-box 已存在 tag：ss-$name"
-      tag_exists_in_config "ss-udp-$name" && die "sing-box 已存在 tag：ss-udp-$name"
-    fi
-  done < <(jq -c 'if (.endpoints | type) == "array" then .endpoints[] else {protocol:(.protocol // "ss2022")} end' <<<"$user")
   fragment="$(make_user_inbounds_from_state "$user")" || return 1
+  while IFS= read -r tag; do
+    [[ -n "$tag" ]] || continue
+    tag_exists_in_config "$tag" && die "sing-box 已存在 tag：$tag"
+  done < <(jq -r '.[].tag' <<<"$fragment")
   metered="$(jq -r '.metered // (.limit_gib != null)' <<<"$user")" || return 1
   [[ "$metered" == true || "$metered" == false ]] || return 1
   expected_tier="$([[ "$metered" == true ]] && echo a || echo c)"
@@ -1070,23 +1138,35 @@ cmd_adjust_traffic() {
 }
 
 cmd_edit_user() {
-  local name="$1" new_port="$2" new_sni="$3" new_method="$4" new_anchor="$5" new_expiry="$6" target_protocol="${7:-}"
+  local name="$1" new_port="$2" new_sni="$3" new_method="$4" new_anchor="$5" new_expiry="$6" target_kind="${7:-}"
   local user endpoint protocol transport="" metered status old_port old_sni old_method old_anchor old_expiry new_user fragment=""
   local config_changed=false method_changed=false nfuse_changed=false nfuse_json="" old_port_id="" limit expected_tier
 
   validate_name "$name"
   user_exists "$name" || die "用户不存在：$name"
   user="$(get_user_json "$name")" || return 1
-  [[ -n "$target_protocol" ]] || target_protocol="$(jq -er '.protocol // "ss2022"' <<<"$user")"
-  endpoint="$(jq -ec --arg protocol "$target_protocol" '
-    if (.endpoints | type) == "array" then .endpoints[] | select(.protocol == $protocol)
-    elif (.protocol // "ss2022") == "anytls" then
-      {protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni} | select(.protocol == $protocol)
-    else
-      {protocol:"ss2022",transport:(.transport // "shadowtls"),port:.port,shadowtls_password:.shadowtls_password,ss2022_password:.ss2022_password,
-       method:.method,shadowtls_sni:.shadowtls_sni} | select(.protocol == $protocol)
-    end
-  ' <<<"$user")" || die "用户没有该协议：$target_protocol"
+  user="$(normalize_user_endpoints_json "$user")" || return 1
+  if [[ -z "$target_kind" ]]; then
+    target_kind="$(jq -er '
+      if .endpoints[0].protocol == "anytls" then "anytls"
+      elif .endpoints[0].transport == "direct" then "ss2022-direct"
+      else "ss2022-shadowtls" end
+    ' <<<"$user")" || return 1
+  elif [[ "$target_kind" == ss2022 ]]; then
+    target_kind="$(jq -er '
+      [.endpoints[] | select(.protocol == "ss2022")] as $matches |
+      select(($matches | length) == 1) |
+      if $matches[0].transport == "direct" then "ss2022-direct" else "ss2022-shadowtls" end
+    ' <<<"$user")" || die "用户有两个 SS2022 入口，请明确选择要编辑的入口"
+  fi
+  endpoint="$(jq -ec --arg kind "$target_kind" '
+    def endpoint_kind:
+      if .protocol == "anytls" then "anytls"
+      elif .protocol == "ss2022" and .transport == "direct" then "ss2022-direct"
+      elif .protocol == "ss2022" and .transport == "shadowtls" then "ss2022-shadowtls"
+      else null end;
+    .endpoints[] | select(endpoint_kind == $kind)
+  ' <<<"$user")" || die "用户没有该连接入口：$target_kind"
   protocol="$(jq -er '.protocol | select(. == "ss2022" or . == "anytls")' <<<"$endpoint")" || return 1
   metered="$(jq -r '(.metered // (.limit_gib != null)) | select(type == "boolean")' <<<"$user")" || return 1
   [[ "$metered" == true || "$metered" == false ]] || return 1
@@ -1158,41 +1238,35 @@ cmd_edit_user() {
   fi
 
   new_user="$(jq -c \
-    --arg protocol "$protocol" --argjson port "$new_port" --arg sni "$new_sni" --arg method "$new_method" \
+    --arg kind "$target_kind" --argjson port "$new_port" --arg sni "$new_sni" --arg method "$new_method" \
     --arg anchor "$new_anchor" --arg expiry "$new_expiry" \
-    'if (.endpoints | type) != "array" then
-       if (.protocol // "ss2022") == "anytls" then
-         .endpoints=[{protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}]
-       else .endpoints=[{protocol:"ss2022",transport:(.transport // "shadowtls"),port:.port,shadowtls_password:.shadowtls_password,
-         ss2022_password:.ss2022_password,method:.method,shadowtls_sni:.shadowtls_sni}] end
-     else . end |
+    'def endpoint_kind:
+       if .protocol == "anytls" then "anytls"
+       elif .protocol == "ss2022" and .transport == "direct" then "ss2022-direct"
+       elif .protocol == "ss2022" and .transport == "shadowtls" then "ss2022-shadowtls"
+       else null end;
      .endpoints |= map(
-       if .protocol == $protocol then
+       if endpoint_kind == $kind then
          .port = $port |
-         if $protocol == "anytls" then .tls_sni = $sni
+         if .protocol == "anytls" then .tls_sni = $sni
          else .method = $method |
            if .transport == "shadowtls" then .shadowtls_sni = $sni
            else del(.shadowtls_password,.shadowtls_sni) end
          end
        else . end) |
-     if (.protocol // "ss2022") == $protocol then
-       .port = $port |
-       if $protocol == "anytls" then .tls_sni = $sni
-       else .method = $method |
-         .transport = (.transport // (first(.endpoints[]? | select(.protocol == "ss2022") | .transport)) // "shadowtls") |
-         if .transport == "shadowtls" then .shadowtls_sni = $sni
-         else del(.shadowtls_password,.shadowtls_sni) end
-       end
-     else . end |
      if (.metered // (.limit_gib != null)) then
        .billing_anchor = ($anchor | tonumber) | .expires_at = $expiry
      else . end' <<<"$user")" || return 1
   if [[ "$method_changed" == true ]]; then
     local new_password
     new_password="$(generate_ss_password "$new_method")" || return 1
-    new_user="$(SB_JQ_PASSWORD="$new_password" jq -c --arg protocol "$protocol" '
-      .endpoints |= map(if .protocol == $protocol then .ss2022_password = $ENV.SB_JQ_PASSWORD else . end) |
-      if (.protocol // "ss2022") == $protocol then .ss2022_password = $ENV.SB_JQ_PASSWORD else . end
+    new_user="$(SB_JQ_PASSWORD="$new_password" jq -c --arg kind "$target_kind" '
+      def endpoint_kind:
+        if .protocol == "anytls" then "anytls"
+        elif .protocol == "ss2022" and .transport == "direct" then "ss2022-direct"
+        elif .protocol == "ss2022" and .transport == "shadowtls" then "ss2022-shadowtls"
+        else null end;
+      .endpoints |= map(if endpoint_kind == $kind then .ss2022_password = $ENV.SB_JQ_PASSWORD else . end)
     ' <<<"$new_user")" || return 1
   fi
   if [[ "$status" == active && "$config_changed" == true ]]; then
@@ -1508,15 +1582,25 @@ cmd_export() {
     *) die "导出格式必须是 all、surge 或 shadowrocket" ;;
   esac
 
-  local user endpoint endpoint_user protocol transport endpoint_count node_name port st_password ss_password method shadowtls_sni server_port shadowrocket_url
+  local user endpoint endpoint_user protocol transport endpoint_count ss_endpoint_count node_name port st_password ss_password method shadowtls_sni server_port shadowrocket_url
   user="$(get_user_json "$name")"
   endpoint_count="$(jq 'if (.endpoints | type) == "array" then .endpoints | length else 1 end' <<<"$user")" || return 1
+  ss_endpoint_count="$(jq '[.endpoints[]? | select(.protocol == "ss2022")] | length' <<<"$user")" || return 1
   while IFS= read -r endpoint; do
     [[ -n "$endpoint" ]] || continue
     protocol="$(jq -er '.protocol' <<<"$endpoint")" || return 1
     port="$(jq -er '.port' <<<"$endpoint")" || return 1
     if ((endpoint_count > 1)); then
-      [[ "$protocol" == anytls ]] && node_name="${name}-AnyTLS" || node_name="${name}-SS2022"
+      if [[ "$protocol" == anytls ]]; then
+        node_name="${name}-AnyTLS"
+      else
+        transport="$(jq -r '.transport // "shadowtls"' <<<"$endpoint")" || return 1
+        if [[ "$transport" == shadowtls ]] && ((ss_endpoint_count > 1)); then
+          node_name="${name}-SS2022-ShadowTLS"
+        else
+          node_name="${name}-SS2022"
+        fi
+      fi
       server_port="$port"
     else
       node_name="$name"

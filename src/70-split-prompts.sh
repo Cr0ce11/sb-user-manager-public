@@ -419,7 +419,10 @@ prompt_select_split_diagnostic_user() {
   echo "请选择用于测试的用户："
   jq -r 'to_entries[] |
     "  \(.key + 1). \(.value.name)｜" +
-    ([.value.endpoints[].protocol | if . == "anytls" then "AnyTLS" else "SS2022 + ShadowTLS" end] | join(" + ")) +
+    ([.value.endpoints[] |
+      if .protocol == "anytls" then "AnyTLS"
+      elif .transport == "direct" then "原生 SS2022"
+      else "SS2022 + ShadowTLS（旧版）" end] | join(" + ")) +
     "｜端口 " + ([.value.endpoints[].port | tostring] | join(" / "))' <<<"$rows_json"
   echo "  0. 返回分流管理"
   if ! read_numbered_index '请选择用户编号：' "$count"; then MENU_RETURNED=true; return 1; fi
@@ -428,7 +431,8 @@ prompt_select_split_diagnostic_user() {
 
 extract_split_diagnostic_connections() {
   local user="$1" expected_outbound="$2" log_file="$3"
-  awk -v anytls="anytls-$user" -v st="st-$user" -v ss="ss-$user" -v ss_udp="ss-udp-$user" -v expected="$expected_outbound" '
+  awk -v anytls="anytls-$user" -v st="st-$user" -v ss="ss-$user" -v ss_direct="ss-direct-$user" \
+      -v ss_udp="ss-udp-$user" -v expected="$expected_outbound" '
     function connection_id(line, token) {
       if (!match(line, /\[[0-9][0-9]*[[:space:]]/)) return ""
       token = substr(line, RSTART + 1, RLENGTH - 2)
@@ -440,7 +444,8 @@ extract_split_diagnostic_connections() {
       gsub(/\033\[[0-9;]*m/, "", line)
     }
     index(line, "inbound/") &&
-      (index(line, "[" anytls "]") || index(line, "[" st "]") || index(line, "[" ss "]") || index(line, "[" ss_udp "]")) &&
+      (index(line, "[" anytls "]") || index(line, "[" st "]") || index(line, "[" ss "]") ||
+       index(line, "[" ss_direct "]") || index(line, "[" ss_udp "]")) &&
       index(line, "inbound connection to ") {
         id = connection_id(line)
         if (id == "") next
