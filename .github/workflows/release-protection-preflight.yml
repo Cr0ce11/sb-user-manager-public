@@ -1,0 +1,23 @@
+name: Release protection preflight
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Verify immutable release protection
+        env:
+          GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo '缺少 Actions Secret：IMMUTABLE_RELEASES_READ_TOKEN；发布保护预检失败。' >&2
+            exit 1
+          fi
+          bash tools/check-immutable-release-setting.sh "$GITHUB_REPOSITORY"

@@ -4,6 +4,7 @@ set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 
 workflow=".github/workflows/ci-release.yml"
+preflight_workflow=".github/workflows/release-protection-preflight.yml"
 verifier="tools/verify-release-assets.jq"
 immutable_check="tools/check-immutable-release-setting.sh"
 work="$(mktemp -d)"
@@ -11,6 +12,7 @@ cleanup() { rm -rf -- "$work"; }
 trap cleanup EXIT
 
 [[ -f "$workflow" && ! -L "$workflow" ]]
+[[ -f "$preflight_workflow" && ! -L "$preflight_workflow" ]]
 [[ -f "$verifier" && ! -L "$verifier" ]]
 [[ -f "$immutable_check" && ! -L "$immutable_check" ]]
 
@@ -65,6 +67,22 @@ if grep -Fq "$immutable_token_contract" <<<"$publish_step"; then
 fi
 [[ "$(grep -Fc "$immutable_token_contract" "$workflow")" -eq 1 ]]
 [[ "$(grep -Fc "$release_token_contract" "$workflow")" -eq 1 ]]
+
+for preflight_contract in \
+  'workflow_dispatch:' \
+  'contents: read' \
+  "$immutable_token_contract" \
+  "$missing_token_contract" \
+  "$immutable_check_contract"; do
+  grep -Fq -- "$preflight_contract" "$preflight_workflow" || {
+    printf 'manual release protection preflight contract is missing: %s\n' "$preflight_contract" >&2
+    exit 1
+  }
+done
+if grep -Eq 'gh[[:space:]]+release[[:space:]]+(create|upload|edit|delete)' "$preflight_workflow"; then
+  echo 'manual release protection preflight must never create or modify a release' >&2
+  exit 1
+fi
 
 release_create_line="$(grep -nF "$release_create_contract" "$workflow" | cut -d: -f1)"
 immutable_check_line="$(grep -nF "$immutable_check_contract" "$workflow" | cut -d: -f1)"
