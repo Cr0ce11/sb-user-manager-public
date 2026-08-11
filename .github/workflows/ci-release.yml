@@ -21,7 +21,7 @@ jobs:
           shellcheck --version
       - name: Bash syntax
         run: |
-          for script in sb-user-manager.sh tests/acceptance.sh tests/check-managed-step-errexit.sh tests/test-acceptance.sh tests/test-controller-state.sh tests/test-controller-role.sh tests/test-controller-role-repair.sh tests/test-controller-role-provision.sh tests/test-manager-role-detection.sh tests/test-manager-role-routing.sh tests/test-controller-landing-transport.sh tests/test-controller-landing-registration.sh tests/test-controller-landing-credentials.sh tests/test-controller-landing-onboarding.sh tests/test-controller-landing-onboarding-journal.sh tests/test-landing-apply-protocol.sh tests/test-landing-agent.sh tests/test-landing-channel-install.sh tests/test-landing-bootstrap.sh tests/test-landing-dependency-prep.sh tests/test-landing-singbox-runtime-prep.sh tests/test-landing-readiness-gate.sh tests/test-landing-channel-e2e.sh tests/test-landing-startup-gate.sh tools/build-manager.sh tools/audit-public-readiness.sh tools/export-public-snapshot.sh tools/check-immutable-release-setting.sh tests/test-build.sh tests/test-public.sh tests/test-public-readiness.sh tests/test-public-snapshot.sh tests/test-release-workflow.sh; do
+          for script in sb-user-manager.sh tests/acceptance.sh tests/check-managed-step-errexit.sh tests/test-acceptance.sh tests/test-controller-state.sh tests/test-controller-role.sh tests/test-controller-role-repair.sh tests/test-controller-role-provision.sh tests/test-manager-role-detection.sh tests/test-manager-role-routing.sh tests/test-manager-handoff.sh tests/test-controller-landing-transport.sh tests/test-controller-landing-registration.sh tests/test-controller-landing-credentials.sh tests/test-controller-landing-onboarding.sh tests/test-controller-landing-onboarding-journal.sh tests/test-landing-apply-protocol.sh tests/test-landing-agent.sh tests/test-landing-channel-install.sh tests/test-landing-bootstrap.sh tests/test-landing-dependency-prep.sh tests/test-landing-singbox-runtime-prep.sh tests/test-landing-readiness-gate.sh tests/test-landing-channel-e2e.sh tests/test-landing-startup-gate.sh tools/build-manager.sh tools/audit-public-readiness.sh tools/export-public-snapshot.sh tools/check-immutable-release-setting.sh tests/test-build.sh tests/test-public.sh tests/test-public-readiness.sh tests/test-public-snapshot.sh tests/test-release-workflow.sh; do
             bash -n "$script"
           done
       - name: Verify generated manager
@@ -29,8 +29,8 @@ jobs:
       - name: ShellCheck
         run: |
           shellcheck -x -e SC1090,SC1091 sb-user-manager.sh tests/acceptance.sh tests/check-managed-step-errexit.sh tests/test-acceptance.sh tests/test-controller-state.sh tests/test-controller-role.sh tests/test-controller-role-repair.sh tests/test-controller-role-provision.sh tests/test-manager-role-detection.sh tests/test-manager-role-routing.sh tests/test-controller-landing-transport.sh tests/test-controller-landing-registration.sh tests/test-controller-landing-credentials.sh tests/test-controller-landing-onboarding.sh tests/test-controller-landing-onboarding-journal.sh tests/test-landing-apply-protocol.sh tests/test-landing-agent.sh tests/test-landing-channel-install.sh tests/test-landing-bootstrap.sh tests/test-landing-dependency-prep.sh tests/test-landing-singbox-runtime-prep.sh tests/test-landing-readiness-gate.sh tests/test-landing-channel-e2e.sh tests/test-landing-startup-gate.sh tools/build-manager.sh tools/audit-public-readiness.sh tools/export-public-snapshot.sh tools/check-immutable-release-setting.sh tests/test-build.sh tests/test-public-readiness.sh tests/test-public-snapshot.sh tests/test-release-workflow.sh
-          # 测试桩由动态 source 的公开版函数间接调用，ShellCheck 无法静态追踪。
-          shellcheck -x -e SC1090,SC1091,SC2034,SC2317 tests/test-public.sh
+          # 测试桩由动态 source 的函数间接调用，ShellCheck 无法静态追踪。
+          shellcheck -x -e SC1090,SC1091,SC2034,SC2317 tests/test-public.sh tests/test-manager-handoff.sh
       - name: Static release checks
         run: bash tests/test-static.sh
       - name: Deterministic manager build checks
@@ -49,6 +49,8 @@ jobs:
         run: bash tests/test-manager-role-detection.sh
       - name: Manager role routing checks
         run: bash tests/test-manager-role-routing.sh
+      - name: Manager channel handoff checks
+        run: bash tests/test-manager-handoff.sh
       - name: Controller landing transport checks
         run: bash tests/test-controller-landing-transport.sh
       - name: Controller landing registration checks
@@ -119,6 +121,7 @@ jobs:
           bash tests/test-controller-role-provision.sh
           bash tests/test-manager-role-detection.sh
           bash tests/test-manager-role-routing.sh
+          bash tests/test-manager-handoff.sh
           bash tests/test-controller-landing-transport.sh
           bash tests/test-controller-landing-registration.sh
           bash tests/test-controller-landing-credentials.sh

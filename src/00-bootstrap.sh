@@ -10,10 +10,12 @@ umask 077
 
 PROGRAM="sb-user-manager"
 CONF_FILE="${SB_USER_CONF:-/etc/sb-user-manager.conf}"
-SELF_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
-SCRIPT_VERSION="4.23.4"
+SELF_SOURCE_PATH="${BASH_SOURCE[0]}"
+SELF_PATH="$(readlink -f -- "$SELF_SOURCE_PATH")"
+SCRIPT_VERSION="4.23.5"
 SCRIPT_EDITION_LABEL="公开版"
 STATE_SCHEMA_VERSION=5
+MIN_SUPPORTED_STATE_SCHEMA_VERSION=0
 MIGRATION_FORMAT_VERSION=1
 MIGRATION_BUNDLE_VERSION=1
 TRANSACTION_FORMAT_VERSION=1
@@ -22,6 +24,8 @@ ENVIRONMENT_BACKUP_RETENTION="${SB_ENVIRONMENT_BACKUP_RETENTION:-5}"
 MIGRATION_REPORT_RETENTION="${SB_MIGRATION_REPORT_RETENTION:-20}"
 ENVIRONMENT_TRANSACTION_JOURNAL="${SB_ENVIRONMENT_TRANSACTION_JOURNAL:-/var/lib/sb-user-manager.recovery.json}"
 ENVIRONMENT_LOCK_FILE="${SB_ENVIRONMENT_LOCK_FILE:-/run/lock/sb-user-manager-environment.lock}"
+MANAGER_HANDOFF_DIRECTORY="${SB_MANAGER_HANDOFF_DIRECTORY:-/var/lib/sb-user-manager/manager-handoff}"
+MANAGER_HANDOFF_JOURNAL="${SB_MANAGER_HANDOFF_JOURNAL:-$MANAGER_HANDOFF_DIRECTORY/active.json}"
 ENVIRONMENT_BACKUP_PERMISSION_MARKER="${SB_ENVIRONMENT_BACKUP_PERMISSION_MARKER:-/var/lib/sb-user-manager/environment-backup-permissions-v1}"
 BACKUP_RETENTION_MIGRATION_MARKER="${SB_BACKUP_RETENTION_MIGRATION_MARKER:-/var/lib/sb-user-manager/backup-retention-v1}"
 SHARED_PRESET_RUNTIME_MARKER="${SB_SHARED_PRESET_RUNTIME_MARKER:-/var/lib/sb-user-manager/shared-preset-runtime-v2}"
@@ -287,7 +291,7 @@ RUNTIME_TEMP_PATH_COUNT=0
 is_managed_temp_path() {
   local path="$1" name="${1##*/}"
   [[ "$path" == /tmp/sb-* ]] ||
-    [[ "$name" =~ ^\.(managed-users|migration-config|migration-state|state-restore|restore-config|restore-state|restore-previous-state|restore-manager-config|sb-user-manager\.conf|sb-user-manager\.launch|atomic-install|config|normalized|takeover-normalized|takeover-config)\. ]] ||
+    [[ "$name" =~ ^\.(managed-users|migration-config|migration-state|state-restore|restore-config|restore-state|restore-previous-state|restore-manager-config|sb-user-manager\.conf|sb-user-manager\.launch|atomic-install|manager-handoff|config|normalized|takeover-normalized|takeover-config)\. ]] ||
     [[ "$name" =~ ^\.(nfuse-snapshot|transaction)\. ]] ||
     [[ "$name" =~ ^\.singbox-channel\. ]] ||
     [[ "$name" =~ ^\.shared-preset-runtime\. ]] ||

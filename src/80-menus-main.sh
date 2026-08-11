@@ -221,10 +221,22 @@ interactive_main() {
 }
 
 main() {
+  local recovered_installed
   [[ $EUID -eq 0 ]] || die "必须使用 root 运行"
+  recover_manager_handoff || die "未完成的管理脚本接管尚未安全恢复"
+  if [[ "$MANAGER_HANDOFF_RECOVERED" == true ]]; then
+    recovered_installed="$(manager_handoff_installed_path)" || die "无法确认恢复后的管理脚本路径"
+    recovered_installed="$(readlink -f -- "$recovered_installed" 2>/dev/null || printf '%s' "$recovered_installed")"
+    if [[ "$SELF_PATH" == "$recovered_installed" ]]; then
+      [[ "${1:-}" != --take-over-installed-manager ]] ||
+        die "上次接管已恢复旧脚本；请重新运行单独下载并校验过的目标脚本完成接管"
+      exec "$recovered_installed" "$@"
+    fi
+  fi
   case "${1:-}" in
     "") dispatch_interactive_startup "$@" ;;
     --internal-expire) run_standalone_internal_expire "${@:2}" ;;
+    --take-over-installed-manager) take_over_installed_manager "${@:2}" ;;
     *) die "本脚本采用交互方式，请直接运行且不要添加参数" ;;
   esac
 }
