@@ -75,18 +75,22 @@ EOF
 # 双协议账户只保存一份生命周期与流量字段，协议入口可独立增删且会正确同步主入口镜像。
 (
   STATE_FILE="$work/state-multi-user.json"
-  printf '%s\n' '{"schema_version":5,"users":[],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
-  state_add_multi_user multi 23003 23004 st-secret ss-secret at-secret 88 12 true \
-    2027-01-01T00:00:00+0800 2022-blake3-aes-128-gcm ss.example.com at.example.com
+  printf '%s\n' '{"schema_version":6,"users":[],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
+  state_add_multi_user multi 23003 23004 ss-secret at-secret 88 12 true \
+    2027-01-01T00:00:00+0800 2022-blake3-aes-128-gcm at.example.com
   jq -e '
     (.users | length) == 1 and
     .users[0].limit_gib == 88 and .users[0].billing_anchor == 12 and
     .users[0].status == "active" and (.users[0].endpoints | length) == 2 and
     [.users[0].endpoints[].protocol] == ["ss2022","anytls"] and
-    [.users[0].endpoints[].port] == [23003,23004]
+    [.users[0].endpoints[].port] == [23003,23004] and
+    .users[0].endpoints[0] == {protocol:"ss2022",transport:"direct",port:23003,
+      ss2022_password:"ss-secret",method:"2022-blake3-aes-128-gcm"} and
+    (.users[0] | has("shadowtls_password") | not) and
+    (.users[0] | has("shadowtls_sni") | not)
   ' "$STATE_FILE" >/dev/null
   tags="$(split_user_inbound_tags multi)"
-  jq -e '. == ["anytls-multi","ss-multi","ss-udp-multi","st-multi"]' <<<"$tags" >/dev/null
+  jq -e '. == ["anytls-multi","ss-multi"]' <<<"$tags" >/dev/null
   PUBLIC_SERVER=203.0.113.10
   cmd_export multi surge > "$work/state-multi-export.txt"
   grep -Fq 'multi-SS2022 = ss, 203.0.113.10, 23003' "$work/state-multi-export.txt"
@@ -118,7 +122,7 @@ multi_nfuse_remove_line="$(grep -n 'run_managed_step nfuse port rm' <<<"$multi_r
   PORT_MAX=30000
   HANDSHAKE_PORT=443
   SHADOWTLS_STRICT_MODE=true
-  printf '%s\n' '{"schema_version":5,"users":[],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
+  printf '%s\n' '{"schema_version":6,"users":[],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
   check_new_user_conflicts() { printf 'preflight:%s:%s\n' "$1" "$3" >> "$events"; }
   generate_st_password() { printf 'test-st-password\n'; }
   generate_ss_password() { printf 'test-ss-password\n'; }
@@ -130,7 +134,7 @@ multi_nfuse_remove_line="$(grep -n 'run_managed_step nfuse port rm' <<<"$multi_r
   append_inbounds() { printf 'append\n' >> "$events"; }
   check_singbox_and_restart() { printf 'restart\n' >> "$events"; }
   cmd_export() { printf 'export:%s\n' "$1" >> "$events"; }
-  cmd_add_multi self live-multi 24001 24002 2022-blake3-aes-128-gcm ss.example.com at.example.com >/dev/null
+  cmd_add_multi self live-multi 24001 24002 2022-blake3-aes-128-gcm at.example.com >/dev/null
   jq -e '
     .users[0].name == "live-multi" and .users[0].metered == false and
     [.users[0].endpoints[].port] == [24001,24002]
@@ -831,7 +835,7 @@ SB_USER_CONF="$deploy_conf" EXPECTED_STATE="$deploy_state" SB_USER_MANAGER_LIBRA
   initialize_deployed_state
   [[ -f "$EXPECTED_STATE" ]]
   jq -e '\''
-    .schema_version == 5 and
+    .schema_version == 6 and
     .users == [] and
     .splits == [] and
     .outbound_presets == [] and
@@ -849,7 +853,7 @@ SB_USER_CONF="$deploy_conf" SB_USER_MANAGER_LIBRARY=true bash -c '
   source ./sb-user-manager.sh
   initialize_deployed_state true
 '
-jq -e '.schema_version == 5 and .users == [] and .splits == [] and .outbound_presets == [] and .rule_presets == []' "$deploy_state" >/dev/null
+jq -e '.schema_version == 6 and .users == [] and .splits == [] and .outbound_presets == [] and .rule_presets == []' "$deploy_state" >/dev/null
 
 printf '%s\n' '{"schema_version":999,"users":[],"splits":[]}' > "$deploy_state"
 deploy_rollback_marker="$deploy_state_root/rollback-marker"
@@ -1602,20 +1606,21 @@ printf '%s\n' '{"users":[{"name":"alice","port":20001,"status":"active","protoco
 chmod 600 "$STATE_FILE"
 
 migrate_state >/dev/null
-[[ "$(jq -r '.schema_version' "$STATE_FILE")" == 5 ]]
+[[ "$(jq -r '.schema_version' "$STATE_FILE")" == 6 ]]
 [[ "$(jq -r '.users[0].tls_sni' "$STATE_FILE")" == anytls.example.com ]]
 [[ "$(jq -r '.users[0].usage_offset_bytes' "$STATE_FILE")" == 0 ]]
 jq -e '.users[0].endpoints == [{protocol:"anytls",port:20001,anytls_password:"legacy-anytls-secret",tls_sni:"anytls.example.com"}]' "$STATE_FILE" >/dev/null
-[[ "$(find "$BACKUP_DIR" -type f -name 'managed-users.pre-schema-0-to-5-*.json' | wc -l | tr -d ' ')" == 1 ]]
+[[ "$(find "$BACKUP_DIR" -type f -name 'managed-users.pre-schema-0-to-6-*.json' | wc -l | tr -d ' ')" == 1 ]]
 
 printf '%s\n' '{"schema_version":1,"users":[{"name":"legacy","port":20004,"status":"active","shadowtls_password":"st","ss2022_password":"ss"},{"name":"legacy-disabled","port":20005,"status":"disabled","shadowtls_password":"st2","ss2022_password":"ss2","method":"2022-blake3-aes-256-gcm"}],"splits":[]}' > "$STATE_FILE"
 migrate_state >/dev/null
 jq -e '
-  .schema_version == 5 and
+  .schema_version == 6 and
   .outbound_presets == [] and .rule_presets == [] and
   .users[0].method == "2022-blake3-aes-256-gcm" and
   .users[0].shadowtls_sni == "legacy.example.com" and
-  .users[0].endpoints[0] == {protocol:"ss2022",port:20004,shadowtls_password:"st",ss2022_password:"ss",method:"2022-blake3-aes-256-gcm",shadowtls_sni:"legacy.example.com"} and
+  .users[0].transport == "shadowtls" and
+  .users[0].endpoints[0] == {protocol:"ss2022",port:20004,shadowtls_password:"st",ss2022_password:"ss",method:"2022-blake3-aes-256-gcm",shadowtls_sni:"legacy.example.com",transport:"shadowtls"} and
   .users[1].method == "2022-blake3-aes-256-gcm" and
   .users[1].shadowtls_sni == "fallback.example.com" and
   .users[1].endpoints[0].shadowtls_sni == "fallback.example.com"
@@ -1623,11 +1628,11 @@ jq -e '
 
 printf '%s\n' '{"schema_version":4,"users":[{"name":"legacy-current","port":20006,"protocol":"anytls","status":"active","metered":false,"expires_at":null,"limit_gib":null,"billing_anchor":null,"created_at":"2026-07-15T00:00:00+08:00","anytls_password":"legacy-secret","tls_sni":"legacy.example.com"}],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
 migrate_state >/dev/null
-jq -e '.schema_version == 5 and .users[0].usage_offset_bytes == 0 and .users[0].endpoints[0] == {protocol:"anytls",port:20006,anytls_password:"legacy-secret",tls_sni:"legacy.example.com"}' "$STATE_FILE" >/dev/null
-[[ "$(find "$BACKUP_DIR" -type f -name 'managed-users.pre-schema-4-to-5-*.json' | wc -l | tr -d ' ')" == 1 ]]
+jq -e '.schema_version == 6 and .users[0].usage_offset_bytes == 0 and .users[0].endpoints[0] == {protocol:"anytls",port:20006,anytls_password:"legacy-secret",tls_sni:"legacy.example.com"}' "$STATE_FILE" >/dev/null
+[[ "$(find "$BACKUP_DIR" -type f -name 'managed-users.pre-schema-4-to-6-*.json' | wc -l | tr -d ' ')" == 1 ]]
 
 multi_endpoint_state="$work/multi-endpoint-state.json"
-printf '%s\n' '{"schema_version":5,"users":[{"name":"multi","port":21001,"protocol":"anytls","status":"active","metered":true,"expires_at":null,"limit_gib":10,"billing_anchor":1,"usage_offset_bytes":0,"created_at":"2026-08-10T00:00:00+08:00","anytls_password":"at-secret","tls_sni":"at.example.com","endpoints":[{"protocol":"anytls","port":21001,"anytls_password":"at-secret","tls_sni":"at.example.com"},{"protocol":"ss2022","port":21002,"shadowtls_password":"st-secret","ss2022_password":"ss-secret","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"ss.example.com"}]}],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$multi_endpoint_state"
+printf '%s\n' '{"schema_version":6,"users":[{"name":"multi","port":21001,"protocol":"anytls","status":"active","metered":true,"expires_at":null,"limit_gib":10,"billing_anchor":1,"usage_offset_bytes":0,"created_at":"2026-08-10T00:00:00+08:00","anytls_password":"at-secret","tls_sni":"at.example.com","endpoints":[{"protocol":"anytls","port":21001,"anytls_password":"at-secret","tls_sni":"at.example.com"},{"protocol":"ss2022","transport":"shadowtls","port":21002,"shadowtls_password":"st-secret","ss2022_password":"ss-secret","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"ss.example.com"}]}],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$multi_endpoint_state"
 validate_state_user_endpoints "$multi_endpoint_state"
 for invalid_filter in \
   '.users[0].endpoints[1].protocol = "anytls"' \
@@ -1730,6 +1735,18 @@ jq -e '
   (.[2].password == "ss-secret")
 ' <<<"$fragment" >/dev/null
 
+direct_fragment="$(make_ss2022_inbound direct 20002 direct-secret 2022-blake3-aes-128-gcm)"
+jq -e '
+  length == 1 and
+  .[0].type == "shadowsocks" and
+  .[0].tag == "ss-direct" and
+  .[0].listen == "::" and
+  .[0].listen_port == 20002 and
+  .[0].method == "2022-blake3-aes-128-gcm" and
+  .[0].password == "direct-secret" and
+  (.[0] | has("network") | not)
+' <<<"$direct_fragment" >/dev/null
+
 stored_ss_user='{"name":"stored-ss","port":20007,"status":"active","metered":false,"shadowtls_password":"stored-st","ss2022_password":"stored-ss-secret","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"stored.example.com"}'
 stored_ss_fragment="$(make_user_inbounds_from_state "$stored_ss_user")"
 jq -e '
@@ -1749,6 +1766,18 @@ jq -e '
   .[2].method == "2022-blake3-aes-128-gcm" and
   .[2].password == "stored-ss-secret"
 ' <<<"$stored_ss_fragment" >/dev/null
+
+stored_direct_user='{"name":"stored-direct","port":20010,"protocol":"ss2022","transport":"direct","status":"active","metered":false,"ss2022_password":"stored-direct-secret","method":"2022-blake3-aes-256-gcm","endpoints":[{"protocol":"ss2022","transport":"direct","port":20010,"ss2022_password":"stored-direct-secret","method":"2022-blake3-aes-256-gcm"}]}'
+stored_direct_fragment="$(make_user_inbounds_from_state "$stored_direct_user")"
+jq -e '
+  length == 1 and
+  .[0].type == "shadowsocks" and
+  .[0].tag == "ss-stored-direct" and
+  .[0].listen_port == 20010 and
+  .[0].method == "2022-blake3-aes-256-gcm" and
+  .[0].password == "stored-direct-secret" and
+  (.[0] | has("network") | not)
+' <<<"$stored_direct_fragment" >/dev/null
 
 stored_multi_user='{"name":"stored-multi","port":20008,"protocol":"anytls","status":"active","metered":false,"anytls_password":"stored-at","tls_sni":"at.example.com","endpoints":[{"protocol":"anytls","port":20008,"anytls_password":"stored-at","tls_sni":"at.example.com"},{"protocol":"ss2022","port":20009,"shadowtls_password":"stored-st","ss2022_password":"stored-ss","method":"2022-blake3-aes-256-gcm","shadowtls_sni":"ss.example.com"}]}'
 stored_multi_fragment="$(make_user_inbounds_from_state "$stored_multi_user")"
@@ -1836,6 +1865,28 @@ assert parse_qs(at.query, strict_parsing=True) == {
     "udp": ["1"],
 }
 assert unquote(at.fragment) == "sr-at"
+PY
+
+(
+  STATE_FILE="$work/direct-export-state.json"
+  PUBLIC_SERVER=198.51.100.21
+  CLIENT_SERVER_PORT_OVERRIDE=""
+  printf '%s\n' '{"schema_version":6,"users":[{"name":"direct-ss","port":20043,"protocol":"ss2022","transport":"direct","status":"active","metered":false,"ss2022_password":"MDEyMzQ1Njc4OWFiY2RlZg==","method":"2022-blake3-aes-128-gcm","endpoints":[{"protocol":"ss2022","transport":"direct","port":20043,"ss2022_password":"MDEyMzQ1Njc4OWFiY2RlZg==","method":"2022-blake3-aes-128-gcm"}]}],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
+  cmd_export direct-ss all
+) > "$work/direct-export.txt"
+grep -Fq 'direct-ss = ss, 198.51.100.21, 20043, encrypt-method=2022-blake3-aes-128-gcm, password=MDEyMzQ1Njc4OWFiY2RlZg==, udp-relay=true' "$work/direct-export.txt"
+! grep -Fq 'shadow-tls-' "$work/direct-export.txt"
+python3 - "$work/direct-export.txt" <<'PY'
+import base64
+import sys
+from urllib.parse import unquote, urlsplit
+
+url = next(line.strip() for line in open(sys.argv[1], encoding="utf-8") if line.startswith("ss://"))
+parsed = urlsplit(url)
+assert base64.b64decode(parsed.username + "===").decode() == "2022-blake3-aes-128-gcm:MDEyMzQ1Njc4OWFiY2RlZg=="
+assert parsed.hostname == "198.51.100.21" and parsed.port == 20043
+assert parsed.query == ""
+assert unquote(parsed.fragment) == "direct-ss"
 PY
 
 (
@@ -2110,6 +2161,7 @@ jq -e '
 )
 
 split_upstream='{"protocol":"ss_shadowtls","server":"upstream.example.com","server_port":443,"method":"2022-blake3-aes-128-gcm","ss_password":"split-secret","shadowtls_password":"transport-secret","sni":"upstream.example.com","insecure":false}'
+printf '%s\n' '{"schema_version":6,"users":[{"name":"stored-at","port":20008,"protocol":"anytls","status":"active","metered":false,"anytls_password":"stored-at-secret","tls_sni":"client.example.com","endpoints":[{"protocol":"anytls","port":20008,"anytls_password":"stored-at-secret","tls_sni":"client.example.com"},{"protocol":"ss2022","transport":"direct","port":20009,"ss2022_password":"stored-direct-secret","method":"2022-blake3-aes-128-gcm"}]}],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
 apply_split_config unit-split https://rules.example.com/unit.srs user stored-at "$split_upstream" unit-out unit-rule
 jq -e '
   any(.outbounds[]; .tag == "direct") and
@@ -2117,10 +2169,10 @@ jq -e '
   any(.outbounds[]; .tag == "managed-transport-unit-split" and .server == "upstream.example.com") and
   any(.route.rule_set[]; .tag == "unit-rule" and .format == "binary") and
   any(.route.rules[]; .rule_set == "unit-rule" and .outbound == "unit-out" and
-    (.inbound | index("st-stored-at")) and
     (.inbound | index("ss-stored-at")) and
-    (.inbound | index("ss-udp-stored-at")) and
-    (.inbound | index("anytls-stored-at")))
+    (.inbound | index("anytls-stored-at")) and
+    (.inbound | index("st-stored-at") | not) and
+    (.inbound | index("ss-udp-stored-at") | not))
 ' "$SINGBOX_CONFIG" >/dev/null
 printf '%s\n' '{"schema_version":3,"users":[],"splits":[{"name":"unit-split","rule_set_tag":"unit-rule","outbound_tag":"unit-out"}]}' > "$STATE_FILE"
 remove_split_config unit-split
@@ -3135,7 +3187,7 @@ printf '%s\n' '{"schema_version":3,"users":[{"name":"zeta","port":20003,"status"
   prompt_user_status_action cmd_disable active 停用 <<<'1'
 ) > "$work/status-disable"
 grep -Fq '1. alpha｜AnyTLS｜端口 20001｜启用' "$work/status-disable"
-grep -Fq '2. zeta｜SS2022 + ShadowTLS｜端口 20003｜启用' "$work/status-disable"
+grep -Fq '2. zeta｜SS2022 + ShadowTLS（旧版）｜端口 20003｜启用' "$work/status-disable"
 grep -Fxq 'ACTION:disable:alpha' "$work/status-disable"
 ! grep -Fq 'beta｜' "$work/status-disable"
 (
@@ -3257,7 +3309,7 @@ EOF
 chmod 700 "$diagnostic_bin/sing-box" "$diagnostic_bin/nfuse"
 cat > "$diagnostic_state" <<'EOF'
 {
-  "schema_version": 5,
+  "schema_version": 6,
   "users": [{
     "name": "crocell", "status": "active", "protocol": "anytls", "port": 20001,
     "metered": true, "limit_gib": 10, "anytls_password": "secret-crocell-123",
@@ -3304,7 +3356,7 @@ printf 'SINGBOX_BIN="%s"\nSINGBOX_CONFIG="%s"\nNFUSE_BIN="%s"\nNFUSE_SOCKET="%s"
   validate_diagnostic_report "$report"
   [[ "$(diagnostic_report_mode "$report")" == 600 ]]
   grep -Fq '总体结果：发现需要处理的项目' "$report"
-  grep -Fq '用户：总计 1｜启用 1｜停用 0｜SS2022 + ShadowTLS 0｜AnyTLS 1｜计量 1｜自用 0' "$report"
+  grep -Fq '用户：总计 1｜启用 1｜停用 0｜SS2022 0（旧版 ShadowTLS 0）｜AnyTLS 1｜计量 1｜自用 0' "$report"
   grep -Fq '[用户1]' "$report"
   grep -Fq '[分流1]' "$report"
   grep -Fq '[出口1]' "$report"
@@ -3361,11 +3413,10 @@ printf 'SINGBOX_BIN="%s"\nSINGBOX_CONFIG="%s"\nNFUSE_BIN="%s"\nNFUSE_SOCKET="%s"
   prompt_add_node <<'EOF'
 1
 
-
 2
 EOF
 ) > "$work/add-default-ss-sni" 2>&1
-grep -Fxq 'ADD-SELF:ss2022|2022-blake3-aes-128-gcm|global-ss.example.com' "$work/add-default-ss-sni"
+grep -Fxq 'ADD-SELF:ss2022|2022-blake3-aes-128-gcm|' "$work/add-default-ss-sni"
 (
   load_runtime_config() {
     SS2022_SHADOWTLS_SNI=global-ss.example.com
@@ -3386,7 +3437,7 @@ grep -Fxq 'ADD-SELF:anytls||global-any.example.com' "$work/add-default-anytls-sn
     SS2022_SHADOWTLS_SNI=global-ss.example.com
     ANYTLS_SNI=global-any.example.com
   }
-  prompt_multi_account() { printf 'ADD-MULTI:%s|%s|%s|%s\n' "$1" "$2" "$3" "$4"; }
+  prompt_multi_account() { printf 'ADD-MULTI:%s|%s|%s\n' "$1" "$2" "$3"; }
   prompt_self() { printf 'UNEXPECTED-SINGLE\n'; }
   prompt_managed() { printf 'UNEXPECTED-SINGLE\n'; }
   MENU_RETURNED=false
@@ -3394,11 +3445,10 @@ grep -Fxq 'ADD-SELF:anytls||global-any.example.com' "$work/add-default-anytls-sn
 3
 
 
-
 2
 EOF
 ) > "$work/add-default-multi" 2>&1
-grep -Fxq 'ADD-MULTI:self|2022-blake3-aes-128-gcm|global-ss.example.com|global-any.example.com' "$work/add-default-multi"
+grep -Fxq 'ADD-MULTI:self|2022-blake3-aes-128-gcm|global-any.example.com' "$work/add-default-multi"
 ! grep -Fq 'UNEXPECTED-SINGLE' "$work/add-default-multi"
 (
   load_runtime_config() { :; }
@@ -3487,10 +3537,15 @@ grep -Fxq 'EDIT:alice|20002|new.example.com|2022-blake3-aes-256-gcm|9|2026-10-15
 state_remove_user alice
 [[ "$(jq '.users | length' "$STATE_FILE")" == 0 ]]
 
-state_add_user custom 20003 st-secret ss-secret 2 14 true 2026-08-14T00:00:00+0800 2022-blake3-aes-256-gcm edge.example.com
+state_add_user custom 20003 ss-secret 2 14 true 2026-08-14T00:00:00+0800 2022-blake3-aes-256-gcm
 jq -e '
+  .users[0].protocol == "ss2022" and
+  .users[0].transport == "direct" and
   .users[0].method == "2022-blake3-aes-256-gcm" and
-  .users[0].shadowtls_sni == "edge.example.com"
+  .users[0].ss2022_password == "ss-secret" and
+  (.users[0] | has("shadowtls_password") | not) and
+  (.users[0] | has("shadowtls_sni") | not) and
+  .users[0].endpoints == [{protocol:"ss2022",transport:"direct",port:20003,ss2022_password:"ss-secret",method:"2022-blake3-aes-256-gcm"}]
 ' "$STATE_FILE" >/dev/null
 state_remove_user custom
 
@@ -3517,8 +3572,8 @@ state_remove_user anytls-custom
     if [[ "${1:-}" == list && "${2:-}" == --json ]]; then printf '[]\n'; return 0; fi
     printf '%s\n' "$*" >> "$self_events"
   }
-  cmd_add self self-created 20020 2022-blake3-aes-128-gcm self.example.com >/dev/null
-  jq -e '.users[0] | .name == "self-created" and .metered == false and .usage_offset_bytes == 0' "$STATE_FILE" >/dev/null
+  cmd_add self self-created 20020 2022-blake3-aes-128-gcm >/dev/null
+  jq -e '.users[0] | .name == "self-created" and .metered == false and .usage_offset_bytes == 0 and .transport == "direct" and (has("shadowtls_password") | not) and (has("shadowtls_sni") | not)' "$STATE_FILE" >/dev/null
   grep -Fxq 'add self-created --tier c --limit 0 --anchor 1' "$self_events"
   grep -Fxq 'port add self-created 20020' "$self_events"
   grep -Fxq persist "$self_events"
@@ -3541,7 +3596,7 @@ state_remove_user anytls-custom
     if [[ "${1:-}" == list && "${2:-}" == --json ]]; then printf '[]\n'; return 0; fi
     printf '%s\n' "$*" >> "$nfuse_marker"
   }
-  cmd_add self blocked-user 20024 2022-blake3-aes-128-gcm blocked.example.com >/dev/null
+  cmd_add self blocked-user 20024 2022-blake3-aes-128-gcm >/dev/null
   [[ "$(jq '.users|length' "$STATE_FILE")" == 0 ]]
   [[ ! -e "$transaction_marker" ]]
   [[ ! -e "$nfuse_marker" ]]
@@ -3570,7 +3625,7 @@ state_remove_user anytls-custom
 
 (
   STATE_FILE="$work/multi-enable-state.json"
-  printf '%s\n' '{"schema_version":5,"users":[{"name":"multi-enable","port":20025,"protocol":"anytls","status":"disabled","metered":false,"usage_offset_bytes":0,"anytls_password":"at","tls_sni":"at.example.com","endpoints":[{"protocol":"anytls","port":20025,"anytls_password":"at","tls_sni":"at.example.com"},{"protocol":"ss2022","port":20026,"shadowtls_password":"st","ss2022_password":"ss","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"ss.example.com"}]}],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
+  printf '%s\n' '{"schema_version":6,"users":[{"name":"multi-enable","port":20025,"protocol":"anytls","status":"disabled","metered":false,"usage_offset_bytes":0,"anytls_password":"at","tls_sni":"at.example.com","endpoints":[{"protocol":"anytls","port":20025,"anytls_password":"at","tls_sni":"at.example.com"},{"protocol":"ss2022","transport":"direct","port":20026,"ss2022_password":"ss","method":"2022-blake3-aes-128-gcm"}]}],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
   tag_exists_in_config() { return 1; }
   ensure_safe_ssh_for_singbox_restart() { return 0; }
   nfuse() {
@@ -3578,7 +3633,7 @@ state_remove_user anytls-custom
     printf '%s\n' '[{"name":"multi-enable","tier":"c","used_bytes":123,"ports":[{"id":1,"start":20025,"end":20025},{"id":2,"start":20026,"end":20026}]}]'
   }
   prepare_user_enable multi-enable
-  jq -e 'length == 4 and any(.[]; .tag == "anytls-multi-enable") and any(.[]; .tag == "ss-udp-multi-enable")' <<<"$ENABLE_USER_FRAGMENT" >/dev/null
+  jq -e 'length == 2 and any(.[]; .tag == "anytls-multi-enable") and any(.[]; .tag == "ss-multi-enable" and (has("network") | not)) and all(.[]; .tag != "st-multi-enable" and .tag != "ss-udp-multi-enable")' <<<"$ENABLE_USER_FRAGMENT" >/dev/null
   nfuse() {
     [[ "${1:-}" == list && "${2:-}" == --json ]] || return 1
     printf '%s\n' '[{"name":"multi-enable","tier":"c","used_bytes":123,"ports":[{"id":1,"start":20025,"end":20025}]}]'
@@ -3683,7 +3738,7 @@ legacy_v412_payload="$work/migration-v4.12.json"
 printf '%s\n' '{"format_version":1,"created_at":"2026-07-15T00:00:00+08:00","script_version":"4.12.0","source_hostname":"legacy-source","state":{"schema_version":3,"users":[{"name":"legacy-metered","port":20031,"status":"active","metered":true,"expires_at":"2026-12-15T00:00:00+08:00","limit_gib":10,"billing_anchor":15,"created_at":"2026-07-15T00:00:00+08:00","shadowtls_password":"st","ss2022_password":"ss","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"ss.example.com"},{"name":"legacy-self","port":20032,"protocol":"anytls","status":"disabled","metered":false,"expires_at":null,"limit_gib":null,"billing_anchor":null,"created_at":"2026-07-15T00:00:00+08:00","anytls_password":"at","tls_sni":"at.example.com"}],"splits":[]},"nfuse_usage":[{"name":"legacy-metered","used_bytes":123}]}' > "$legacy_v412_payload"
 validate_migration_payload_structure "$legacy_v412_payload"
 jq -e '
-  .state.schema_version == 5 and .state.outbound_presets == [] and .state.rule_presets == [] and
+  .state.schema_version == 6 and .state.outbound_presets == [] and .state.rule_presets == [] and
   all(.state.users[]; .usage_offset_bytes == 0)
 ' "$legacy_v412_payload" >/dev/null
 jq '.state.users[0].usage_offset_bytes = null' "$legacy_v412_payload" > "$work/migration-invalid-offset.json"
@@ -3915,9 +3970,10 @@ batch_state_before="$(sha256sum "$STATE_FILE" "$SINGBOX_CONFIG")"
 decrypt_retry_output="$work/decrypt-retry-output"
 printf '%s\n' 'wrong-password' 'unit-test-password' | decrypt_migration_backup "$bundle" "$decrypted" >"$decrypt_retry_output"
 jq -e --slurpfile original "$migration_payload" '
-  .state.schema_version == 5 and .state.outbound_presets == [] and .state.rule_presets == [] and
-  (.state.users | map(del(.endpoints) | if .protocol == "ss2022" then del(.protocol) else . end)) == $original[0].state.users and
+  .state.schema_version == 6 and .state.outbound_presets == [] and .state.rule_presets == [] and
+  (.state.users | map(del(.endpoints) | if .protocol == "ss2022" then del(.protocol,.transport) else . end)) == $original[0].state.users and
   all(.state.users[]; (.endpoints | length) == 1 and .endpoints[0].port == .port) and
+  all(.state.users[] | select(.protocol == "ss2022"); .transport == "shadowtls" and .endpoints[0].transport == "shadowtls") and
   .state.splits == $original[0].state.splits and
   .nfuse_usage == $original[0].nfuse_usage
 ' "$decrypted" >/dev/null
@@ -3948,7 +4004,7 @@ mkdir -p "$created_materialized"
 materialize_migration_bundle "$created_bundle" "$created_materialized"
 SB_BACKUP_PASSWORD='unit-test-password' openssl enc -d -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 \
   -in "$MATERIALIZED_MIGRATION_ENCRYPTED" -out "$created_plain" -pass env:SB_BACKUP_PASSWORD
-jq -e '.state.schema_version == 5 and .state.users[0].usage_offset_bytes == 0' "$created_plain" >/dev/null
+jq -e '.state.schema_version == 6 and .state.users[0].usage_offset_bytes == 0' "$created_plain" >/dev/null
 
 MIGRATION_BACKUP_DIR="$work/rejected-created"
 jq '.users[0].usage_offset_bytes = null' "$STATE_FILE" > "$work/invalid-created-migration-state.json"
@@ -4816,6 +4872,19 @@ mv "$SINGBOX_CONFIG.tmp" "$SINGBOX_CONFIG"
 audit_consistency > "$work/audit-udp-invalid-output"
 [[ "$AUDIT_ISSUES" == 1 && "$AUDIT_REPAIRABLE" == 1 ]]
 grep -Fq 'UDP 连接配置不正确' "$work/audit-udp-invalid-output"
+
+printf '%s\n' '{"schema_version":6,"users":[{"name":"direct-audit","status":"active","port":20044,"protocol":"ss2022","transport":"direct","metered":false,"usage_offset_bytes":0,"ss2022_password":"direct-secret","method":"2022-blake3-aes-128-gcm","endpoints":[{"protocol":"ss2022","transport":"direct","port":20044,"ss2022_password":"direct-secret","method":"2022-blake3-aes-128-gcm"}]}],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
+printf '%s\n' '{"inbounds":[{"type":"shadowsocks","tag":"ss-direct-audit","listen":"::","listen_port":20044,"method":"2022-blake3-aes-128-gcm","password":"direct-secret"},{"type":"shadowtls","tag":"st-direct-audit"},{"type":"shadowsocks","tag":"ss-udp-direct-audit","network":"udp","listen_port":20044}],"outbounds":[],"route":{"rule_set":[],"rules":[]}}' > "$SINGBOX_CONFIG"
+nfuse() {
+  if [[ "$1" == list && "$2" == --json ]]; then
+    printf '%s\n' '[{"name":"direct-audit","tier":"c","ports":[{"start":20044,"end":20044}]}]'
+    return 0
+  fi
+  return 0
+}
+audit_consistency > "$work/audit-direct-stale-output"
+[[ "$AUDIT_ISSUES" == 1 && "$AUDIT_REPAIRABLE" == 1 ]]
+grep -Fq '原生 SS2022 仍有旧版 ShadowTLS 连接残留' "$work/audit-direct-stale-output"
 
 python3 tests/test-interactive.py
 

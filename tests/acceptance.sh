@@ -384,7 +384,7 @@ remove_full_test_users() {
 }
 
 run_lifecycle() {
-  local suffix ss_port anytls_port sni edited_sni edited_expiry old_secret new_secret limit_bytes list_output expires usage
+  local suffix ss_port anytls_port sni edited_expiry old_secret new_secret limit_bytes list_output expires usage
   [[ "$CONFIRM" == YES ]] || { fail '写入型验收授权' '必须设置 SB_ACCEPTANCE_CONFIRM=YES'; return 1; }
   if ((FAILURES > 0)); then fail '写入型验收前置检查' '只读验收存在失败项'; return 1; fi
   prepare_core
@@ -414,28 +414,32 @@ run_lifecycle() {
   LIVE_STARTED=true
 
   ss_port="$(find_available_user_port)"
-  run_mutation '创建自用 SS2022 + ShadowTLS 用户' cmd_add self "$SS_USER" "$ss_port" 2022-blake3-aes-128-gcm "$sni"
+  run_mutation '创建自用 SS2022 用户' cmd_add self "$SS_USER" "$ss_port" 2022-blake3-aes-128-gcm
   if ss -H -lnu "sport = :$ss_port" | grep -q .; then pass 'SS2022 同端口 UDP 监听'; else fail 'SS2022 同端口 UDP 监听'; return 1; fi
   anytls_port="$(find_available_user_port)"
   run_mutation '创建计量 AnyTLS 用户' cmd_add_anytls managed "$ANYTLS_USER" "$anytls_port" 1 1 1 "$sni"
-  verify_state_value 'SS2022 用户写入状态' ".users[] | select(.name == \"$SS_USER\") | .protocol // \"ss2022\"" ss2022 || return 1
+  if jq -e --arg name "$SS_USER" '
+    .users[] | select(.name == $name and .protocol == "ss2022" and .transport == "direct") |
+    (has("shadowtls_password") | not) and (has("shadowtls_sni") | not) and
+    (.endpoints == [{protocol:"ss2022",transport:"direct",port:.port,ss2022_password:.ss2022_password,method:.method}])
+  ' "$STATE_FILE" >/dev/null; then pass 'SS2022 用户写入原生状态'; else fail 'SS2022 用户写入原生状态'; return 1; fi
   verify_state_value 'AnyTLS 用户写入状态' ".users[] | select(.name == \"$ANYTLS_USER\") | .protocol" anytls || return 1
   if nfuse_account_exists "$ANYTLS_USER" && nfuse_port_exists "$anytls_port"; then pass 'Nfuse 账户与端口联动'; else fail 'Nfuse 账户与端口联动'; return 1; fi
 
   if cmd_export "$SS_USER" surge > "$WORK/export-ss.txt" &&
      grep -Fq '[Surge]' "$WORK/export-ss.txt" && grep -Fq 'udp-relay=true' "$WORK/export-ss.txt" &&
-     ! grep -Fq 'udp-port=' "$WORK/export-ss.txt"; then
+     ! grep -Fq 'udp-port=' "$WORK/export-ss.txt" && ! grep -Fq 'shadow-tls-' "$WORK/export-ss.txt"; then
     pass '导出 SS2022 Surge 同端口 UDP 配置'
   else
     fail '导出 SS2022 Surge 同端口 UDP 配置'
     return 1
   fi
   if cmd_export "$SS_USER" shadowrocket > "$WORK/export-ss-shadowrocket.txt" &&
-     grep -Eq '^ss://[^[:space:]]+\?shadow-tls=[^[:space:]]+#[^[:space:]]+$' "$WORK/export-ss-shadowrocket.txt" &&
-     ! grep -Fq 'shadow-tls-password=' "$WORK/export-ss-shadowrocket.txt"; then
-    pass '导出 SS2022 + ShadowTLS Shadowrocket URL'
+     grep -Eq '^ss://[^@[:space:]]+@[^:[:space:]]+:[0-9]+#[^[:space:]]+$' "$WORK/export-ss-shadowrocket.txt" &&
+     ! grep -Fq 'shadow-tls' "$WORK/export-ss-shadowrocket.txt"; then
+    pass '导出原生 SS2022 Shadowrocket URL'
   else
-    fail '导出 SS2022 + ShadowTLS Shadowrocket URL'
+    fail '导出原生 SS2022 Shadowrocket URL'
     return 1
   fi
   if cmd_export "$ANYTLS_USER" shadowrocket > "$WORK/export-anytls.txt" &&
@@ -449,14 +453,16 @@ run_lifecycle() {
 
   old_secret="$(jq -r --arg name "$SS_USER" '.users[] | select(.name == $name) | .ss2022_password' "$STATE_FILE")"
   ss_port="$(find_available_user_port)"
-  edited_sni="edit.${sni}"
-  run_mutation '编辑启用中的 SS2022 用户' cmd_edit_user "$SS_USER" "$ss_port" "$edited_sni" 2022-blake3-aes-256-gcm '' ''
+  run_mutation '编辑启用中的 SS2022 用户' cmd_edit_user "$SS_USER" "$ss_port" '' 2022-blake3-aes-256-gcm '' ''
   new_secret="$(jq -r --arg name "$SS_USER" '.users[] | select(.name == $name) | .ss2022_password' "$STATE_FILE")"
   if [[ "$new_secret" != "$old_secret" ]] &&
-     jq -e --arg name "$SS_USER" --arg sni "$edited_sni" --argjson port "$ss_port" '
-       .users[] | select(.name == $name and .port == $port and .shadowtls_sni == $sni and .method == "2022-blake3-aes-256-gcm")
+     jq -e --arg name "$SS_USER" --argjson port "$ss_port" '
+       .users[] | select(.name == $name and .port == $port and .transport == "direct" and .method == "2022-blake3-aes-256-gcm" and (has("shadowtls_sni") | not))
      ' "$STATE_FILE" >/dev/null &&
-     tag_exists_in_config "st-$SS_USER" && tag_exists_in_config "ss-$SS_USER" && tag_exists_in_config "ss-udp-$SS_USER"; then
+     jq -e --arg tag "ss-$SS_USER" '
+       any(.inbounds[]; .tag == $tag and .type == "shadowsocks" and (has("network") | not)) and
+       all(.inbounds[]; .tag != ("st-" + ($tag | ltrimstr("ss-"))) and .tag != ("ss-udp-" + ($tag | ltrimstr("ss-"))))
+     ' "$SINGBOX_CONFIG" >/dev/null; then
     pass 'SS2022 编辑同步状态、入站并更换密钥'
   else
     fail 'SS2022 编辑同步状态、入站并更换密钥'
@@ -480,12 +486,12 @@ run_lifecycle() {
     return 1
   fi
 
-  run_mutation '停用自用 SS2022 + ShadowTLS 用户' cmd_disable "$SS_USER"
+  run_mutation '停用自用 SS2022 用户' cmd_disable "$SS_USER"
   verify_state_value 'SS2022 用户状态为停用' ".users[] | select(.name == \"$SS_USER\") | .status" disabled || return 1
   if ss -H -lnu "sport = :$ss_port" | grep -q .; then fail 'SS2022 停用后 UDP 监听清理'; return 1; else pass 'SS2022 停用后 UDP 监听清理'; fi
-  run_mutation '重新启用自用 SS2022 + ShadowTLS 用户' cmd_enable "$SS_USER"
+  run_mutation '重新启用自用 SS2022 用户' cmd_enable "$SS_USER"
   verify_state_value 'SS2022 用户状态为启用' ".users[] | select(.name == \"$SS_USER\") | .status" active || return 1
-  if tag_exists_in_config "st-$SS_USER" && tag_exists_in_config "ss-$SS_USER" && tag_exists_in_config "ss-udp-$SS_USER" &&
+  if tag_exists_in_config "ss-$SS_USER" && ! tag_exists_in_config "st-$SS_USER" && ! tag_exists_in_config "ss-udp-$SS_USER" &&
      ss -H -lnu "sport = :$ss_port" | grep -q . &&
      nfuse list --json | jq -e --arg name "$SS_USER" --argjson port "$ss_port" '
        .[] | select(.name == $name and .tier == "c") |

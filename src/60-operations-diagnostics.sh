@@ -118,7 +118,7 @@ prompt_managed() {
     [[ "$months" =~ ^[1-9][0-9]*$ ]] && break
     echo '输入无效：有效期月数必须是正整数，请重新输入。'
   done
-  if [[ "$protocol" == anytls ]]; then cmd_add_anytls managed "$name" "$port" "$limit" "$anchor" "$months" "$protocol_sni"; else cmd_add managed "$name" "$port" "$limit" "$anchor" "$months" "$method" "$protocol_sni"; fi
+  if [[ "$protocol" == anytls ]]; then cmd_add_anytls managed "$name" "$port" "$limit" "$anchor" "$months" "$protocol_sni"; else cmd_add managed "$name" "$port" "$limit" "$anchor" "$months" "$method"; fi
 }
 
 prompt_self() {
@@ -141,7 +141,7 @@ prompt_self() {
     if port_in_state "$port" || port_is_listening "$port" || nfuse_port_exists "$port"; then echo '该端口已经被占用，请重新输入或直接回车随机选择。'; continue; fi
     break
   done
-  if [[ "$protocol" == anytls ]]; then cmd_add_anytls self "$name" "$port" "$protocol_sni"; else cmd_add self "$name" "$port" "$method" "$protocol_sni"; fi
+  if [[ "$protocol" == anytls ]]; then cmd_add_anytls self "$name" "$port" "$protocol_sni"; else cmd_add self "$name" "$port" "$method"; fi
 }
 
 prompt_available_user_port() {
@@ -173,7 +173,7 @@ prompt_available_user_port() {
 }
 
 prompt_multi_account() {
-  local mode="$1" method="$2" shadowtls_sni="$3" tls_sni="$4"
+  local mode="$1" method="$2" tls_sni="$3"
   local name ss_port anytls_port limit="" anchor="" months=""
   prepare_core
   echo '输入 0 可取消添加并返回用户管理。'
@@ -185,7 +185,7 @@ prompt_multi_account() {
     if nfuse_account_exists "$name"; then echo '同名流量记录已经存在，请先运行「服务与配置检查」。'; continue; fi
     break
   done
-  if ! prompt_available_user_port 'SS2022 + ShadowTLS 公网端口'; then MENU_RETURNED=true; return 0; fi
+  if ! prompt_available_user_port 'SS2022 公网端口'; then MENU_RETURNED=true; return 0; fi
   ss_port="$PROMPT_VALUE"
   if ! prompt_available_user_port 'AnyTLS 公网端口' "$ss_port"; then MENU_RETURNED=true; return 0; fi
   anytls_port="$PROMPT_VALUE"
@@ -200,21 +200,21 @@ prompt_multi_account() {
       [[ "$months" =~ ^[1-9][0-9]*$ ]] && break
       echo '输入无效：有效期月数必须是正整数，请重新输入。'
     done
-    cmd_add_multi managed "$name" "$ss_port" "$anytls_port" "$limit" "$anchor" "$months" "$method" "$shadowtls_sni" "$tls_sni"
+    cmd_add_multi managed "$name" "$ss_port" "$anytls_port" "$limit" "$anchor" "$months" "$method" "$tls_sni"
   else
-    cmd_add_multi self "$name" "$ss_port" "$anytls_port" "$method" "$shadowtls_sni" "$tls_sni"
+    cmd_add_multi self "$name" "$ss_port" "$anytls_port" "$method" "$tls_sni"
   fi
 }
 
 prompt_add_node() {
-  local protocol_choice account_choice protocol method="" protocol_sni="" shadowtls_sni="" tls_sni=""
+  local protocol_choice account_choice protocol method="" protocol_sni="" tls_sni=""
   ensure_safe_ssh_for_singbox_restart || return 0
   load_runtime_config
   while true; do
     echo
     cat <<'EOF'
 选择连接协议：
-  1. SS2022 + ShadowTLS v3
+  1. SS2022
   2. AnyTLS
   3. 同时启用两种协议（共享流量、有效期和状态）
   4. 为已有用户添加或移除协议
@@ -242,9 +242,6 @@ EOF
       method="$PROMPT_VALUE"
       [[ "$method" != 0 ]] || continue
       case "$method" in 1) method=2022-blake3-aes-128-gcm;; 2) method=2022-blake3-aes-256-gcm;; esac
-      if ! read_validated_value "ShadowTLS SNI（留空使用全局默认 ${SS2022_SHADOWTLS_SNI}；输入 0 返回协议选择）：" "$SS2022_SHADOWTLS_SNI" 0 validate_shadowtls_sni; then continue; fi
-      shadowtls_sni="$PROMPT_VALUE"
-      protocol_sni="$shadowtls_sni"
     fi
     if [[ "$protocol" == anytls || "$protocol" == multi ]]; then
       if ! read_validated_value "AnyTLS SNI（留空使用全局默认 ${ANYTLS_SNI}；输入 0 返回协议选择）：" "$ANYTLS_SNI" 0 validate_shadowtls_sni; then continue; fi
@@ -262,8 +259,8 @@ EOF
     read_menu_choice '请选择使用方式 [1]：' '0,1,2' 1 '请输入 1、2 或 0' || return 1
     account_choice="$PROMPT_VALUE"
     case "$account_choice" in
-      1) if [[ "$protocol" == multi ]]; then prompt_multi_account managed "$method" "$shadowtls_sni" "$tls_sni"; else prompt_managed "$protocol" "$method" "$protocol_sni"; fi; return 0;;
-      2) if [[ "$protocol" == multi ]]; then prompt_multi_account self "$method" "$shadowtls_sni" "$tls_sni"; else prompt_self "$protocol" "$method" "$protocol_sni"; fi; return 0;;
+      1) if [[ "$protocol" == multi ]]; then prompt_multi_account managed "$method" "$tls_sni"; else prompt_managed "$protocol" "$method" "$protocol_sni"; fi; return 0;;
+      2) if [[ "$protocol" == multi ]]; then prompt_multi_account self "$method" "$tls_sni"; else prompt_self "$protocol" "$method" "$protocol_sni"; fi; return 0;;
       0) continue;;
     esac
   done
@@ -275,8 +272,11 @@ load_standard_user_rows() {
     .users[] | select($desired == "all" or .status == $desired) |
     [.name,
      ([if (.endpoints | type) == "array" then .endpoints[].port else .port end | tostring] | join(" / ")),
-     ([if (.endpoints | type) == "array" then .endpoints[].protocol else (.protocol // "ss2022") end |
-       if . == "anytls" then "AnyTLS" else "SS2022 + ShadowTLS" end] | join(" + ")),
+     ([if (.endpoints | type) == "array" then .endpoints[]
+       else {protocol:(.protocol // "ss2022"),transport:(.transport // "shadowtls")} end |
+       if .protocol == "anytls" then "AnyTLS"
+       elif .transport == "shadowtls" then "SS2022 + ShadowTLS（旧版）"
+       else "SS2022" end] | join(" + ")),
      (if .status == "active" then "启用" elif .status == "disabled" then "停用" else .status end)] |
     @tsv
   ' "$STATE_FILE" | sort -V)
@@ -309,7 +309,7 @@ prompt_manage_user_protocols() {
     existing="$(jq -r '.endpoints[0].protocol' <<<"$user")" || return 1
     [[ "$existing" == anytls ]] && missing=ss2022 || missing=anytls
     printf '\n用户 %s 当前只有 %s。\n' "$name" "$protocol_label"
-    read -r -p "是否添加 $([[ "$missing" == anytls ]] && echo AnyTLS || echo 'SS2022 + ShadowTLS')，并共享现有流量、有效期和启停状态？[y/N]：" answer
+    read -r -p "是否添加 $([[ "$missing" == anytls ]] && echo AnyTLS || echo SS2022)，并共享现有流量、有效期和启停状态？[y/N]：" answer
     [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消。'; return 0; }
     if ! prompt_available_user_port '新协议公网端口'; then MENU_RETURNED=true; return 0; fi
     port="$PROMPT_VALUE"
@@ -324,18 +324,18 @@ EOF
       choice="$PROMPT_VALUE"
       [[ "$choice" != 0 ]] || { MENU_RETURNED=true; return 0; }
       [[ "$choice" == 1 ]] && method=2022-blake3-aes-128-gcm || method=2022-blake3-aes-256-gcm
-      if ! read_validated_value "ShadowTLS SNI（留空使用 ${SS2022_SHADOWTLS_SNI}；输入 0 取消）：" "$SS2022_SHADOWTLS_SNI" 0 validate_shadowtls_sni; then MENU_RETURNED=true; return 0; fi
+      sni=""
     else
       if ! read_validated_value "AnyTLS SNI（留空使用 ${ANYTLS_SNI}；输入 0 取消）：" "$ANYTLS_SNI" 0 validate_shadowtls_sni; then MENU_RETURNED=true; return 0; fi
+      sni="$PROMPT_VALUE"
     fi
-    sni="$PROMPT_VALUE"
     cmd_add_user_endpoint "$name" "$missing" "$port" "$method" "$sni"
     return 0
   fi
 
   printf '\n用户 %s 当前同时拥有两个协议。移除协议不会改变账户累计用量、配额或有效期。\n' "$name"
   cat <<'EOF'
-  1. 移除 SS2022 + ShadowTLS
+  1. 移除 SS2022
   2. 移除 AnyTLS
   0. 取消
 EOF
@@ -407,7 +407,7 @@ prompt_remove_user() {
 }
 
 prompt_edit_user() {
-  local row name port protocol_label status user endpoint endpoint_count protocol metered old_sni old_method old_anchor old_expiry
+  local row name port protocol_label status user endpoint endpoint_count protocol transport="" metered old_sni old_method old_anchor old_expiry
   local new_port new_sni new_method new_anchor new_expiry input choice answer changed=false
   prepare_core
   load_standard_user_rows
@@ -432,20 +432,20 @@ prompt_edit_user() {
     cat <<'EOF'
 
 请选择要编辑的连接协议：
-  1. SS2022 + ShadowTLS
+  1. SS2022
   2. AnyTLS
   0. 取消编辑
 EOF
     read_menu_choice '请选择：' '0,1,2' '' '请输入 1、2 或 0' || return 1
     choice="$PROMPT_VALUE"
-    case "$choice" in 1) protocol=ss2022; protocol_label='SS2022 + ShadowTLS';; 2) protocol=anytls; protocol_label=AnyTLS;; 0) MENU_RETURNED=true; return 0;; esac
+    case "$choice" in 1) protocol=ss2022; protocol_label=SS2022;; 2) protocol=anytls; protocol_label=AnyTLS;; 0) MENU_RETURNED=true; return 0;; esac
   else
     protocol="$(jq -r 'if (.endpoints | type) == "array" then .endpoints[0].protocol else (.protocol // "ss2022") end' <<<"$user")" || return 1
   fi
   endpoint="$(jq -ec --arg protocol "$protocol" '
     if (.endpoints | type) == "array" then .endpoints[] | select(.protocol == $protocol)
     elif $protocol == "anytls" then {protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}
-    else {protocol:"ss2022",port:.port,shadowtls_password:.shadowtls_password,ss2022_password:.ss2022_password,
+    else {protocol:"ss2022",transport:(.transport // "shadowtls"),port:.port,shadowtls_password:.shadowtls_password,ss2022_password:.ss2022_password,
       method:.method,shadowtls_sni:.shadowtls_sni} end
   ' <<<"$user")" || return 1
   port="$(jq -r '.port' <<<"$endpoint")" || return 1
@@ -477,7 +477,14 @@ EOF
     new_sni="$PROMPT_VALUE"
     old_method=""
   else
-    old_sni="$(jq -r '.shadowtls_sni' <<<"$endpoint")"
+    transport="$(jq -r '.transport // "shadowtls"' <<<"$endpoint")"
+    if [[ "$transport" == shadowtls ]]; then
+      protocol_label='SS2022 + ShadowTLS（旧版）'
+      old_sni="$(jq -r '.shadowtls_sni' <<<"$endpoint")"
+    else
+      protocol_label=SS2022
+      old_sni=""
+    fi
     old_method="$(jq -r '.method' <<<"$endpoint")"
     cat <<EOF
 SS2022 加密方式（当前 ${old_method}）：
@@ -494,8 +501,12 @@ EOF
       2) new_method=2022-blake3-aes-256-gcm;;
       0) MENU_RETURNED=true; return 0;;
     esac
-    if ! read_validated_value "ShadowTLS SNI（当前 ${old_sni}；留空保持；输入 0 取消）：" "$old_sni" 0 validate_shadowtls_sni; then MENU_RETURNED=true; return 0; fi
-    new_sni="$PROMPT_VALUE"
+    if [[ "$transport" == shadowtls ]]; then
+      if ! read_validated_value "ShadowTLS SNI（当前 ${old_sni}；留空保持；输入 0 取消）：" "$old_sni" 0 validate_shadowtls_sni; then MENU_RETURNED=true; return 0; fi
+      new_sni="$PROMPT_VALUE"
+    else
+      new_sni=""
+    fi
   fi
 
   if [[ "$metered" == true ]]; then
@@ -673,7 +684,7 @@ EOF
 }
 
 audit_consistency() {
-  local config_json nfuse_json user_rows split_rows split name status protocol port metered expected expected_tier tag split_status rule_tag out_tag scope scope_user scope_tags
+  local config_json nfuse_json user_rows split_rows split name status protocol transport port metered expected expected_tier tag split_status rule_tag out_tag scope scope_user scope_tags
   local preset_link_rows preset_kind preset_reason managed_tags legacy_cleanup legacy_count
   AUDIT_ISSUES=0
   AUDIT_REPAIRABLE=0
@@ -684,16 +695,17 @@ audit_consistency() {
   user_rows="$(jq -r '
     .users[] | . as $user |
     (if ($user.endpoints | type) == "array" then $user.endpoints[]
-     else {protocol:($user.protocol // "ss2022"),port:$user.port} end) |
-    [$user.name,$user.status,.protocol,(.port|tostring),
+     else {protocol:($user.protocol // "ss2022"),transport:($user.transport // "shadowtls"),port:$user.port} end) |
+    [$user.name,$user.status,.protocol,(.transport // "-"),(.port|tostring),
      (($user.metered // ($user.limit_gib != null))|tostring)] | @tsv
   ' "$STATE_FILE")" || return 1
   split_rows="$(jq -c '.splits[]?' "$STATE_FILE")" || return 1
   printf '\n服务与配置检查结果\n\n'
-  while IFS=$'\t' read -r name status protocol port metered; do
+  while IFS=$'\t' read -r name status protocol transport port metered; do
     [[ -n "$name" ]] || continue
     if [[ "$protocol" == anytls ]]; then expected="anytls-$name"
-    else expected="st-$name ss-$name ss-udp-$name"
+    elif [[ "$transport" == shadowtls ]]; then expected="st-$name ss-$name ss-udp-$name"
+    else expected="ss-$name"
     fi
     for tag in $expected; do
       if [[ "$status" == active ]] && ! jq -e --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' <<<"$config_json" >/dev/null; then
@@ -704,12 +716,26 @@ audit_consistency() {
         ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
       fi
     done
-    if [[ "$protocol" != anytls && "$status" == active ]] &&
+    if [[ "$protocol" == ss2022 && "$transport" == shadowtls && "$status" == active ]] &&
        jq -e --arg tag "ss-udp-$name" '.inbounds[]? | select(.tag == $tag)' <<<"$config_json" >/dev/null &&
        ! jq -e --arg tag "ss-udp-$name" --argjson port "$port" '
          .inbounds[]? | select(.tag == $tag and .type == "shadowsocks" and .network == "udp" and .listen_port == $port)
        ' <<<"$config_json" >/dev/null; then
       printf '  [可自动修复] 用户 %s 的 UDP 连接配置不正确\n' "$name"
+      ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
+    fi
+    if [[ "$protocol" == ss2022 && "$transport" == direct && "$status" == active ]] &&
+       ! jq -e --arg tag "ss-$name" --argjson port "$port" '
+         .inbounds[]? | select(.tag == $tag and .type == "shadowsocks" and .listen_port == $port and ((.network // "") == ""))
+       ' <<<"$config_json" >/dev/null; then
+      printf '  [可自动修复] 用户 %s 的原生 SS2022 连接配置不正确\n' "$name"
+      ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
+    fi
+    if [[ "$protocol" == ss2022 && "$transport" == direct ]] &&
+       jq -e --arg st "st-$name" --arg udp "ss-udp-$name" '
+         any(.inbounds[]?; .tag == $st or .tag == $udp)
+       ' <<<"$config_json" >/dev/null; then
+      printf '  [可自动修复] 用户 %s 的原生 SS2022 仍有旧版 ShadowTLS 连接残留\n' "$name"
       ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
     fi
     expected_tier="$([[ "$metered" == true ]] && echo a || echo c)"
@@ -1114,7 +1140,7 @@ diagnostic_report_uid() {
 create_diagnostic_report() {
   local raw sanitized audit_file log_file report os_name singbox_version nfuse_version channel recorded_version
   local sing_state nfuse_state expiry_state config_result nfuse_result state_result audit_result transaction_result launcher_result overall
-  local users_total=0 users_active=0 users_disabled=0 users_ss=0 users_anytls=0 users_metered=0 users_self=0
+  local users_total=0 users_active=0 users_disabled=0 users_ss=0 users_ss_legacy=0 users_anytls=0 users_metered=0 users_self=0
   local splits_total=0 splits_active=0 splits_disabled=0 splits_all=0 splits_user=0
   local outbound_presets_total=0 rule_presets_total=0 linked_splits=0 independent_splits=0
   local lock_acquired=false
@@ -1168,6 +1194,7 @@ create_diagnostic_report() {
     users_active="$(jq '[.users[] | select(.status=="active")]|length' "$STATE_FILE")"
     users_disabled=$((users_total-users_active))
     users_ss="$(jq '[.users[] | select(any(.endpoints[]; .protocol=="ss2022"))]|length' "$STATE_FILE")"
+    users_ss_legacy="$(jq '[.users[] | select(any(.endpoints[]; .protocol=="ss2022" and .transport=="shadowtls"))]|length' "$STATE_FILE")"
     users_anytls="$(jq '[.users[] | select(any(.endpoints[]; .protocol=="anytls"))]|length' "$STATE_FILE")"
     users_metered="$(jq '[.users[] | select(.metered // (.limit_gib != null))]|length' "$STATE_FILE")"
     users_self=$((users_total-users_metered))
@@ -1227,8 +1254,8 @@ create_diagnostic_report() {
     printf '未完成操作：%s\n' "$transaction_result"
     echo
     echo '== 数据数量（不含名称） =='
-    printf '用户：总计 %s｜启用 %s｜停用 %s｜SS2022 + ShadowTLS %s｜AnyTLS %s｜计量 %s｜自用 %s\n' \
-      "$users_total" "$users_active" "$users_disabled" "$users_ss" "$users_anytls" "$users_metered" "$users_self"
+    printf '用户：总计 %s｜启用 %s｜停用 %s｜SS2022 %s（旧版 ShadowTLS %s）｜AnyTLS %s｜计量 %s｜自用 %s\n' \
+      "$users_total" "$users_active" "$users_disabled" "$users_ss" "$users_ss_legacy" "$users_anytls" "$users_metered" "$users_self"
     printf '分流：总计 %s｜启用 %s｜停用 %s｜全部用户 %s｜指定用户 %s\n' \
       "$splits_total" "$splits_active" "$splits_disabled" "$splits_all" "$splits_user"
     printf '预置内容：出口 %s｜规则 %s｜关联分流 %s｜独立分流 %s\n' \

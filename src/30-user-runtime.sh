@@ -99,6 +99,22 @@ make_user_inbounds() {
     ]'
 }
 
+make_ss2022_inbound() {
+  local name="$1" port="$2" ss_password="$3" method="$4"
+  SB_JQ_SS_PASSWORD="$ss_password" jq -n \
+    --arg name "$name" \
+    --argjson port "$port" \
+    --arg method "$method" \
+    '[{
+      "type": "shadowsocks",
+      "tag": ("ss-" + $name),
+      "listen": "::",
+      "listen_port": $port,
+      "method": $method,
+      "password": $ENV.SB_JQ_SS_PASSWORD
+    }]'
+}
+
 rewrite_singbox_config() {
   local filter="$1" config_dir tmp normalized
   shift
@@ -178,7 +194,7 @@ rebuild_protocol_inbounds() {
      elif ($user.protocol // "ss2022") == "anytls" then
        {protocol:"anytls",port:$user.port,anytls_password:$user.anytls_password,tls_sni:$user.tls_sni}
      else
-       {protocol:"ss2022",port:$user.port,shadowtls_password:$user.shadowtls_password,
+       {protocol:"ss2022",transport:"shadowtls",port:$user.port,shadowtls_password:$user.shadowtls_password,
         ss2022_password:$user.ss2022_password,method:$user.method,shadowtls_sni:$user.shadowtls_sni}
      end) |
     select(.protocol == $protocol) | {name:$user.name,status:$user.status,endpoint:.}
@@ -198,8 +214,8 @@ ss2022_udp_inbounds_are_current() {
         . as $user |
         ([if (.endpoints | type) == "array" then .endpoints[]
           elif (.protocol // "ss2022") == "ss2022" then
-            {protocol:"ss2022",port:.port,ss2022_password:.ss2022_password,method:.method}
-          else empty end | select(.protocol == "ss2022")] | first) as $endpoint |
+            {protocol:"ss2022",transport:"shadowtls",port:.port,ss2022_password:.ss2022_password,method:.method}
+          else empty end | select(.protocol == "ss2022" and (.transport // "shadowtls") == "shadowtls")] | first) as $endpoint |
         if $endpoint != null and .status == "active" then
           any($config[0].inbounds[]?;
             .tag == ("ss-udp-" + $user.name) and
@@ -219,7 +235,7 @@ ss2022_udp_inbounds_are_current() {
     user_status="$(jq -r --arg name "$user" 'first(.users[]? | select(.name == $name) | .status) // "missing"' "$STATE_FILE")" || return 1
     [[ "$user_status" == active ]] || continue
     jq -e --arg name "$user" '.users[]? | select(.name == $name) |
-      if (.endpoints | type) == "array" then any(.endpoints[]; .protocol == "ss2022")
+      if (.endpoints | type) == "array" then any(.endpoints[]; .protocol == "ss2022" and (.transport // "shadowtls") == "shadowtls")
       else (.protocol // "ss2022") == "ss2022" end' "$STATE_FILE" >/dev/null || continue
     rule_tag="$(split_runtime_rule_tag_from_json "$split")" || return 1
     inbound="ss-udp-$user"
@@ -276,16 +292,21 @@ make_anytls_inbound() {
 }
 
 make_endpoint_inbounds_from_state() {
-  local name="$1" endpoint="$2" port protocol anytls_password st_password ss_password method shadowtls_sni
+  local name="$1" endpoint="$2" port protocol transport anytls_password st_password ss_password method shadowtls_sni
   port="$(jq -er '.port | select(type == "number")' <<<"$endpoint")" || return 1
   protocol="$(jq -er '.protocol | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
   if [[ "$protocol" == anytls ]]; then
     anytls_password="$(jq -er '.anytls_password | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
     make_anytls_inbound "$name" "$port" "$anytls_password"
   elif [[ "$protocol" == ss2022 ]]; then
-    st_password="$(jq -er '.shadowtls_password | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
+    transport="$(jq -er '.transport // "shadowtls" | select(. == "direct" or . == "shadowtls")' <<<"$endpoint")" || return 1
     ss_password="$(jq -er '.ss2022_password | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
     method="$(jq -er '.method | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
+    if [[ "$transport" == direct ]]; then
+      make_ss2022_inbound "$name" "$port" "$ss_password" "$method"
+      return
+    fi
+    st_password="$(jq -er '.shadowtls_password | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
     shadowtls_sni="$(jq -er '.shadowtls_sni | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
     make_user_inbounds \
       "$name" \
@@ -312,7 +333,7 @@ make_user_inbounds_from_state() {
     if (.protocol // "ss2022") == "anytls" then
       {protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}
     else
-      {protocol:"ss2022",port:.port,shadowtls_password:.shadowtls_password,
+      {protocol:"ss2022",transport:(.transport // "shadowtls"),port:.port,shadowtls_password:.shadowtls_password,
        ss2022_password:.ss2022_password,method:.method,shadowtls_sni:.shadowtls_sni}
     end end' <<<"$user")
   if ((count == 0)); then
@@ -322,15 +343,14 @@ make_user_inbounds_from_state() {
 }
 
 state_add_user() {
-  local name="$1" port="$2" st_password="$3" ss_password="$4" limit="$5" anchor="$6" metered="$7" expires_at="$8" method="$9" shadowtls_sni="${10}"
-  SB_JQ_ST_PASSWORD="$st_password" SB_JQ_SS_PASSWORD="$ss_password" atomic_state_update '.users += [{
+  local name="$1" port="$2" ss_password="$3" limit="$4" anchor="$5" metered="$6" expires_at="$7" method="$8"
+  SB_JQ_SS_PASSWORD="$ss_password" atomic_state_update '.users += [{
       name: $name,
       port: $port,
       protocol: "ss2022",
-      shadowtls_password: $ENV.SB_JQ_ST_PASSWORD,
+      transport: "direct",
       ss2022_password: $ENV.SB_JQ_SS_PASSWORD,
       method: $method,
-      shadowtls_sni: $shadowtls_sni,
       metered: $metered,
       expires_at: (if $expires_at == "" then null else $expires_at end),
       limit_gib: (if $metered then ($limit | tonumber) else null end),
@@ -340,17 +360,15 @@ state_add_user() {
       created_at: $created_at,
       endpoints: [{
         protocol: "ss2022",
+        transport: "direct",
         port: $port,
-        shadowtls_password: $ENV.SB_JQ_ST_PASSWORD,
         ss2022_password: $ENV.SB_JQ_SS_PASSWORD,
-        method: $method,
-        shadowtls_sni: $shadowtls_sni
+        method: $method
       }]
     }]' \
     --arg name "$name" \
     --argjson port "$port" \
     --arg method "$method" \
-    --arg shadowtls_sni "$shadowtls_sni" \
     --arg created_at "$(date -Iseconds)" \
     --arg limit "$limit" \
     --arg anchor "$anchor" \
@@ -365,26 +383,25 @@ state_add_anytls() {
 }
 
 state_add_multi_user() {
-  local name="$1" ss_port="$2" anytls_port="$3" st_password="$4" ss_password="$5" anytls_password="$6"
-  local limit="$7" anchor="$8" metered="$9" expires_at="${10}" method="${11}" shadowtls_sni="${12}" tls_sni="${13}"
-  SB_JQ_ST_PASSWORD="$st_password" SB_JQ_SS_PASSWORD="$ss_password" SB_JQ_ANYTLS_PASSWORD="$anytls_password" \
+  local name="$1" ss_port="$2" anytls_port="$3" ss_password="$4" anytls_password="$5"
+  local limit="$6" anchor="$7" metered="$8" expires_at="$9" method="${10}" tls_sni="${11}"
+  SB_JQ_SS_PASSWORD="$ss_password" SB_JQ_ANYTLS_PASSWORD="$anytls_password" \
     atomic_state_update '.users += [{
       name:$name,port:$ss_port,protocol:"ss2022",
-      shadowtls_password:$ENV.SB_JQ_ST_PASSWORD,ss2022_password:$ENV.SB_JQ_SS_PASSWORD,
-      method:$method,shadowtls_sni:$shadowtls_sni,
+      transport:"direct",ss2022_password:$ENV.SB_JQ_SS_PASSWORD,method:$method,
       metered:$metered,expires_at:(if $expires_at=="" then null else $expires_at end),
       limit_gib:(if $metered then ($limit|tonumber) else null end),
       billing_anchor:(if $metered then ($anchor|tonumber) else null end),
       usage_offset_bytes:0,status:"active",created_at:$created_at,
       endpoints:[
-        {protocol:"ss2022",port:$ss_port,shadowtls_password:$ENV.SB_JQ_ST_PASSWORD,
-         ss2022_password:$ENV.SB_JQ_SS_PASSWORD,method:$method,shadowtls_sni:$shadowtls_sni},
+        {protocol:"ss2022",transport:"direct",port:$ss_port,
+         ss2022_password:$ENV.SB_JQ_SS_PASSWORD,method:$method},
         {protocol:"anytls",port:$anytls_port,anytls_password:$ENV.SB_JQ_ANYTLS_PASSWORD,tls_sni:$tls_sni}
       ]
     }]' \
     --arg name "$name" --argjson ss_port "$ss_port" --argjson anytls_port "$anytls_port" \
     --arg limit "$limit" --arg anchor "$anchor" --argjson metered "$metered" --arg expires_at "$expires_at" \
-    --arg method "$method" --arg shadowtls_sni "$shadowtls_sni" --arg tls_sni "$tls_sni" \
+    --arg method "$method" --arg tls_sni "$tls_sni" \
     --arg created_at "$(date -Iseconds)"
 }
 
@@ -402,14 +419,17 @@ state_remove_user_endpoint() {
       if .name == $name then
         .endpoints = [.endpoints[] | select(.protocol != $protocol)] |
         .endpoints[0] as $primary |
-        del(.anytls_password,.tls_sni,.shadowtls_password,.ss2022_password,.method,.shadowtls_sni) |
+        del(.anytls_password,.tls_sni,.transport,.shadowtls_password,.ss2022_password,.method,.shadowtls_sni) |
         .protocol = $primary.protocol | .port = $primary.port |
         if $primary.protocol == "anytls" then
           .anytls_password = $primary.anytls_password | .tls_sni = $primary.tls_sni
         else
-          .shadowtls_password = $primary.shadowtls_password |
+          .transport = $primary.transport |
           .ss2022_password = $primary.ss2022_password |
-          .method = $primary.method | .shadowtls_sni = $primary.shadowtls_sni
+          .method = $primary.method |
+          if $primary.transport == "shadowtls" then
+            .shadowtls_password = $primary.shadowtls_password | .shadowtls_sni = $primary.shadowtls_sni
+          else . end
         end
       else . end)
   ' --arg name "$name" --arg protocol "$protocol"
@@ -491,8 +511,15 @@ state_replace_user() {
          .endpoints[0] = {protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}
        else
          .protocol = "ss2022" |
-         .endpoints[0] = {protocol:"ss2022",port:.port,shadowtls_password:.shadowtls_password,
-                          ss2022_password:.ss2022_password,method:.method,shadowtls_sni:.shadowtls_sni}
+         .transport = (.transport // "shadowtls") |
+         if .transport == "shadowtls" then
+           .endpoints[0] = {protocol:"ss2022",transport:"shadowtls",port:.port,
+                            shadowtls_password:.shadowtls_password,ss2022_password:.ss2022_password,
+                            method:.method,shadowtls_sni:.shadowtls_sni}
+         else
+           .endpoints[0] = {protocol:"ss2022",transport:"direct",port:.port,
+                            ss2022_password:.ss2022_password,method:.method}
+         end
        end;
      .users = [.users[] | if .name == $name then (($ENV.SB_JQ_USER | fromjson) | sync_primary_endpoint) else . end]' \
     --arg name "$1"
@@ -507,11 +534,13 @@ state_set_protocol_sni() {
           if $protocol == "anytls" then
             if .protocol == "anytls" then .tls_sni = $sni else . end
           else
-            if .protocol == "ss2022" then .shadowtls_sni = $sni else . end
+            if .protocol == "ss2022" and (.transport // "shadowtls") == "shadowtls" then .shadowtls_sni = $sni else . end
           end)
       else . end |
       if (.protocol // "ss2022") == $protocol then
-        if $protocol == "anytls" then .tls_sni = $sni else .shadowtls_sni = $sni end
+        if $protocol == "anytls" then .tls_sni = $sni
+        elif (.transport // "shadowtls") == "shadowtls" then .shadowtls_sni = $sni
+        else . end
       else . end)
   ' --arg protocol "$protocol" --arg sni "$sni"
 }
@@ -611,21 +640,20 @@ check_new_endpoint_conflicts() {
 
 cmd_add() {
   local mode="$1"; shift
-  local name="${1:-}" port="${2:-}" limit="${3:-}" anchor="${4:-}" months="${5:-}" method shadowtls_sni metered=true expires_at
+  local name="${1:-}" port="${2:-}" limit="${3:-}" anchor="${4:-}" months="${5:-}" method metered=true expires_at
   if [[ "$mode" == self ]]; then
-    (( $# == 4 )) || die "用法：$PROGRAM add-me <用户名> <公网端口> <加密方式> <ShadowTLS-SNI>"
-    method="$3"; shadowtls_sni="$4"
+    (( $# == 3 )) || die "用法：$PROGRAM add-me <用户名> <公网端口> <加密方式>"
+    method="$3"
     metered=false
     expires_at=""
   else
-    (( $# == 7 )) || die "用法：$PROGRAM add <用户名> <公网端口> <配额GiB> <账单日1-28> <有效期月数> <加密方式> <ShadowTLS-SNI>"
-    method="$6"; shadowtls_sni="$7"
+    (( $# == 6 )) || die "用法：$PROGRAM add <用户名> <公网端口> <配额GiB> <账单日1-28> <有效期月数> <加密方式>"
+    method="$6"
   fi
 
   validate_name "$name"
   validate_port "$port"
   validate_ss2022_method "$method"
-  validate_shadowtls_sni "$shadowtls_sni"
   if [[ "$metered" == true ]]; then
     [[ "$months" =~ ^[1-9][0-9]*$ ]] || die "有效期月数必须是正整数"
     expires_at="$(date -d "+${months} month" '+%Y-%m-%dT%H:%M:%S%z')"
@@ -636,14 +664,13 @@ cmd_add() {
   fi
   check_new_user_conflicts ss2022 "$name" "$port"
 
-  local st_password ss_password fragment
-  st_password="$(generate_st_password)"
-  ss_password="$(generate_ss_password "$method")"
-  fragment="$(make_user_inbounds "$name" "$port" "$st_password" "$ss_password" "$method" "$shadowtls_sni")"
+  local ss_password fragment
+  ss_password="$(generate_ss_password "$method")" || return 1
+  fragment="$(make_ss2022_inbound "$name" "$port" "$ss_password" "$method")" || return 1
   ensure_safe_ssh_for_singbox_restart || return 0
   start_managed_operation "add-user:$name" || return 1
 
-  run_managed_step state_add_user "$name" "$port" "$st_password" "$ss_password" "$limit" "$anchor" "$metered" "$expires_at" "$method" "$shadowtls_sni" || return 1
+  run_managed_step state_add_user "$name" "$port" "$ss_password" "$limit" "$anchor" "$metered" "$expires_at" "$method" || return 1
   register_new_user_nfuse "$name" "$port" "$metered" "$limit" "$anchor" || return 1
   run_managed_step append_inbounds "$fragment" || return 1
   run_managed_step check_singbox_and_restart || return 1
@@ -687,14 +714,14 @@ cmd_add_anytls() {
 cmd_add_multi() {
   local mode="$1"; shift
   local name="${1:-}" ss_port="${2:-}" anytls_port="${3:-}" limit="${4:-}" anchor="${5:-}" months="${6:-}"
-  local method shadowtls_sni tls_sni metered=true expires_at=""
+  local method tls_sni metered=true expires_at=""
   if [[ "$mode" == self ]]; then
-    (( $# == 6 )) || die "用法：$PROGRAM add-multi-me <用户名> <SS端口> <AnyTLS端口> <加密方式> <ShadowTLS-SNI> <AnyTLS-SNI>"
-    method="$4"; shadowtls_sni="$5"; tls_sni="$6"; metered=false
+    (( $# == 5 )) || die "用法：$PROGRAM add-multi-me <用户名> <SS端口> <AnyTLS端口> <加密方式> <AnyTLS-SNI>"
+    method="$4"; tls_sni="$5"; metered=false
     limit=""; anchor=""
   else
-    (( $# == 9 )) || die "用法：$PROGRAM add-multi <用户名> <SS端口> <AnyTLS端口> <配额GiB> <账单日> <有效期月数> <加密方式> <ShadowTLS-SNI> <AnyTLS-SNI>"
-    method="$7"; shadowtls_sni="$8"; tls_sni="$9"
+    (( $# == 8 )) || die "用法：$PROGRAM add-multi <用户名> <SS端口> <AnyTLS端口> <配额GiB> <账单日> <有效期月数> <加密方式> <AnyTLS-SNI>"
+    method="$7"; tls_sni="$8"
     [[ "$months" =~ ^[1-9][0-9]*$ ]] || die "有效期月数必须是正整数"
     validate_limit "$limit"
     validate_anchor "$anchor"
@@ -705,21 +732,19 @@ cmd_add_multi() {
   validate_port "$anytls_port"
   [[ "$ss_port" != "$anytls_port" ]] || die "两个协议必须使用不同端口"
   validate_ss2022_method "$method"
-  validate_shadowtls_sni "$shadowtls_sni"
   validate_shadowtls_sni "$tls_sni"
   check_new_user_conflicts ss2022 "$name" "$ss_port"
   check_new_user_conflicts anytls "$name" "$anytls_port"
 
-  local st_password ss_password anytls_password prospective fragment
-  st_password="$(generate_st_password)" || return 1
+  local ss_password anytls_password prospective fragment
   ss_password="$(generate_ss_password "$method")" || return 1
   anytls_password="$(generate_st_password)" || return 1
-  prospective="$(SB_JQ_ST_PASSWORD="$st_password" SB_JQ_SS_PASSWORD="$ss_password" SB_JQ_ANYTLS_PASSWORD="$anytls_password" jq -cn \
+  prospective="$(SB_JQ_SS_PASSWORD="$ss_password" SB_JQ_ANYTLS_PASSWORD="$anytls_password" jq -cn \
     --arg name "$name" --argjson ss_port "$ss_port" --argjson anytls_port "$anytls_port" \
-    --arg method "$method" --arg shadowtls_sni "$shadowtls_sni" --arg tls_sni "$tls_sni" '
+    --arg method "$method" --arg tls_sni "$tls_sni" '
       {name:$name,status:"active",endpoints:[
-        {protocol:"ss2022",port:$ss_port,shadowtls_password:$ENV.SB_JQ_ST_PASSWORD,
-         ss2022_password:$ENV.SB_JQ_SS_PASSWORD,method:$method,shadowtls_sni:$shadowtls_sni},
+        {protocol:"ss2022",transport:"direct",port:$ss_port,
+         ss2022_password:$ENV.SB_JQ_SS_PASSWORD,method:$method},
         {protocol:"anytls",port:$anytls_port,anytls_password:$ENV.SB_JQ_ANYTLS_PASSWORD,tls_sni:$tls_sni}
       ]}')" || return 1
   fragment="$(make_user_inbounds_from_state "$prospective")" || return 1
@@ -727,8 +752,8 @@ cmd_add_multi() {
   start_managed_operation "add-multi-user:$name" || return 1
 
   # 先登记可回滚的账户状态，再把两个端口纳入同一流量账户，最后才开放认证入口。
-  run_managed_step state_add_multi_user "$name" "$ss_port" "$anytls_port" "$st_password" "$ss_password" "$anytls_password" \
-    "$limit" "$anchor" "$metered" "$expires_at" "$method" "$shadowtls_sni" "$tls_sni" || return 1
+  run_managed_step state_add_multi_user "$name" "$ss_port" "$anytls_port" "$ss_password" "$anytls_password" \
+    "$limit" "$anchor" "$metered" "$expires_at" "$method" "$tls_sni" || return 1
   register_new_user_nfuse_ports "$name" "$metered" "$limit" "$anchor" "$ss_port" "$anytls_port" || return 1
   run_managed_step append_inbounds "$fragment" || return 1
   run_managed_step check_singbox_and_restart || return 1
@@ -744,7 +769,7 @@ cmd_add_multi() {
 
 cmd_add_user_endpoint() {
   local name="$1" protocol="$2" port="$3" method="${4:-}" sni="$5"
-  local user status metered expected_tier nfuse_json endpoint prospective fragment password st_password ss_password
+  local user status metered expected_tier nfuse_json endpoint prospective fragment password ss_password
   validate_name "$name"
   user_exists "$name" || die "用户不存在：$name"
   user="$(get_user_json "$name")" || return 1
@@ -755,7 +780,7 @@ cmd_add_user_endpoint() {
     anytls) [[ -z "$method" ]] || die "AnyTLS 不支持 SS2022 加密方式";;
     *) die "不支持的协议：$protocol";;
   esac
-  validate_shadowtls_sni "$sni"
+  if [[ "$protocol" == anytls ]]; then validate_shadowtls_sni "$sni"; fi
   check_new_endpoint_conflicts "$protocol" "$name" "$port"
   status="$(jq -er '.status | select(. == "active" or . == "disabled")' <<<"$user")" || return 1
   metered="$(jq -er '(.metered // (.limit_gib != null)) | select(type == "boolean")' <<<"$user")" || return 1
@@ -769,12 +794,11 @@ cmd_add_user_endpoint() {
     endpoint="$(SB_JQ_PASSWORD="$password" jq -cn --argjson port "$port" --arg sni "$sni" \
       '{protocol:"anytls",port:$port,anytls_password:$ENV.SB_JQ_PASSWORD,tls_sni:$sni}')" || return 1
   else
-    st_password="$(generate_st_password)" || return 1
     ss_password="$(generate_ss_password "$method")" || return 1
-    endpoint="$(SB_JQ_ST_PASSWORD="$st_password" SB_JQ_SS_PASSWORD="$ss_password" jq -cn \
-      --argjson port "$port" --arg method "$method" --arg sni "$sni" \
-      '{protocol:"ss2022",port:$port,shadowtls_password:$ENV.SB_JQ_ST_PASSWORD,
-       ss2022_password:$ENV.SB_JQ_SS_PASSWORD,method:$method,shadowtls_sni:$sni}')" || return 1
+    endpoint="$(SB_JQ_SS_PASSWORD="$ss_password" jq -cn \
+      --argjson port "$port" --arg method "$method" \
+      '{protocol:"ss2022",transport:"direct",port:$port,
+       ss2022_password:$ENV.SB_JQ_SS_PASSWORD,method:$method}')" || return 1
   fi
   prospective="$(SB_JQ_ENDPOINT="$endpoint" jq -c '.endpoints += [($ENV.SB_JQ_ENDPOINT | fromjson)]' <<<"$user")" || return 1
   if [[ "$status" == active ]]; then
@@ -791,7 +815,7 @@ cmd_add_user_endpoint() {
     run_managed_step check_singbox_and_restart || return 1
   fi
   finish_managed_operation || return 1
-  log "已为用户 ${name} 添加协议：$([[ "$protocol" == anytls ]] && echo AnyTLS || echo 'SS2022 + ShadowTLS')（端口 ${port}，共享原流量与有效期）"
+  log "已为用户 ${name} 添加协议：$([[ "$protocol" == anytls ]] && echo AnyTLS || echo SS2022)（端口 ${port}，共享原流量与有效期）"
   cmd_export "$name"
 }
 
@@ -810,11 +834,14 @@ cmd_remove_user_endpoint() {
   prospective="$(jq -c --arg protocol "$protocol" '
     .endpoints = [.endpoints[] | select(.protocol != $protocol)] |
     .endpoints[0] as $primary |
-    del(.anytls_password,.tls_sni,.shadowtls_password,.ss2022_password,.method,.shadowtls_sni) |
+    del(.anytls_password,.tls_sni,.transport,.shadowtls_password,.ss2022_password,.method,.shadowtls_sni) |
     .protocol = $primary.protocol | .port = $primary.port |
     if $primary.protocol == "anytls" then .anytls_password=$primary.anytls_password | .tls_sni=$primary.tls_sni
-    else .shadowtls_password=$primary.shadowtls_password | .ss2022_password=$primary.ss2022_password |
-      .method=$primary.method | .shadowtls_sni=$primary.shadowtls_sni end' <<<"$user")" || return 1
+    else .transport=$primary.transport | .ss2022_password=$primary.ss2022_password | .method=$primary.method |
+      if $primary.transport == "shadowtls" then
+        .shadowtls_password=$primary.shadowtls_password | .shadowtls_sni=$primary.shadowtls_sni
+      else . end
+    end' <<<"$user")" || return 1
   status="$(jq -er '.status | select(. == "active" or . == "disabled")' <<<"$user")" || return 1
   if [[ "$status" == active ]]; then
     fragment="$(make_user_inbounds_from_state "$prospective")" || return 1
@@ -831,7 +858,7 @@ cmd_remove_user_endpoint() {
   run_managed_step nfuse port rm "$port_id" || return 1
   run_managed_step nfuse persist || return 1
   finish_managed_operation || return 1
-  log "已移除用户 ${name} 的协议：$([[ "$protocol" == anytls ]] && echo AnyTLS || echo 'SS2022 + ShadowTLS')；共享账户与用量保持不变"
+  log "已移除用户 ${name} 的协议：$([[ "$protocol" == anytls ]] && echo AnyTLS || echo SS2022)；共享账户与用量保持不变"
   cmd_export "$name"
 }
 
@@ -1044,7 +1071,7 @@ cmd_adjust_traffic() {
 
 cmd_edit_user() {
   local name="$1" new_port="$2" new_sni="$3" new_method="$4" new_anchor="$5" new_expiry="$6" target_protocol="${7:-}"
-  local user endpoint protocol metered status old_port old_sni old_method old_anchor old_expiry new_user fragment=""
+  local user endpoint protocol transport="" metered status old_port old_sni old_method old_anchor old_expiry new_user fragment=""
   local config_changed=false method_changed=false nfuse_changed=false nfuse_json="" old_port_id="" limit expected_tier
 
   validate_name "$name"
@@ -1056,7 +1083,7 @@ cmd_edit_user() {
     elif (.protocol // "ss2022") == "anytls" then
       {protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni} | select(.protocol == $protocol)
     else
-      {protocol:"ss2022",port:.port,shadowtls_password:.shadowtls_password,ss2022_password:.ss2022_password,
+      {protocol:"ss2022",transport:(.transport // "shadowtls"),port:.port,shadowtls_password:.shadowtls_password,ss2022_password:.ss2022_password,
        method:.method,shadowtls_sni:.shadowtls_sni} | select(.protocol == $protocol)
     end
   ' <<<"$user")" || die "用户没有该协议：$target_protocol"
@@ -1070,12 +1097,19 @@ cmd_edit_user() {
   if [[ "$protocol" == anytls ]]; then
     old_sni="$(jq -er '.tls_sni | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
     [[ -z "$new_method" ]] || die "AnyTLS 用户不支持 SS2022 加密方式"
+    validate_shadowtls_sni "$new_sni"
   else
-    old_sni="$(jq -er '.shadowtls_sni | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
+    transport="$(jq -er '.transport // "shadowtls" | select(. == "direct" or . == "shadowtls")' <<<"$endpoint")" || return 1
+    if [[ "$transport" == shadowtls ]]; then
+      old_sni="$(jq -er '.shadowtls_sni | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
+      validate_shadowtls_sni "$new_sni"
+    else
+      old_sni=""
+      [[ -z "$new_sni" ]] || die "原生 SS2022 不使用 SNI"
+    fi
     old_method="$(jq -er '.method | select(type == "string" and length > 0)' <<<"$endpoint")" || return 1
     validate_ss2022_method "$new_method"
   fi
-  validate_shadowtls_sni "$new_sni"
 
   if [[ "$metered" == true ]]; then
     old_anchor="$(jq -er '.billing_anchor | select(type == "number" and . == floor)' <<<"$user")" || return 1
@@ -1129,19 +1163,26 @@ cmd_edit_user() {
     'if (.endpoints | type) != "array" then
        if (.protocol // "ss2022") == "anytls" then
          .endpoints=[{protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}]
-       else .endpoints=[{protocol:"ss2022",port:.port,shadowtls_password:.shadowtls_password,
+       else .endpoints=[{protocol:"ss2022",transport:(.transport // "shadowtls"),port:.port,shadowtls_password:.shadowtls_password,
          ss2022_password:.ss2022_password,method:.method,shadowtls_sni:.shadowtls_sni}] end
      else . end |
      .endpoints |= map(
        if .protocol == $protocol then
          .port = $port |
          if $protocol == "anytls" then .tls_sni = $sni
-         else .shadowtls_sni = $sni | .method = $method end
+         else .method = $method |
+           if .transport == "shadowtls" then .shadowtls_sni = $sni
+           else del(.shadowtls_password,.shadowtls_sni) end
+         end
        else . end) |
      if (.protocol // "ss2022") == $protocol then
        .port = $port |
        if $protocol == "anytls" then .tls_sni = $sni
-       else .shadowtls_sni = $sni | .method = $method end
+       else .method = $method |
+         .transport = (.transport // (first(.endpoints[]? | select(.protocol == "ss2022") | .transport)) // "shadowtls") |
+         if .transport == "shadowtls" then .shadowtls_sni = $sni
+         else del(.shadowtls_password,.shadowtls_sni) end
+       end
      else . end |
      if (.metered // (.limit_gib != null)) then
        .billing_anchor = ($anchor | tonumber) | .expires_at = $expiry
@@ -1200,13 +1241,18 @@ cmd_set_global_sni() {
     *) die "未知 SNI 协议：$protocol";;
   esac
   total="$(jq --arg protocol "$protocol" '[.users[] |
-    select(any(if (.endpoints | type) == "array" then .endpoints[] else {protocol:(.protocol // "ss2022")} end; .protocol == $protocol))] | length' "$STATE_FILE")" || return 1
+    select(any(if (.endpoints | type) == "array" then .endpoints[]
+      else {protocol:(.protocol // "ss2022"),transport:(.transport // "shadowtls")} end;
+      .protocol == $protocol and ($protocol != "ss2022" or .transport == "shadowtls")))] | length' "$STATE_FILE")" || return 1
   mismatched="$(jq --arg protocol "$protocol" --arg sni "$new_sni" '[.users[] |
     (if (.endpoints | type) == "array" then .endpoints[]
-     else {protocol:(.protocol // "ss2022"),tls_sni:.tls_sni,shadowtls_sni:.shadowtls_sni} end) |
-    select(.protocol == $protocol) | select((if $protocol == "anytls" then .tls_sni else .shadowtls_sni end) != $sni)] | length' "$STATE_FILE")" || return 1
+     else {protocol:(.protocol // "ss2022"),transport:(.transport // "shadowtls"),tls_sni:.tls_sni,shadowtls_sni:.shadowtls_sni} end) |
+    select(.protocol == $protocol and ($protocol != "ss2022" or .transport == "shadowtls")) |
+    select((if $protocol == "anytls" then .tls_sni else .shadowtls_sni end) != $sni)] | length' "$STATE_FILE")" || return 1
   active_count="$(jq --arg protocol "$protocol" '[.users[] |
-    select(.status == "active" and any(if (.endpoints | type) == "array" then .endpoints[] else {protocol:(.protocol // "ss2022")} end; .protocol == $protocol))] | length' "$STATE_FILE")" || return 1
+    select(.status == "active" and any(if (.endpoints | type) == "array" then .endpoints[]
+      else {protocol:(.protocol // "ss2022"),transport:(.transport // "shadowtls")} end;
+      .protocol == $protocol and ($protocol != "ss2022" or .transport == "shadowtls")))] | length' "$STATE_FILE")" || return 1
   if [[ "$new_sni" == "$current_sni" && "$mismatched" == 0 ]]; then
     log "全局 SNI 与既有用户已一致，无需修改"
     return 0
@@ -1283,8 +1329,11 @@ render_user_list() {
         (($user.metered // ($user.limit_gib != null))) as $metered |
         ($nfuse | map(select(.name == $user.name)) | first) as $meter |
         [$user.name,
-         ([if ($user.endpoints | type) == "array" then $user.endpoints[].protocol else ($user.protocol // "ss2022") end |
-           if . == "anytls" then "AnyTLS" else "SS2022+ShadowTLS" end] | join(" + ")),
+         ([if ($user.endpoints | type) == "array" then $user.endpoints[]
+           else {protocol:($user.protocol // "ss2022"),transport:($user.transport // "shadowtls")} end |
+           if .protocol == "anytls" then "AnyTLS"
+           elif .transport == "shadowtls" then "SS2022+ShadowTLS（旧版）"
+           else "SS2022" end] | join(" + ")),
          ([if ($user.endpoints | type) == "array" then $user.endpoints[].port else $user.port end | tostring] | join(" / ")),
          (if $user.status == "disabled" then "停用"
           elif $user.status == "active" and $metered and $meter != null and $meter.used_bytes >= $meter.limit_bytes then "配额耗尽"
@@ -1404,6 +1453,18 @@ shadowrocket_ss2022_url() {
     "$credentials_base64" "$(url_percent_encode "$plugin_base64")" "$(url_percent_encode "$name")"
 }
 
+shadowrocket_ss2022_direct_url() {
+  local user="$1" override_port="${2:-}" name port method ss_password host userinfo
+  name="$(jq -er '.name' <<<"$user")" || return 1
+  port="$(jq -er '.port' <<<"$user")" || return 1
+  [[ -z "$override_port" ]] || port="$override_port"
+  method="$(jq -er '.method' <<<"$user")" || return 1
+  ss_password="$(jq -er '.ss2022_password' <<<"$user")" || return 1
+  host="$(url_authority_host "$PUBLIC_SERVER")"
+  userinfo="$(printf '%s' "${method}:${ss_password}" | base64_without_padding)" || return 1
+  printf 'ss://%s@%s:%s#%s' "$userinfo" "$host" "$port" "$(url_percent_encode "$name")"
+}
+
 print_shadowrocket_qr() {
   qrencode -t ANSIUTF8 -l L -m 1 -- "$1"
 }
@@ -1447,7 +1508,7 @@ cmd_export() {
     *) die "导出格式必须是 all、surge 或 shadowrocket" ;;
   esac
 
-  local user endpoint endpoint_user protocol endpoint_count node_name port st_password ss_password method shadowtls_sni server_port shadowrocket_url
+  local user endpoint endpoint_user protocol transport endpoint_count node_name port st_password ss_password method shadowtls_sni server_port shadowrocket_url
   user="$(get_user_json "$name")"
   endpoint_count="$(jq 'if (.endpoints | type) == "array" then .endpoints | length else 1 end' <<<"$user")" || return 1
   while IFS= read -r endpoint; do
@@ -1472,25 +1533,37 @@ cmd_export() {
       fi
       continue
     fi
-    st_password="$(jq -r '.shadowtls_password' <<<"$endpoint")"
+    transport="$(jq -r '.transport // "shadowtls"' <<<"$endpoint")"
     ss_password="$(jq -r '.ss2022_password' <<<"$endpoint")"
     method="$(jq -r '.method' <<<"$endpoint")"
-    shadowtls_sni="$(jq -r '.shadowtls_sni' <<<"$endpoint")"
-    if [[ "$format" == all || "$format" == surge ]]; then
-      printf '\n[Surge]\n'
-      printf '%s = ss, %s, %s, encrypt-method=%s, password=%s, shadow-tls-password=%s, shadow-tls-sni=%s, shadow-tls-version=3, udp-relay=true\n' \
-        "$node_name" "$PUBLIC_SERVER" "$server_port" "$method" "$ss_password" "$st_password" "$shadowtls_sni"
-    fi
-    if [[ "$format" == all || "$format" == shadowrocket ]]; then
-      shadowrocket_url="$(shadowrocket_ss2022_url "$endpoint_user" "$server_port")" || die "无法生成 Shadowrocket SS2022 + ShadowTLS 导入链接"
-      render_shadowrocket_export "$shadowrocket_url"
+    if [[ "$transport" == shadowtls ]]; then
+      st_password="$(jq -er '.shadowtls_password' <<<"$endpoint")" || return 1
+      shadowtls_sni="$(jq -er '.shadowtls_sni' <<<"$endpoint")" || return 1
+      if [[ "$format" == all || "$format" == surge ]]; then
+        printf '\n[Surge]\n'
+        printf '%s = ss, %s, %s, encrypt-method=%s, password=%s, shadow-tls-password=%s, shadow-tls-sni=%s, shadow-tls-version=3, udp-relay=true\n' \
+          "$node_name" "$PUBLIC_SERVER" "$server_port" "$method" "$ss_password" "$st_password" "$shadowtls_sni"
+      fi
+      if [[ "$format" == all || "$format" == shadowrocket ]]; then
+        shadowrocket_url="$(shadowrocket_ss2022_url "$endpoint_user" "$server_port")" || die "无法生成 Shadowrocket SS2022 + ShadowTLS 导入链接"
+        render_shadowrocket_export "$shadowrocket_url"
+      fi
+    else
+      if [[ "$format" == all || "$format" == surge ]]; then
+        printf '\n[Surge]\n%s = ss, %s, %s, encrypt-method=%s, password=%s, udp-relay=true\n' \
+          "$node_name" "$PUBLIC_SERVER" "$server_port" "$method" "$ss_password"
+      fi
+      if [[ "$format" == all || "$format" == shadowrocket ]]; then
+        shadowrocket_url="$(shadowrocket_ss2022_direct_url "$endpoint_user" "$server_port")" || die "无法生成 Shadowrocket SS2022 导入链接"
+        render_shadowrocket_export "$shadowrocket_url"
+      fi
     fi
   done < <(jq -c '
     if (.endpoints | type) == "array" then .endpoints[]
     elif (.protocol // "ss2022") == "anytls" then
       {protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}
     else
-      {protocol:"ss2022",port:.port,shadowtls_password:.shadowtls_password,
+      {protocol:"ss2022",transport:(.transport // "shadowtls"),port:.port,shadowtls_password:.shadowtls_password,
        ss2022_password:.ss2022_password,method:.method,shadowtls_sni:.shadowtls_sni}
     end
   ' <<<"$user")

@@ -213,16 +213,23 @@ create_migration_backup() {
        if (.protocol // "ss2022") == "anytls" then
          {protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}
        else
-         {protocol:"ss2022",port:.port,shadowtls_password:.shadowtls_password,
+         {protocol:"ss2022",transport:"shadowtls",port:.port,shadowtls_password:.shadowtls_password,
           ss2022_password:.ss2022_password,method:.method,shadowtls_sni:.shadowtls_sni}
        end;
      ($state[0] |
        if .schema_version == 3 and $schema >= 4 then
          . + {schema_version:4,outbound_presets:(.outbound_presets // []),rule_presets:(.rule_presets // [])}
        else . end |
-       if .schema_version == 4 and $schema == 5 then
+       if .schema_version == 4 and $schema >= 5 then
          .users |= map(.protocol = (.protocol // "ss2022") | if has("usage_offset_bytes") then . else .usage_offset_bytes = 0 end | .endpoints = [endpoint_from_legacy]) |
          .schema_version = 5
+       else . end |
+       if .schema_version == 5 and $schema >= 6 then
+         .users |= map(
+           .endpoints |= map(if .protocol == "ss2022" then .transport = (.transport // "shadowtls") else . end) |
+           if .protocol == "ss2022" then .transport = (.transport // "shadowtls") else . end
+         ) |
+         .schema_version = 6
        else . end) as $snapshot |
       {format_version:$format,created_at:$created_at,script_version:$script_version,source_hostname:$hostname,state:$snapshot,
        nfuse_usage:[$nfuse[] as $account | select(any($snapshot.users[]; .name == $account.name)) | $account]}' > "$plain"
@@ -450,9 +457,7 @@ normalize_migration_payload_schema() {
   local file="$1" schema tmp needs_update=false
   schema="$(jq -r '.state.schema_version // 0' "$file" 2>/dev/null)" || return 1
   [[ "$schema" =~ ^[0-9]+$ ]] || return 1
-  if ((schema == 3 && STATE_SCHEMA_VERSION >= 4)); then
-    needs_update=true
-  elif ((schema == 4 && STATE_SCHEMA_VERSION == 5)); then
+  if ((schema < STATE_SCHEMA_VERSION)); then
     needs_update=true
   elif jq -e '(.state.users | type == "array") and any(.state.users[]?; has("usage_offset_bytes") | not)' \
       "$file" >/dev/null 2>&1; then
@@ -465,7 +470,7 @@ normalize_migration_payload_schema() {
         if (.protocol // "ss2022") == "anytls" then
           {protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}
         else
-          {protocol:"ss2022",port:.port,shadowtls_password:.shadowtls_password,
+          {protocol:"ss2022",transport:"shadowtls",port:.port,shadowtls_password:.shadowtls_password,
            ss2022_password:.ss2022_password,method:.method,shadowtls_sni:.shadowtls_sni}
         end;
       .state.users |= map(if has("usage_offset_bytes") then . else .usage_offset_bytes = 0 end) |
@@ -474,9 +479,16 @@ normalize_migration_payload_schema() {
         .state.rule_presets = (.state.rule_presets // []) |
         .state.schema_version = 4
       else . end |
-      if .state.schema_version == 4 and $schema == 5 then
+      if .state.schema_version == 4 and $schema >= 5 then
         .state.users |= map(.protocol = (.protocol // "ss2022") | .endpoints = [endpoint_from_legacy]) |
         .state.schema_version = 5
+      else . end |
+      if .state.schema_version == 5 and $schema >= 6 then
+        .state.users |= map(
+          .endpoints |= map(if .protocol == "ss2022" then .transport = (.transport // "shadowtls") else . end) |
+          if .protocol == "ss2022" then .transport = (.transport // "shadowtls") else . end
+        ) |
+        .state.schema_version = 6
       else . end
     ' "$file" > "$tmp"; then
       rm -f -- "$tmp"
@@ -548,6 +560,16 @@ validate_migration_payload_structure() {
   local payload="$1" rule_url
   normalize_migration_payload_schema "$payload" || return 1
   jq -e --argjson schema "$STATE_SCHEMA_VERSION" '
+    def valid_ss2022_endpoint:
+      (.transport == "direct" or .transport == "shadowtls") and
+      (.ss2022_password | type == "string" and length > 0) and
+      (.method == "2022-blake3-aes-128-gcm" or .method == "2022-blake3-aes-256-gcm") and
+      (if .transport == "shadowtls" then
+         (.shadowtls_password | type == "string" and length > 0) and
+         (.shadowtls_sni | type == "string" and length > 0)
+       else
+         (has("shadowtls_password") | not) and (has("shadowtls_sni") | not)
+       end);
     def valid_upstream:
       (type == "object") and
       (.server | type == "string" and length > 0) and
@@ -604,18 +626,20 @@ validate_migration_payload_structure() {
         if .protocol == "anytls" then
           (.anytls_password|type=="string" and length>0) and (.tls_sni|type=="string" and length>0)
         elif .protocol == "ss2022" then
-          (.shadowtls_password|type=="string" and length>0) and
-          (.ss2022_password|type=="string" and length>0) and
-          (.method=="2022-blake3-aes-128-gcm" or .method=="2022-blake3-aes-256-gcm") and
-          (.shadowtls_sni|type=="string" and length>0)
+          valid_ss2022_endpoint
         else false end) and
       if .protocol == "anytls" then
         (.anytls_password == .endpoints[0].anytls_password) and (.tls_sni == .endpoints[0].tls_sni)
       elif .protocol == "ss2022" then
-        (.shadowtls_password == .endpoints[0].shadowtls_password) and
+        (.transport == .endpoints[0].transport) and
         (.ss2022_password == .endpoints[0].ss2022_password) and
         (.method == .endpoints[0].method) and
-        (.shadowtls_sni == .endpoints[0].shadowtls_sni)
+        (if .transport == "shadowtls" then
+           (.shadowtls_password == .endpoints[0].shadowtls_password) and
+           (.shadowtls_sni == .endpoints[0].shadowtls_sni)
+         else
+           (has("shadowtls_password") | not) and (has("shadowtls_sni") | not)
+         end)
       else false end) and
     all(.state.splits[];
       (.name|type=="string" and test("^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$")) and
@@ -795,7 +819,13 @@ migration_user_conflict() {
         MIGRATION_CONFLICT_REASON="端口 ${port} 已被其他连接配置占用（${tag}）"; return 0
       fi
     done < <(jq -r --argjson port "$port" '.inbounds[]? | select(.listen_port == $port) | (.tag // "")' "$normalized")
-    if [[ "$protocol" == anytls ]]; then tags=("anytls-$name"); else tags=("st-$name" "ss-$name" "ss-udp-$name"); fi
+    if [[ "$protocol" == anytls ]]; then
+      tags=("anytls-$name")
+    elif [[ "$(jq -r '.transport // "shadowtls"' <<<"$endpoint")" == shadowtls ]]; then
+      tags=("st-$name" "ss-$name" "ss-udp-$name")
+    else
+      tags=("ss-$name")
+    fi
     for tag in "${tags[@]}"; do
       if jq -e --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' "$normalized" >/dev/null && ! current_state_owns_tag "$tag"; then
         MIGRATION_CONFLICT_REASON="连接名称已被其他配置占用：$tag"; return 0
@@ -821,7 +851,10 @@ prompt_migration_user_reconfigure() {
     for ((index=0; index<count; index++)); do
       original_port="$(jq -r --argjson index "$index" '.endpoints[$index].port' <<<"$incoming")"
       protocol="$(jq -r --argjson index "$index" '.endpoints[$index].protocol' <<<"$incoming")"
-      [[ "$protocol" == anytls ]] && label=AnyTLS || label='SS2022 + ShadowTLS'
+      if [[ "$protocol" == anytls ]]; then label=AnyTLS
+      elif [[ "$(jq -r --argjson index "$index" '.endpoints[$index].transport // "shadowtls"' <<<"$incoming")" == shadowtls ]]; then label='SS2022 + ShadowTLS（旧版）'
+      else label=SS2022
+      fi
       read -r -p "${label} 新端口 [${original_port}]（输入 0 取消合并）：" port
       [[ "$port" != 0 ]] || { MIGRATION_MERGE_CANCELLED=true; return 1; }
       port="${port:-$original_port}"
@@ -944,7 +977,7 @@ build_merge_migration_payload() {
       if (.protocol // "ss2022") == "anytls" then
         {protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}
       else
-        {protocol:"ss2022",port:.port,shadowtls_password:.shadowtls_password,
+        {protocol:"ss2022",transport:(.transport // "shadowtls"),port:.port,shadowtls_password:.shadowtls_password,
          ss2022_password:.ss2022_password,method:.method,shadowtls_sni:.shadowtls_sni}
       end;
     ($current[0] |
@@ -1015,11 +1048,15 @@ build_merge_migration_payload() {
       jq -r --arg name "$source_name" '
         .state.users[] | select(.name == $name) |
         "  这台服务器：" + ([.endpoints[] |
-          (if .protocol == "anytls" then "AnyTLS" else "SS2022 + ShadowTLS" end) + " 端口 " + (.port|tostring)] | join(" / "))
+          (if .protocol == "anytls" then "AnyTLS"
+           elif .transport == "shadowtls" then "SS2022 + ShadowTLS（旧版）"
+           else "SS2022" end) + " 端口 " + (.port|tostring)] | join(" / "))
       ' "$output"
       jq -r '
         "  备份中用户：" + ([.endpoints[] |
-          (if .protocol == "anytls" then "AnyTLS" else "SS2022 + ShadowTLS" end) + " 端口 " + (.port|tostring)] | join(" / "))
+          (if .protocol == "anytls" then "AnyTLS"
+           elif .transport == "shadowtls" then "SS2022 + ShadowTLS（旧版）"
+           else "SS2022" end) + " 端口 " + (.port|tostring)] | join(" / "))
       ' <<<"$incoming"
       cat <<'EOF'
   1. 保留这台服务器上的用户，跳过备份用户（推荐）
@@ -1186,9 +1223,12 @@ current_state_owns_tag() {
   local tag="$1" rows split runtime_tag
   jq -e --arg tag "$tag" '
     any(.users[]?;
-      . as $user | any(if (.endpoints | type) == "array" then .endpoints[] else {protocol:(.protocol // "ss2022")} end;
+      . as $user | any(if (.endpoints | type) == "array" then .endpoints[]
+        else {protocol:(.protocol // "ss2022"),transport:(.transport // "shadowtls")} end;
         if .protocol == "anytls" then $tag==("anytls-"+$user.name)
-        else ($tag==("st-"+$user.name) or $tag==("ss-"+$user.name) or $tag==("ss-udp-"+$user.name)) end)) or
+        elif .transport == "shadowtls" then
+          ($tag==("st-"+$user.name) or $tag==("ss-"+$user.name) or $tag==("ss-udp-"+$user.name))
+        else $tag==("ss-"+$user.name) end)) or
     any(.splits[]?;
       $tag==(.outbound_tag // ("managed-out-"+.name)) or
       $tag==(.rule_set_tag // ("managed-split-"+.name)) or
@@ -1243,7 +1283,13 @@ collect_migration_conflicts() {
         [[ -n "$tag" ]] || continue
         current_state_owns_tag "$tag" || add_migration_conflict "端口 ${port} 已被其他连接配置占用（${tag}）"
       done < <(jq -r --argjson port "$port" '.inbounds[]? | select(.listen_port==$port) | (.tag//"")' "$normalized")
-      if [[ "$protocol" == anytls ]]; then tags=("anytls-$name"); else tags=("st-$name" "ss-$name" "ss-udp-$name"); fi
+      if [[ "$protocol" == anytls ]]; then
+        tags=("anytls-$name")
+      elif [[ "$(jq -r '.transport // "shadowtls"' <<<"$endpoint")" == shadowtls ]]; then
+        tags=("st-$name" "ss-$name" "ss-udp-$name")
+      else
+        tags=("ss-$name")
+      fi
       for tag in "${tags[@]}"; do
         if jq -e --arg tag "$tag" '.inbounds[]? | select(.tag==$tag)' "$normalized" >/dev/null && ! current_state_owns_tag "$tag"; then
           add_migration_conflict "连接名称已被其他配置占用：$tag"
