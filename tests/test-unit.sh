@@ -1560,6 +1560,28 @@ set -e
 grep -Fxq 'UPDATE:deploy-called' "$work/update-failure"
 ! grep -Fq '正在切换到新进程' "$work/update-failure"
 
+# 安装或更新必须在建立备份、停止服务或写入系统前确认 127.0.0.1 可绑定。
+# 该检查不能依赖 sing-box check，因为静态检查不会实际打开监听端口。
+(
+  python3() { return 0; }
+  ensure_deploy_loopback_ready
+)
+(
+  marker="$work/deploy-after-loopback-preflight"
+  ensure_safe_ssh_for_singbox_restart() { return 0; }
+  python3() { return 1; }
+  validate_manager_shortcut_path() { : > "$marker"; return 0; }
+  create_environment_backup() { : > "$marker"; return 0; }
+  systemctl() { : > "$marker"; return 0; }
+  if deploy_environment false false > "$work/deploy-loopback-rejected" 2>&1; then
+    echo 'deployment accepted an unavailable 127.0.0.1 loopback address' >&2
+    exit 1
+  fi
+  [[ ! -e "$marker" ]]
+  grep -Fq '本机回环地址 127.0.0.1 不可用' "$work/deploy-loopback-rejected"
+  grep -Fq '本次操作已在修改前取消' "$work/deploy-loopback-rejected"
+)
+
 (
   environment_is_deployed() { return 0; }
   load_runtime_config() { :; }
