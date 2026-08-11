@@ -12,7 +12,7 @@ PROGRAM="sb-user-manager"
 CONF_FILE="${SB_USER_CONF:-/etc/sb-user-manager.conf}"
 SELF_SOURCE_PATH="${BASH_SOURCE[0]}"
 SELF_PATH="$(readlink -f -- "$SELF_SOURCE_PATH")"
-SCRIPT_VERSION="4.25.0"
+SCRIPT_VERSION="4.25.1"
 SCRIPT_EDITION_LABEL="公开版"
 STATE_SCHEMA_VERSION=7
 MIN_SUPPORTED_STATE_SCHEMA_VERSION=0
@@ -15066,7 +15066,13 @@ cmd_add_user_endpoint() {
   if [[ "$kind" == anytls ]]; then validate_shadowtls_sni "$sni"; fi
   check_new_endpoint_conflicts "$kind" "$name" "$port"
   status="$(jq -er '.status | select(. == "active" or . == "disabled")' <<<"$user")" || return 1
-  metered="$(jq -er '(.metered // (.limit_gib != null)) | select(type == "boolean")' <<<"$user")" || return 1
+  metered="$(jq -er '
+    (if has("metered") then .metered else (.limit_gib != null) end) |
+    select(type == "boolean") | tostring
+  ' <<<"$user")" || {
+    printf '错误：用户 %s 的流量计费状态无效，请先运行「服务与配置检查」\n' "$name" >&2
+    return 1
+  }
   expected_tier="$([[ "$metered" == true ]] && echo a || echo c)"
   nfuse_json="$(nfuse list --json)" || die "无法读取流量统计数据，请查看服务状态"
   jq -e --arg name "$name" --arg tier "$expected_tier" '.[] | select(.name == $name and .tier == $tier)' <<<"$nfuse_json" >/dev/null ||
