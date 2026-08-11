@@ -12,7 +12,8 @@
 6. 验证升级前备份、失败回滚和旧版本数据兼容性。
 7. 确认管理脚本更新路径保持匿名，不读取、保存或发送 GitHub Token。
 8. 确认仓库 Actions Secret `IMMUTABLE_RELEASES_READ_TOKEN` 已配置且未过期；它必须是只授权当前发布仓库、仅有 Repository Administration 只读权限的短期 fine-grained personal access token。
-9. 由 AI 产品与技术负责人汇总证据并给出发布建议，由项目所有者确认是否发布；正式环境上线另行授权。
+9. 每次创建或轮换上述 Secret 后，先手动运行 `Release protection preflight` 工作流并确认成功；该预检只能读取保护设置，不得创建标签、草稿、附件或 Release。
+10. 由 AI 产品与技术负责人汇总证据并给出发布建议，由项目所有者确认是否发布；正式环境上线另行授权。
 
 ## 测试服务器验收
 

@@ -8,6 +8,13 @@
 
 ## Unreleased
 
+## 4.23.4 - 2026-08-11
+
+- 新增可手动触发的发布保护预检，只验证 `IMMUTABLE_RELEASES_READ_TOKEN` 非空且能读取仓库不可变 Release 设置，不创建标签、草稿、附件或 Release；密钥创建、轮换后必须先通过该预检再占用新版本号。
+- 公开源码审计继续只允许这一种精确的 Secret 引用形式，发布工作流仍将专用只读密钥与 GitHub 自动签发的 Release 写入令牌分开使用。
+- `v4.23.3` 标签的三组完整 CI 全部通过，但发布门禁发现 Actions Secret 实际为空并在创建 Release 前安全停止；本版本不移动或复用该标签，也不为其补建 Release。
+- 本版本只调整发布预检、版本记录和测试，不改变菜单、运行期业务行为、状态 schema、迁移格式、服务器配置或用户数据；继续仅采用本地门禁与 GitHub CI 验收，不登录服务器。
+
 ## 4.23.3 - 2026-08-11
 
 - 不可变 Release 保护门禁改用仓库专用的只读 Actions Secret `IMMUTABLE_RELEASES_READ_TOKEN` 查询仓库设置；密钥缺失、接口失败、响应无效或未启用时仍会在创建 Release 前安全停止。
