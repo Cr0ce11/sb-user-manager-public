@@ -76,6 +76,12 @@ grep -Fq 'entry_controller_main()' sb-user-manager.sh
 grep -Fq 'landing_managed_main()' sb-user-manager.sh
 grep -Fq '"") dispatch_interactive_startup "$@" ;;' sb-user-manager.sh
 grep -Fq -- '--internal-expire) run_standalone_internal_expire "${@:2}" ;;' sb-user-manager.sh
+grep -Fq -- '--take-over-installed-manager) take_over_installed_manager "${@:2}" ;;' sb-user-manager.sh
+grep -Fq 'MIN_SUPPORTED_STATE_SCHEMA_VERSION=0' sb-user-manager.sh
+grep -Fq 'recover_manager_handoff || die' sb-user-manager.sh
+grep -Fq 'exec "$recovered_installed" "$@"' sb-user-manager.sh
+[[ "$(grep -Fc '# >>> manager_channel_handoff' src/50-install-update.sh)" == 1 ]]
+[[ "$(grep -Fc '# <<< manager_channel_handoff' src/50-install-update.sh)" == 1 ]]
 grep -Fq 'printf '\''%s\n'\'' coreutils gawk grep jq openssh-client openssl python3 util-linux' sb-user-manager.sh
 grep -Fq 'CONTROLLER_ROLE_LAST_STATUS=not_checked' sb-user-manager.sh
 grep -Fq 'controller_apply_landing()' sb-user-manager.sh
@@ -248,6 +254,7 @@ grep -Fq 'bash tests/test-controller-role.sh' .github/workflows/ci-release.yml
 grep -Fq 'bash tests/test-controller-role-repair.sh' .github/workflows/ci-release.yml
 grep -Fq 'bash tests/test-controller-role-provision.sh' .github/workflows/ci-release.yml
 grep -Fq 'bash tests/test-manager-role-detection.sh' .github/workflows/ci-release.yml
+grep -Fq 'bash tests/test-manager-handoff.sh' .github/workflows/ci-release.yml
 grep -Fq 'bash tests/test-landing-bootstrap.sh' .github/workflows/ci-release.yml
 grep -Fq 'bash tests/test-landing-dependency-prep.sh' .github/workflows/ci-release.yml
 grep -Fq 'SB_REQUIRE_LANDING_DEPENDENCY_PREP_PRODUCTION=true bash tests/test-landing-dependency-prep.sh' .github/workflows/ci-release.yml
@@ -517,14 +524,15 @@ grep -Fq "trap 'handle_runtime_signal INT 130' INT" sb-user-manager.sh
 grep -Fq "trap 'handle_runtime_signal TERM 143' TERM" sb-user-manager.sh
 signal_rollback_count="$(grep -Ec '^[[:space:]]+set_signal_rollback rollback_' sb-user-manager.sh || true)"
 clear_rollback_count="$(grep -Ec '^[[:space:]]+clear_signal_rollback$' sb-user-manager.sh || true)"
-if [[ "$signal_rollback_count" != 6 ]]; then
-  echo "expected 6 signal rollback registrations, found $signal_rollback_count" >&2
+if [[ "$signal_rollback_count" != 7 ]]; then
+  echo "expected 7 signal rollback registrations, found $signal_rollback_count" >&2
   exit 1
 fi
-if [[ "$clear_rollback_count" != 17 ]]; then
-  echo "expected 17 signal rollback clears, found $clear_rollback_count" >&2
+if [[ "$clear_rollback_count" != 19 ]]; then
+  echo "expected 19 signal rollback clears, found $clear_rollback_count" >&2
   exit 1
 fi
+grep -Fq 'set_signal_rollback rollback_manager_handoff' sb-user-manager.sh
 grep -Fq 'set_signal_rollback landing_apply_signal_rollback' sb-user-manager.sh
 grep -Fq 'set_signal_rollback landing_channel_signal_rollback' sb-user-manager.sh
 grep -Fq 'LANDING_APPLY_TRANSACTION_SCHEMA_VERSION=1' sb-user-manager.sh

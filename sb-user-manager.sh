@@ -10,10 +10,12 @@ umask 077
 
 PROGRAM="sb-user-manager"
 CONF_FILE="${SB_USER_CONF:-/etc/sb-user-manager.conf}"
-SELF_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
-SCRIPT_VERSION="4.23.4"
+SELF_SOURCE_PATH="${BASH_SOURCE[0]}"
+SELF_PATH="$(readlink -f -- "$SELF_SOURCE_PATH")"
+SCRIPT_VERSION="4.23.5"
 SCRIPT_EDITION_LABEL="公开版"
 STATE_SCHEMA_VERSION=5
+MIN_SUPPORTED_STATE_SCHEMA_VERSION=0
 MIGRATION_FORMAT_VERSION=1
 MIGRATION_BUNDLE_VERSION=1
 TRANSACTION_FORMAT_VERSION=1
@@ -22,6 +24,8 @@ ENVIRONMENT_BACKUP_RETENTION="${SB_ENVIRONMENT_BACKUP_RETENTION:-5}"
 MIGRATION_REPORT_RETENTION="${SB_MIGRATION_REPORT_RETENTION:-20}"
 ENVIRONMENT_TRANSACTION_JOURNAL="${SB_ENVIRONMENT_TRANSACTION_JOURNAL:-/var/lib/sb-user-manager.recovery.json}"
 ENVIRONMENT_LOCK_FILE="${SB_ENVIRONMENT_LOCK_FILE:-/run/lock/sb-user-manager-environment.lock}"
+MANAGER_HANDOFF_DIRECTORY="${SB_MANAGER_HANDOFF_DIRECTORY:-/var/lib/sb-user-manager/manager-handoff}"
+MANAGER_HANDOFF_JOURNAL="${SB_MANAGER_HANDOFF_JOURNAL:-$MANAGER_HANDOFF_DIRECTORY/active.json}"
 ENVIRONMENT_BACKUP_PERMISSION_MARKER="${SB_ENVIRONMENT_BACKUP_PERMISSION_MARKER:-/var/lib/sb-user-manager/environment-backup-permissions-v1}"
 BACKUP_RETENTION_MIGRATION_MARKER="${SB_BACKUP_RETENTION_MIGRATION_MARKER:-/var/lib/sb-user-manager/backup-retention-v1}"
 SHARED_PRESET_RUNTIME_MARKER="${SB_SHARED_PRESET_RUNTIME_MARKER:-/var/lib/sb-user-manager/shared-preset-runtime-v2}"
@@ -287,7 +291,7 @@ RUNTIME_TEMP_PATH_COUNT=0
 is_managed_temp_path() {
   local path="$1" name="${1##*/}"
   [[ "$path" == /tmp/sb-* ]] ||
-    [[ "$name" =~ ^\.(managed-users|migration-config|migration-state|state-restore|restore-config|restore-state|restore-previous-state|restore-manager-config|sb-user-manager\.conf|sb-user-manager\.launch|atomic-install|config|normalized|takeover-normalized|takeover-config)\. ]] ||
+    [[ "$name" =~ ^\.(managed-users|migration-config|migration-state|state-restore|restore-config|restore-state|restore-previous-state|restore-manager-config|sb-user-manager\.conf|sb-user-manager\.launch|atomic-install|manager-handoff|config|normalized|takeover-normalized|takeover-config)\. ]] ||
     [[ "$name" =~ ^\.(nfuse-snapshot|transaction)\. ]] ||
     [[ "$name" =~ ^\.singbox-channel\. ]] ||
     [[ "$name" =~ ^\.shared-preset-runtime\. ]] ||
@@ -17274,6 +17278,422 @@ version_gt() {
   [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]
 }
 
+# >>> manager_channel_handoff
+manager_handoff_installed_path() {
+  if [[ -n "${MANAGER_INSTALLED_PATH:-}" ]]; then
+    printf '%s\n' "$MANAGER_INSTALLED_PATH"
+  else
+    system_path /usr/local/sbin/sb-user-manager
+  fi
+}
+
+manager_handoff_backup_script_path() {
+  printf '%s/previous.sh\n' "$MANAGER_HANDOFF_DIRECTORY"
+}
+
+manager_handoff_backup_versions_path() {
+  printf '%s/previous.versions\n' "$MANAGER_HANDOFF_DIRECTORY"
+}
+
+manager_handoff_read_quoted_assignment() {
+  local file="$1" key="$2" count value
+  count="$(grep -Ec "^${key}=\"[^\"]+\"$" "$file" 2>/dev/null || true)"
+  [[ "$count" == 1 ]] || return 1
+  value="$(sed -n "s/^${key}=\"\([^\"]*\)\"$/\1/p" "$file")" || return 1
+  [[ -n "$value" ]] || return 1
+  printf '%s\n' "$value"
+}
+
+manager_handoff_read_integer_assignment() {
+  local file="$1" key="$2" count value
+  count="$(grep -Ec "^${key}=[0-9][0-9]*$" "$file" 2>/dev/null || true)"
+  [[ "$count" == 1 ]] || return 1
+  value="$(sed -n "s/^${key}=\([0-9][0-9]*\)$/\1/p" "$file")" || return 1
+  [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$value"
+}
+
+read_manager_handoff_metadata() {
+  local file="$1" require_handoff="${2:-false}" program minimum_schema=0
+  [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 1
+  [[ "$(head -n 1 "$file" 2>/dev/null || true)" == '#!/usr/bin/env bash' ]] || return 1
+  bash -n "$file" >/dev/null 2>&1 || return 1
+  program="$(manager_handoff_read_quoted_assignment "$file" PROGRAM)" || return 1
+  MANAGER_HANDOFF_METADATA_VERSION="$(manager_handoff_read_quoted_assignment "$file" SCRIPT_VERSION)" || return 1
+  MANAGER_HANDOFF_METADATA_EDITION="$(manager_handoff_read_quoted_assignment "$file" SCRIPT_EDITION_LABEL)" || return 1
+  MANAGER_HANDOFF_METADATA_SCHEMA="$(manager_handoff_read_integer_assignment "$file" STATE_SCHEMA_VERSION)" || return 1
+  [[ "$program" == sb-user-manager ]] || return 1
+  [[ "$MANAGER_HANDOFF_METADATA_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  case "$MANAGER_HANDOFF_METADATA_EDITION" in
+    公开版|私有版) ;;
+    *) return 1 ;;
+  esac
+  grep -Fq 'main() {' "$file" || return 1
+  grep -Fq 'install_manager_binary() {' "$file" || return 1
+  grep -Fq 'if [[ "${SB_USER_MANAGER_LIBRARY:-false}" != true ]]; then' "$file" || return 1
+  if [[ "$require_handoff" == true ]]; then
+    minimum_schema="$(manager_handoff_read_integer_assignment "$file" MIN_SUPPORTED_STATE_SCHEMA_VERSION)" || return 1
+    grep -Fq 'take_over_installed_manager() {' "$file" || return 1
+  elif minimum_schema="$(manager_handoff_read_integer_assignment "$file" MIN_SUPPORTED_STATE_SCHEMA_VERSION 2>/dev/null)"; then
+    :
+  else
+    minimum_schema=0
+  fi
+  ((minimum_schema <= MANAGER_HANDOFF_METADATA_SCHEMA)) || return 1
+  MANAGER_HANDOFF_METADATA_MIN_SCHEMA="$minimum_schema"
+}
+
+manager_handoff_file_is_safe() {
+  local file="$1" installed="${2:-false}" owner mode expected_owner
+  [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 1
+  owner="$(manager_file_uid "$file")" || return 1
+  mode="$(manager_file_mode "$file")" || return 1
+  expected_owner="$(runtime_config_expected_uid)"
+  [[ "$owner" == "$expected_owner" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+  if [[ "$installed" == true ]]; then
+    (( (8#$mode & 077) == 0 ))
+  else
+    (( (8#$mode & 022) == 0 ))
+  fi
+}
+
+manager_handoff_sha256() {
+  sha256sum "$1" 2>/dev/null | awk 'NR==1 {print $1}'
+}
+
+manager_handoff_versions_file_is_safe() {
+  local file="$1" installed_version="$2" owner mode expected_owner count recorded
+  [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 1
+  owner="$(manager_file_uid "$file")" || return 1
+  mode="$(manager_file_mode "$file")" || return 1
+  expected_owner="$(runtime_config_expected_uid)"
+  [[ "$owner" == "$expected_owner" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+  (( (8#$mode & 077) == 0 )) || return 1
+  count="$(grep -Ec '^SCRIPT_VERSION=[0-9]+\.[0-9]+\.[0-9]+$' "$file" 2>/dev/null || true)"
+  [[ "$count" == 1 ]] || return 1
+  recorded="$(sed -n 's/^SCRIPT_VERSION=//p' "$file")" || return 1
+  [[ "$recorded" == "$installed_version" ]]
+}
+
+update_deployed_manager_version() {
+  local version="$1" versions="$DEPLOYED_VERSIONS_FILE" tmp expected_owner
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  [[ -f "$versions" && ! -L "$versions" ]] || return 1
+  tmp="$(mktemp "$(dirname "$versions")/.manager-handoff.XXXXXX")" || return 1
+  register_temp_path "$tmp" || { rm -f -- "$tmp"; return 1; }
+  if ! awk -v version="$version" '
+      BEGIN {updated=0}
+      /^SCRIPT_VERSION=/ {if (updated) exit 2; print "SCRIPT_VERSION=" version; updated=1; next}
+      {print}
+      END {if (!updated) exit 3}
+    ' "$versions" > "$tmp" ||
+     ! chmod 600 "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if ! chown --reference="$versions" "$tmp" 2>/dev/null; then
+    expected_owner="$(runtime_config_expected_uid)"
+    if [[ "$expected_owner" == 0 ]]; then
+      rm -f -- "$tmp"
+      return 1
+    fi
+  fi
+  if ! sync_transaction_path "$tmp" || ! mv -- "$tmp" "$versions" ||
+     ! sync_transaction_path "$(dirname "$versions")"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+acquire_manager_handoff_lock() {
+  install -d -m 755 "$(dirname "$ENVIRONMENT_LOCK_FILE")" || return 1
+  exec 8>"$ENVIRONMENT_LOCK_FILE" || return 1
+  flock -n 8 || { release_environment_lock; return 1; }
+  [[ ! -e "$ENVIRONMENT_TRANSACTION_JOURNAL" && ! -L "$ENVIRONMENT_TRANSACTION_JOURNAL" ]] || {
+    release_environment_lock
+    return 1
+  }
+}
+
+prepare_manager_handoff_directory() {
+  local owner mode expected_owner
+  if [[ -e "$MANAGER_HANDOFF_DIRECTORY" || -L "$MANAGER_HANDOFF_DIRECTORY" ]]; then
+    [[ -d "$MANAGER_HANDOFF_DIRECTORY" && ! -L "$MANAGER_HANDOFF_DIRECTORY" ]] || return 1
+    owner="$(manager_file_uid "$MANAGER_HANDOFF_DIRECTORY")" || return 1
+    mode="$(manager_file_mode "$MANAGER_HANDOFF_DIRECTORY")" || return 1
+    expected_owner="$(runtime_config_expected_uid)"
+    [[ "$owner" == "$expected_owner" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 077) == 0 )) || return 1
+    return 0
+  fi
+  install -d -m 700 "$MANAGER_HANDOFF_DIRECTORY" || return 1
+}
+
+write_manager_handoff_journal() {
+  local old_version="$1" old_edition="$2" old_schema="$3" old_sha256="$4"
+  local new_version="$5" new_edition="$6" new_schema="$7" tmp
+  [[ ! -L "$MANAGER_HANDOFF_JOURNAL" ]] || return 1
+  if [[ -e "$MANAGER_HANDOFF_JOURNAL" ]]; then
+    [[ -f "$MANAGER_HANDOFF_JOURNAL" ]] || return 1
+  fi
+  tmp="$(mktemp "$MANAGER_HANDOFF_DIRECTORY/.manager-handoff.XXXXXX")" || return 1
+  register_temp_path "$tmp" || { rm -f -- "$tmp"; return 1; }
+  if ! jq -n \
+      --argjson format 1 --arg status active \
+      --arg old_version "$old_version" --arg old_edition "$old_edition" \
+      --argjson old_schema "$old_schema" --arg old_sha256 "$old_sha256" \
+      --arg new_version "$new_version" --arg new_edition "$new_edition" \
+      --argjson new_schema "$new_schema" --arg started_at "$(date -Iseconds)" \
+      '{format_version:$format,status:$status,old_version:$old_version,
+        old_edition:$old_edition,old_schema:$old_schema,old_sha256:$old_sha256,
+        new_version:$new_version,new_edition:$new_edition,new_schema:$new_schema,
+        versions_existed:true,started_at:$started_at}' > "$tmp" ||
+     ! chmod 600 "$tmp" || ! sync_transaction_path "$tmp" ||
+     ! mv -- "$tmp" "$MANAGER_HANDOFF_JOURNAL" ||
+     ! sync_transaction_path "$MANAGER_HANDOFF_DIRECTORY"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+validate_manager_handoff_journal() {
+  [[ -f "$MANAGER_HANDOFF_JOURNAL" && ! -L "$MANAGER_HANDOFF_JOURNAL" ]] || return 1
+  jq -e '
+    .format_version == 1 and .status == "active" and .versions_existed == true and
+    (.old_version | type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+    (.new_version | type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+    (.old_edition == "公开版" or .old_edition == "私有版") and
+    (.new_edition == "公开版" or .new_edition == "私有版") and
+    (.old_schema | type == "number" and . >= 0 and . == floor) and
+    (.new_schema | type == "number" and . >= 0 and . == floor) and
+    (.old_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+    (.started_at | type == "string" and length > 0)
+  ' "$MANAGER_HANDOFF_JOURNAL" >/dev/null
+}
+
+clear_manager_handoff_journal() {
+  rm -f -- "$MANAGER_HANDOFF_JOURNAL" || return 1
+  sync_transaction_path "$MANAGER_HANDOFF_DIRECTORY" || return 1
+}
+
+restore_manager_handoff_backups_locked() {
+  local old_sha256="$1" old_version="$2" installed backup_script backup_versions
+  installed="$(manager_handoff_installed_path)" || return 1
+  backup_script="$(manager_handoff_backup_script_path)"
+  backup_versions="$(manager_handoff_backup_versions_path)"
+  [[ "$old_sha256" =~ ^[0-9a-f]{64}$ && "$old_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  manager_handoff_file_is_safe "$backup_script" true || return 1
+  [[ "$(manager_handoff_sha256 "$backup_script")" == "$old_sha256" ]] || return 1
+  manager_handoff_versions_file_is_safe "$backup_versions" "$old_version" || return 1
+  atomic_install_file "$backup_script" "$installed" 700 || return 1
+  atomic_install_file "$backup_versions" "$DEPLOYED_VERSIONS_FILE" 600 || return 1
+  [[ "$(manager_handoff_sha256 "$installed")" == "$old_sha256" ]] || return 1
+  manager_handoff_versions_file_is_safe "$DEPLOYED_VERSIONS_FILE" "$old_version" || return 1
+}
+
+restore_manager_handoff_locked() {
+  local old_sha256 old_version
+  validate_manager_handoff_journal || return 1
+  old_sha256="$(jq -r '.old_sha256' "$MANAGER_HANDOFF_JOURNAL")" || return 1
+  old_version="$(jq -r '.old_version' "$MANAGER_HANDOFF_JOURNAL")" || return 1
+  restore_manager_handoff_backups_locked "$old_sha256" "$old_version"
+}
+
+MANAGER_HANDOFF_ROLLBACK_ACTIVE=false
+MANAGER_HANDOFF_RECOVERED=false
+MANAGER_HANDOFF_ROLLBACK_OLD_SHA256=""
+MANAGER_HANDOFF_ROLLBACK_OLD_VERSION=""
+
+rollback_manager_handoff() {
+  local rc="${1:-1}"
+  trap - ERR
+  clear_signal_rollback
+  if [[ "$MANAGER_HANDOFF_ROLLBACK_ACTIVE" == true ]]; then
+    if restore_manager_handoff_backups_locked \
+         "$MANAGER_HANDOFF_ROLLBACK_OLD_SHA256" "$MANAGER_HANDOFF_ROLLBACK_OLD_VERSION"; then
+      if [[ ! -e "$MANAGER_HANDOFF_JOURNAL" && ! -L "$MANAGER_HANDOFF_JOURNAL" ]] ||
+         clear_manager_handoff_journal; then
+        log '管理脚本接管失败，已原子恢复原脚本和版本记录'
+      else
+        log "严重错误：原脚本已恢复，但无法清除接管日志：$MANAGER_HANDOFF_JOURNAL"
+      fi
+    else
+      log "严重错误：管理脚本接管回滚未能完成；请保留恢复目录：$MANAGER_HANDOFF_DIRECTORY"
+    fi
+  fi
+  MANAGER_HANDOFF_ROLLBACK_ACTIVE=false
+  MANAGER_HANDOFF_ROLLBACK_OLD_SHA256=""
+  MANAGER_HANDOFF_ROLLBACK_OLD_VERSION=""
+  release_environment_lock
+  return "$rc"
+}
+
+recover_manager_handoff() {
+  MANAGER_HANDOFF_RECOVERED=false
+  [[ -e "$MANAGER_HANDOFF_JOURNAL" || -L "$MANAGER_HANDOFF_JOURNAL" ]] || return 0
+  acquire_manager_handoff_lock || {
+    echo '错误：发现未完成的管理脚本接管，但恢复锁不可用。请停止其他管理操作后重试。' >&2
+    return 1
+  }
+  if restore_manager_handoff_locked && clear_manager_handoff_journal; then
+    release_environment_lock
+    MANAGER_HANDOFF_RECOVERED=true
+    log '已恢复上次未完成接管前的管理脚本和版本记录'
+    return 0
+  fi
+  release_environment_lock
+  echo "错误：未完成的管理脚本接管无法自动恢复。请保留恢复目录并停止继续操作：$MANAGER_HANDOFF_DIRECTORY" >&2
+  return 1
+}
+
+verify_manager_handoff_installation() {
+  local installed="$1" candidate="$2" target_version="$3" target_edition="$4" target_schema="$5"
+  cmp -s -- "$candidate" "$installed" || return 1
+  read_manager_handoff_metadata "$installed" true || return 1
+  [[ "$MANAGER_HANDOFF_METADATA_VERSION" == "$target_version" &&
+     "$MANAGER_HANDOFF_METADATA_EDITION" == "$target_edition" &&
+     "$MANAGER_HANDOFF_METADATA_SCHEMA" == "$target_schema" ]] || return 1
+  manager_handoff_versions_file_is_safe "$DEPLOYED_VERSIONS_FILE" "$target_version"
+}
+
+sync_manager_handoff_root_copy() {
+  local installed="$1" old_sha256="$2" root_copy="${MANAGER_ROOT_LAUNCH_COPY:-/root/sb-user-manager.sh}"
+  root_copy="$(system_path "$root_copy")" || return 0
+  [[ "$root_copy" != "$installed" && "$root_copy" != "$SELF_PATH" ]] || return 0
+  [[ -f "$root_copy" && ! -L "$root_copy" ]] || return 0
+  [[ "$(manager_handoff_sha256 "$root_copy")" == "$old_sha256" ]] || return 0
+  if atomic_install_file "$installed" "$root_copy" 700; then
+    log "已同步 root 启动副本：$root_copy"
+  else
+    log "警告：未能同步 root 启动副本；请直接运行 $installed"
+  fi
+}
+
+take_over_installed_manager() {
+  local installed candidate candidate_source versions backup_script backup_versions
+  local target_version target_edition target_schema target_min_schema target_sha256
+  local current_version current_edition current_schema current_sha256
+  [[ $# -eq 0 ]] || { echo '错误：管理脚本接管命令不接受额外参数。' >&2; return 64; }
+  candidate="$SELF_PATH"
+  candidate_source="$SELF_SOURCE_PATH"
+  installed="$(manager_handoff_installed_path)" || return 1
+  versions="$DEPLOYED_VERSIONS_FILE"
+  [[ ! -L "$candidate_source" ]] || { echo '错误：目标管理脚本不能通过符号链接执行。' >&2; return 1; }
+  manager_handoff_file_is_safe "$candidate" false || {
+    echo '错误：目标管理脚本必须是当前用户拥有、且不可被组或其他用户修改的普通文件。' >&2
+    return 1
+  }
+  read_manager_handoff_metadata "$candidate" true || {
+    echo '错误：目标管理脚本的语法、版本信息或项目结构不完整。' >&2
+    return 1
+  }
+  target_version="$MANAGER_HANDOFF_METADATA_VERSION"
+  target_edition="$MANAGER_HANDOFF_METADATA_EDITION"
+  target_schema="$MANAGER_HANDOFF_METADATA_SCHEMA"
+  target_min_schema="$MANAGER_HANDOFF_METADATA_MIN_SCHEMA"
+  [[ "$target_version" == "$SCRIPT_VERSION" && "$target_edition" == "$SCRIPT_EDITION_LABEL" &&
+     "$target_schema" == "$STATE_SCHEMA_VERSION" &&
+     "$target_min_schema" == "$MIN_SUPPORTED_STATE_SCHEMA_VERSION" ]] || {
+    echo '错误：正在运行的目标脚本与其静态版本标记不一致，已拒绝接管。' >&2
+    return 1
+  }
+  [[ "$candidate" != "$installed" ]] || {
+    echo '当前脚本已经位于正式安装路径，无需再次接管。'
+    return 0
+  }
+  manager_handoff_file_is_safe "$installed" true || {
+    echo "错误：正式安装入口不是安全的 root 专用普通文件：$installed" >&2
+    return 1
+  }
+  read_manager_handoff_metadata "$installed" false || {
+    echo '错误：当前已安装管理脚本的语法、版本信息或项目结构无效。' >&2
+    return 1
+  }
+  current_version="$MANAGER_HANDOFF_METADATA_VERSION"
+  current_edition="$MANAGER_HANDOFF_METADATA_EDITION"
+  current_schema="$MANAGER_HANDOFF_METADATA_SCHEMA"
+  if version_gt "$current_version" "$target_version"; then
+    printf '错误：禁止管理脚本降级（当前 %s，目标 %s）。\n' "$current_version" "$target_version" >&2
+    return 1
+  fi
+  if [[ "$current_version" == "$target_version" && "$current_edition" == "$target_edition" ]]; then
+    printf '当前已经是 %s %s，无需重复接管。\n' "$target_version" "$target_edition"
+    return 0
+  fi
+  if ((current_schema > target_schema || current_schema < target_min_schema)); then
+    printf '错误：目标脚本不支持当前数据版本范围（当前支持 %s，目标支持 %s-%s）。\n' \
+      "$current_schema" "$target_min_schema" "$target_schema" >&2
+    return 1
+  fi
+  manager_handoff_versions_file_is_safe "$versions" "$current_version" || {
+    echo "错误：管理脚本版本记录缺失、不安全或与当前脚本不一致：$versions" >&2
+    return 1
+  }
+  candidate_sha256="$(manager_handoff_sha256 "$candidate")" || return 1
+  current_sha256="$(manager_handoff_sha256 "$installed")" || return 1
+  [[ "$candidate_sha256" =~ ^[0-9a-f]{64}$ && "$current_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+
+  acquire_manager_handoff_lock || {
+    echo '错误：另一个安装、恢复或接管操作正在执行，已停止本次接管。' >&2
+    return 1
+  }
+  if [[ -e "$MANAGER_HANDOFF_JOURNAL" || -L "$MANAGER_HANDOFF_JOURNAL" ]]; then
+    release_environment_lock
+    echo '错误：发现尚未恢复的管理脚本接管记录；请重新运行脚本先完成自动恢复。' >&2
+    return 1
+  fi
+  if [[ "$(manager_handoff_sha256 "$candidate")" != "$candidate_sha256" ||
+        "$(manager_handoff_sha256 "$installed")" != "$current_sha256" ]] ||
+     ! manager_handoff_versions_file_is_safe "$versions" "$current_version"; then
+    release_environment_lock
+    echo '错误：接管准备期间脚本或版本记录发生变化，已取消本次操作。' >&2
+    return 1
+  fi
+  if ! prepare_manager_handoff_directory; then
+    release_environment_lock
+    echo "错误：无法创建安全的管理脚本恢复目录：$MANAGER_HANDOFF_DIRECTORY" >&2
+    return 1
+  fi
+  backup_script="$(manager_handoff_backup_script_path)"
+  backup_versions="$(manager_handoff_backup_versions_path)"
+  if ! atomic_install_file "$installed" "$backup_script" 700 ||
+     ! atomic_install_file "$versions" "$backup_versions" 600 ||
+     [[ "$(manager_handoff_sha256 "$backup_script")" != "$current_sha256" ]] ||
+     ! manager_handoff_versions_file_is_safe "$backup_versions" "$current_version" ||
+     ! write_manager_handoff_journal \
+       "$current_version" "$current_edition" "$current_schema" "$current_sha256" \
+       "$target_version" "$target_edition" "$target_schema"; then
+    release_environment_lock
+    echo '错误：无法建立完整的接管回退点，当前安装脚本没有改变。' >&2
+    return 1
+  fi
+
+  MANAGER_HANDOFF_ROLLBACK_ACTIVE=true
+  MANAGER_HANDOFF_ROLLBACK_OLD_SHA256="$current_sha256"
+  MANAGER_HANDOFF_ROLLBACK_OLD_VERSION="$current_version"
+  trap rollback_manager_handoff ERR
+  set_signal_rollback rollback_manager_handoff
+  if ! atomic_install_file "$candidate" "$installed" 700 ||
+     ! update_deployed_manager_version "$target_version" ||
+     ! verify_manager_handoff_installation \
+       "$installed" "$candidate" "$target_version" "$target_edition" "$target_schema" ||
+     ! clear_manager_handoff_journal; then
+    rollback_manager_handoff 1 || true
+    return 1
+  fi
+  MANAGER_HANDOFF_ROLLBACK_ACTIVE=false
+  MANAGER_HANDOFF_ROLLBACK_OLD_SHA256=""
+  MANAGER_HANDOFF_ROLLBACK_OLD_VERSION=""
+  trap - ERR
+  clear_signal_rollback
+  release_environment_lock
+  sync_manager_handoff_root_copy "$installed" "$current_sha256"
+  printf '管理脚本接管完成：%s %s → %s %s\n' \
+    "$current_version" "$current_edition" "$target_version" "$target_edition"
+  printf '用户、流量、证书、分流和运行服务均未修改；原脚本保存在：%s\n' "$backup_script"
+}
+# <<< manager_channel_handoff
+
 installed_singbox_version() { "${SINGBOX_BIN:-/usr/local/bin/sing-box}" version 2>/dev/null | awk 'NR==1 {print $3}' || true; }
 installed_nfuse_version() {
   if [[ -r "$DEPLOYED_VERSIONS_FILE" ]]; then sed -n 's/^NFUSE_VERSION=//p' "$DEPLOYED_VERSIONS_FILE"
@@ -21328,10 +21748,22 @@ interactive_main() {
 }
 
 main() {
+  local recovered_installed
   [[ $EUID -eq 0 ]] || die "必须使用 root 运行"
+  recover_manager_handoff || die "未完成的管理脚本接管尚未安全恢复"
+  if [[ "$MANAGER_HANDOFF_RECOVERED" == true ]]; then
+    recovered_installed="$(manager_handoff_installed_path)" || die "无法确认恢复后的管理脚本路径"
+    recovered_installed="$(readlink -f -- "$recovered_installed" 2>/dev/null || printf '%s' "$recovered_installed")"
+    if [[ "$SELF_PATH" == "$recovered_installed" ]]; then
+      [[ "${1:-}" != --take-over-installed-manager ]] ||
+        die "上次接管已恢复旧脚本；请重新运行单独下载并校验过的目标脚本完成接管"
+      exec "$recovered_installed" "$@"
+    fi
+  fi
   case "${1:-}" in
     "") dispatch_interactive_startup "$@" ;;
     --internal-expire) run_standalone_internal_expire "${@:2}" ;;
+    --take-over-installed-manager) take_over_installed_manager "${@:2}" ;;
     *) die "本脚本采用交互方式，请直接运行且不要添加参数" ;;
   esac
 }
