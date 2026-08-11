@@ -12,7 +12,7 @@ PROGRAM="sb-user-manager"
 CONF_FILE="${SB_USER_CONF:-/etc/sb-user-manager.conf}"
 SELF_SOURCE_PATH="${BASH_SOURCE[0]}"
 SELF_PATH="$(readlink -f -- "$SELF_SOURCE_PATH")"
-SCRIPT_VERSION="4.24.0"
+SCRIPT_VERSION="4.24.1"
 SCRIPT_EDITION_LABEL="公开版"
 STATE_SCHEMA_VERSION=6
 MIN_SUPPORTED_STATE_SCHEMA_VERSION=0
@@ -19388,16 +19388,14 @@ prompt_add_node() {
   1. SS2022
   2. AnyTLS
   3. 同时启用两种协议（共享流量、有效期和状态）
-  4. 为已有用户添加或移除协议
   0. 返回用户管理
 EOF
-    read_menu_choice '请选择协议：' '0,1,2,3,4' '' '请输入 1、2、3、4 或 0' || return 1
+    read_menu_choice '请选择协议：' '0,1,2,3' '' '请输入 1、2、3 或 0' || return 1
     protocol_choice="$PROMPT_VALUE"
     case "$protocol_choice" in
       1) protocol=ss2022;;
       2) protocol=anytls;;
       3) protocol=multi;;
-      4) prompt_manage_user_protocols; return 0;;
       0) MENU_RETURNED=true; return 0;;
     esac
 
@@ -21802,7 +21800,8 @@ user_management_menu() {
     ui_section '常用操作'
     ui_menu_items \
       add '添加用户' list '查看用户' \
-      edit '编辑用户' export '导出用户配置'
+      edit '编辑用户' export '导出用户配置' \
+      protocols '管理用户协议'
     printf '\n'
     ui_section '状态与计费'
     ui_menu_items \
@@ -21820,6 +21819,7 @@ user_management_menu() {
       remove) MENU_RETURNED=false; prompt_remove_user; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
       list) prepare_core; cmd_list; pause_menu;;
       edit) MENU_RETURNED=false; prompt_edit_user; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
+      protocols) MENU_RETURNED=false; prompt_manage_user_protocols; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
       disable) MENU_RETURNED=false; prompt_user_status_action cmd_disable active 停用; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
       enable) MENU_RETURNED=false; prompt_user_status_action cmd_enable disabled 启用; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
       renew) MENU_RETURNED=false; prompt_renew_user; [[ "$MENU_RETURNED" == true ]] || pause_menu;;

@@ -87,7 +87,8 @@ user_management_menu() {
     ui_section '常用操作'
     ui_menu_items \
       add '添加用户' list '查看用户' \
-      edit '编辑用户' export '导出用户配置'
+      edit '编辑用户' export '导出用户配置' \
+      protocols '管理用户协议'
     printf '\n'
     ui_section '状态与计费'
     ui_menu_items \
@@ -105,6 +106,7 @@ user_management_menu() {
       remove) MENU_RETURNED=false; prompt_remove_user; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
       list) prepare_core; cmd_list; pause_menu;;
       edit) MENU_RETURNED=false; prompt_edit_user; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
+      protocols) MENU_RETURNED=false; prompt_manage_user_protocols; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
       disable) MENU_RETURNED=false; prompt_user_status_action cmd_disable active 停用; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
       enable) MENU_RETURNED=false; prompt_user_status_action cmd_enable disabled 启用; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
       renew) MENU_RETURNED=false; prompt_renew_user; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
