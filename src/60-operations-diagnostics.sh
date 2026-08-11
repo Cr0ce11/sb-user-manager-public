@@ -217,16 +217,14 @@ prompt_add_node() {
   1. SS2022
   2. AnyTLS
   3. 同时启用两种协议（共享流量、有效期和状态）
-  4. 为已有用户添加或移除协议
   0. 返回用户管理
 EOF
-    read_menu_choice '请选择协议：' '0,1,2,3,4' '' '请输入 1、2、3、4 或 0' || return 1
+    read_menu_choice '请选择协议：' '0,1,2,3' '' '请输入 1、2、3 或 0' || return 1
     protocol_choice="$PROMPT_VALUE"
     case "$protocol_choice" in
       1) protocol=ss2022;;
       2) protocol=anytls;;
       3) protocol=multi;;
-      4) prompt_manage_user_protocols; return 0;;
       0) MENU_RETURNED=true; return 0;;
     esac
 

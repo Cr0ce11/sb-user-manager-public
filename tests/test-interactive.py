@@ -80,6 +80,12 @@ prompt_edit_user() {
   MENU_RETURNED=true
 }
 
+prompt_manage_user_protocols() {
+  acquire_test_lock
+  echo 'mock manage user protocols'
+  MENU_RETURNED=true
+}
+
 prompt_user_status_action() {
   acquire_test_lock
   echo 'mock user status action'
@@ -269,11 +275,12 @@ def main() -> None:
 
             send("1\n")
             expect("用户管理")
+            expect("管理用户协议")
+            expect_choice_prompt()
+            send("11\n")
+            expect("请输入 0-10 之间的编号")
             expect_choice_prompt()
             send("10\n")
-            expect("请输入 0-9 之间的编号")
-            expect_choice_prompt()
-            send("9\n")
             expect("用户管理")
             expect_choice_prompt()
             send("3\n")
@@ -281,10 +288,14 @@ def main() -> None:
             expect("用户管理")
             expect_choice_prompt()
             send("5\n")
-            expect("mock user status action")
+            expect("mock manage user protocols")
             expect("用户管理")
             expect_choice_prompt()
             send("6\n")
+            expect("mock user status action")
+            expect("用户管理")
+            expect_choice_prompt()
+            send("7\n")
             expect("mock user status action")
             expect("用户管理")
             expect_choice_prompt()

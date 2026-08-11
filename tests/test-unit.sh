@@ -3452,13 +3452,19 @@ grep -Fxq 'ADD-MULTI:self|2022-blake3-aes-128-gcm|global-any.example.com' "$work
 ! grep -Fq 'UNEXPECTED-SINGLE' "$work/add-default-multi"
 (
   load_runtime_config() { :; }
-  prompt_manage_user_protocols() { printf 'MANAGE-EXISTING-PROTOCOLS\n'; }
   MENU_RETURNED=false
   prompt_add_node <<'EOF'
 4
+0
 EOF
-) > "$work/manage-existing-protocols" 2>&1
-grep -Fxq 'MANAGE-EXISTING-PROTOCOLS' "$work/manage-existing-protocols"
+) > "$work/add-user-protocol-menu" 2>&1
+grep -Fq '输入无效：请输入 1、2、3 或 0' "$work/add-user-protocol-menu"
+! grep -Fq '为已有用户添加或移除协议' "$work/add-user-protocol-menu"
+
+user_management_body="$(declare -f user_management_menu)"
+grep -Fq "protocols '管理用户协议'" <<<"$user_management_body"
+grep -Fq 'protocols)' <<<"$user_management_body"
+[[ "$(grep -Fc 'prompt_manage_user_protocols;' <<<"$user_management_body")" == 1 ]]
 (
   load_runtime_config() {
     SS2022_SHADOWTLS_SNI=global-ss.example.com
