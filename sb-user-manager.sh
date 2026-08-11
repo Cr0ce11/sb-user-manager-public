@@ -18698,11 +18698,36 @@ restore_environment_backup() {
   [[ "$copy_ok" == true ]] || { log "环境快照文件恢复失败"; return 1; }
 }
 
+loopback_runtime_bind_is_ready() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - >/dev/null 2>&1 <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+    listener.bind(("127.0.0.1", 0))
+PY
+}
+
+ensure_deploy_loopback_ready() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "安装或更新前安全检查无法执行：缺少 python3。"
+    log "为避免停止当前仍在运行的连接服务，本次操作已在修改前取消。"
+    log "请先进入「安装或修复环境」补齐依赖，再重新执行。"
+    return 1
+  fi
+  if loopback_runtime_bind_is_ready; then return 0; fi
+  log "安装或更新前安全检查未通过：本机回环地址 127.0.0.1 不可用。"
+  log "为避免停止当前仍在运行的连接服务，本次操作已在修改前取消。"
+  log "请先修复 lo 接口的 127.0.0.1 地址，再重新执行。"
+  return 1
+}
+
 deploy_environment() {
   local fresh="$1" update_manager="${2:-false}" iface work backup path deployed_state_file
   local -a deploy_created=()
   local deploy_created_count=0
   ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_deploy_loopback_ready || return 1
   validate_manager_shortcut_path ||
     die "检测到 /usr/local/bin/sbm 已被其他文件或链接占用；为避免覆盖现有程序，本次操作已停止"
   [[ "$(uname -m)" == x86_64 ]] || die "仅支持 x86_64 Linux"
