@@ -11,7 +11,8 @@
 5. 在 Debian 12 x86_64 专用测试服务器执行适用的验收模式。
 6. 验证升级前备份、失败回滚和旧版本数据兼容性。
 7. 确认管理脚本更新路径保持匿名，不读取、保存或发送 GitHub Token。
-8. 由 AI 产品与技术负责人汇总证据并给出发布建议，由项目所有者确认是否发布；正式环境上线另行授权。
+8. 确认仓库 Actions Secret `IMMUTABLE_RELEASES_READ_TOKEN` 已配置且未过期；它必须是只授权当前发布仓库、仅有 Repository Administration 只读权限的短期 fine-grained personal access token。
+9. 由 AI 产品与技术负责人汇总证据并给出发布建议，由项目所有者确认是否发布；正式环境上线另行授权。
 
 ## 测试服务器验收
 
@@ -31,6 +32,8 @@
 - Release 资产必须且只能包括公开版 `sb-user-manager.sh` 及其 SHA-256 文件。
 - 相同标签或 Release 已存在时必须停止；不允许覆盖、删除后复用或手工修补同版本资产。
 - 创建 Release 前必须通过只读 API 确认当前仓库明确返回 `enabled=true`；接口失败、无效响应或未启用时一律停止发布。
+- 上述只读检查只能使用 `IMMUTABLE_RELEASES_READ_TOKEN`；密钥缺失或过期时必须失败关闭。创建、上传和发布 Release 仍使用 GitHub 自动签发的工作流令牌，不得把专用长期密钥扩大到写入操作。
+- 专用密钥应采用短有效期并在到期前轮换；仓库中只保存加密后的 Actions Secret，不得把密钥值写入源码、日志、Issue、Pull Request 或发布附件。
 - 自动发布必须先创建草稿 Release，上传并核对两个附件的 GitHub digest，全部一致后才发布。
 - 草稿准备失败时不得留下正式 Release；已经发布的版本发现问题后只能递增版本号发布修正版。
 - 仓库不可变 Release 设置必须保持启用，使未来发布的标签和附件在发布后由 GitHub 锁定。

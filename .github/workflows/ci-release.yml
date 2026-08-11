@@ -176,8 +176,14 @@ jobs:
         run: sha256sum sb-user-manager.sh > sb-user-manager.sh.sha256
       - name: Verify immutable release protection
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash tools/check-immutable-release-setting.sh "$GITHUB_REPOSITORY"
+          GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo '缺少 Actions Secret：IMMUTABLE_RELEASES_READ_TOKEN；拒绝创建 Release。' >&2
+            exit 1
+          fi
+          bash tools/check-immutable-release-setting.sh "$GITHUB_REPOSITORY"
       - name: Publish immutable release
         env:
           GH_TOKEN: ${{ github.token }}

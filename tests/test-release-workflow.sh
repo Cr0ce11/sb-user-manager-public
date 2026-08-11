@@ -29,6 +29,9 @@ release_filter_contract='-f tools/verify-release-assets.jq'
 release_publish_contract="gh release edit \"${literal_dollar}tag\" --draft=false --latest"
 release_delete_contract="gh release delete \"${literal_dollar}tag\" --yes"
 immutable_check_contract="bash tools/check-immutable-release-setting.sh \"${literal_dollar}GITHUB_REPOSITORY\""
+immutable_token_contract='GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}'
+release_token_contract='GH_TOKEN: ${{ github.token }}'
+missing_token_contract='if [[ -z "${GH_TOKEN:-}" ]]; then'
 
 for release_contract in \
   "$release_view_contract" \
@@ -38,12 +41,30 @@ for release_contract in \
   "$release_verify_contract" \
   "$release_filter_contract" \
   "$release_publish_contract" \
-  "$immutable_check_contract"; do
+  "$immutable_check_contract" \
+  "$immutable_token_contract" \
+  "$release_token_contract" \
+  "$missing_token_contract"; do
   grep -Fq -- "$release_contract" "$workflow" || {
     printf 'immutable release workflow contract is missing: %s\n' "$release_contract" >&2
     exit 1
   }
 done
+
+immutable_step="$(sed -n '/- name: Verify immutable release protection/,/- name: Publish immutable release/p' "$workflow")"
+publish_step="$(sed -n '/- name: Publish immutable release/,$p' "$workflow")"
+grep -Fq "$immutable_token_contract" <<<"$immutable_step"
+if grep -Fq "$release_token_contract" <<<"$immutable_step"; then
+  echo 'immutable setting preflight must not use the default GitHub token' >&2
+  exit 1
+fi
+grep -Fq "$release_token_contract" <<<"$publish_step"
+if grep -Fq "$immutable_token_contract" <<<"$publish_step"; then
+  echo 'the dedicated read-only token must not be used to publish a release' >&2
+  exit 1
+fi
+[[ "$(grep -Fc "$immutable_token_contract" "$workflow")" -eq 1 ]]
+[[ "$(grep -Fc "$release_token_contract" "$workflow")" -eq 1 ]]
 
 release_create_line="$(grep -nF "$release_create_contract" "$workflow" | cut -d: -f1)"
 immutable_check_line="$(grep -nF "$immutable_check_contract" "$workflow" | cut -d: -f1)"
