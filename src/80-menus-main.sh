@@ -3,19 +3,21 @@ show_global_sni_settings() {
   local ss_total ss_mismatch anytls_total anytls_mismatch
   prepare_core
   ss_total="$(jq '[.users[] | . as $user |
-    (if (.endpoints | type) == "array" then .endpoints[] else {protocol:(.protocol // "ss2022")} end) |
-    select(.protocol == "ss2022")] | length' "$STATE_FILE")"
+    (if (.endpoints | type) == "array" then .endpoints[]
+     else {protocol:(.protocol // "ss2022"),transport:(.transport // "shadowtls")} end) |
+    select(.protocol == "ss2022" and .transport == "shadowtls")] | length' "$STATE_FILE")"
   ss_mismatch="$(jq --arg sni "$SS2022_SHADOWTLS_SNI" '[.users[] | . as $user |
-    (if (.endpoints | type) == "array" then .endpoints[] else {protocol:(.protocol // "ss2022"),shadowtls_sni:.shadowtls_sni} end) |
-    select(.protocol == "ss2022" and .shadowtls_sni != $sni)] | length' "$STATE_FILE")"
+    (if (.endpoints | type) == "array" then .endpoints[]
+     else {protocol:(.protocol // "ss2022"),transport:(.transport // "shadowtls"),shadowtls_sni:.shadowtls_sni} end) |
+    select(.protocol == "ss2022" and .transport == "shadowtls" and .shadowtls_sni != $sni)] | length' "$STATE_FILE")"
   anytls_total="$(jq '[.users[] | . as $user |
     (if (.endpoints | type) == "array" then .endpoints[] else {protocol:(.protocol // "ss2022")} end) |
     select(.protocol == "anytls")] | length' "$STATE_FILE")"
   anytls_mismatch="$(jq --arg sni "$ANYTLS_SNI" '[.users[] | . as $user |
     (if (.endpoints | type) == "array" then .endpoints[] else {protocol:(.protocol // "ss2022"),tls_sni:.tls_sni} end) |
     select(.protocol == "anytls" and .tls_sni != $sni)] | length' "$STATE_FILE")"
-  printf '\nSS2022 + ShadowTLS 默认连接域名：%s\n' "$SS2022_SHADOWTLS_SNI"
-  printf '  用户数：%s，仍在使用其他域名：%s\n' "$ss_total" "$ss_mismatch"
+  printf '\n旧版 SS2022 + ShadowTLS 默认连接域名：%s\n' "$SS2022_SHADOWTLS_SNI"
+  printf '  旧版用户数：%s，仍在使用其他域名：%s\n' "$ss_total" "$ss_mismatch"
   printf 'AnyTLS 默认连接域名：%s\n' "$ANYTLS_SNI"
   printf '  用户数：%s，仍在使用其他域名：%s\n' "$anytls_total" "$anytls_mismatch"
 }
@@ -27,8 +29,9 @@ prompt_global_sni_change() {
   else current="$ANYTLS_SNI"
   fi
   total="$(jq --arg protocol "$protocol" '[.users[] | select(
-    if (.endpoints | type) == "array" then any(.endpoints[]; .protocol == $protocol)
-    else (.protocol // "ss2022") == $protocol end)] | length' "$STATE_FILE")"
+    if (.endpoints | type) == "array" then
+      any(.endpoints[]; .protocol == $protocol and ($protocol != "ss2022" or .transport == "shadowtls"))
+    else (.protocol // "ss2022") == $protocol and ($protocol != "ss2022" or (.transport // "shadowtls") == "shadowtls") end)] | length' "$STATE_FILE")"
   printf '\n%s 当前默认连接域名（SNI）：%s\n' "$label" "$current"
   while true; do
     read -r -p '请输入新的连接域名（留空取消）：' new_sni
@@ -54,13 +57,13 @@ global_sni_menu() {
     ui_section '查看与修改'
     ui_menu_items \
       show '查看当前默认域名' \
-      ss2022 '修改 SS2022 + ShadowTLS 默认域名' \
+      ss2022 '修改旧版 ShadowTLS 默认域名' \
       anytls '修改 AnyTLS 默认域名'
     ui_back_item '返回上一级'
     ui_menu_select || return 0
     case "$UI_MENU_ACTION" in
       show) show_global_sni_settings; pause_menu;;
-      ss2022) prompt_global_sni_change ss2022 'SS2022 + ShadowTLS'; pause_menu;;
+      ss2022) prompt_global_sni_change ss2022 '旧版 SS2022 + ShadowTLS'; pause_menu;;
       anytls) prompt_global_sni_change anytls AnyTLS; pause_menu;;
       back) return 0;;
     esac

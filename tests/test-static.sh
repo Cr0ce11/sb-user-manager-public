@@ -223,10 +223,13 @@ grep -Fq 'if ! harden_existing_environment_backups; then' sb-user-manager.sh
 grep -Fq 'migrate_legacy_ss2022_udp_inbounds()' sb-user-manager.sh
 grep -Fq 'if ! migrate_legacy_ss2022_udp_inbounds; then' sb-user-manager.sh
 grep -Fq 'run_managed_step rebuild_all_split_configs' sb-user-manager.sh
+grep -Fq 'make_ss2022_inbound()' sb-user-manager.sh
+grep -Fq 'transport:"direct"' sb-user-manager.sh
 grep -Fq '"tag": ("ss-udp-" + $name)' sb-user-manager.sh
 grep -Fq 'shadow-tls-version=3, udp-relay=true' sb-user-manager.sh
 grep -Fq 'shadowrocket_anytls_url()' sb-user-manager.sh
 grep -Fq 'shadowrocket_ss2022_url()' sb-user-manager.sh
+grep -Fq 'shadowrocket_ss2022_direct_url()' sb-user-manager.sh
 grep -Fq 'qrencode -t ANSIUTF8 -l L -m 1 -- "$1"' sb-user-manager.sh
 grep -Fq 'apt-get install -y ca-certificates curl jq nftables iproute2 util-linux bsdextrautils tar openssl python3 qrencode' sb-user-manager.sh
 if grep -Fq "printf '%s=ss,%s,%s,encrypt-method=%s" sb-user-manager.sh || grep -Fq '%s=anytls,%s,%s,password=%s' sb-user-manager.sh; then
@@ -375,7 +378,10 @@ grep -Fq '生成故障诊断报告（只读）' sb-user-manager.sh
 grep -Fq '/root/sb-user-manager-diagnostics' sb-user-manager.sh
 grep -Fq 'DEFAULT_SS2022_SHADOWTLS_SNI="publicassets.cdn-apple.com"' sb-user-manager.sh
 grep -Fq 'DEFAULT_ANYTLS_SNI="weKbP9SVYU.download.windowsupdate.com"' sb-user-manager.sh
-grep -Fq 'ShadowTLS SNI（留空使用全局默认 ${SS2022_SHADOWTLS_SNI}；输入 0 返回协议选择）' sb-user-manager.sh
+if grep -Fq 'ShadowTLS SNI（留空使用全局默认 ${SS2022_SHADOWTLS_SNI}；输入 0 返回协议选择）' sb-user-manager.sh; then
+  echo 'new SS2022 users must not be prompted for a ShadowTLS SNI' >&2
+  exit 1
+fi
 grep -Fq 'AnyTLS SNI（留空使用全局默认 ${ANYTLS_SNI}；输入 0 返回协议选择）' sb-user-manager.sh
 grep -Fq '请选择使用方式 [1]：' sb-user-manager.sh
 grep -Fq 'prompt_managed "$protocol" "$method" "$protocol_sni"' sb-user-manager.sh

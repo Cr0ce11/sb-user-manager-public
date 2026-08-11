@@ -260,9 +260,10 @@ validate_upstream_candidate() {
 }
 
 apply_split_config() {
-  local name="$1" url="$2" scope="$3" user="$4" upstream="$5" out_tag="$6" tag="$7" transport_tag="${8:-}" format outbounds
+  local name="$1" url="$2" scope="$3" user="$4" upstream="$5" out_tag="$6" tag="$7" transport_tag="${8:-}" format outbounds inbounds='[]'
   outbounds="$(build_split_outbounds "$name" "$upstream" "$out_tag" "$transport_tag")"
   format="$(split_rule_format "$url")" || die "远程规则集地址必须指向 .srs 或 .json 文件"
+  if [[ "$scope" == user ]]; then inbounds="$(split_user_inbound_tags "$user")" || return 1; fi
   SB_JQ_NEW_OUTBOUNDS="$outbounds" rewrite_singbox_config '
     ($ENV.SB_JQ_NEW_OUTBOUNDS | fromjson) as $new_outbounds |
     .route.rules = [(.route.rules // [])[] | select((.rule_set // "") != $tag)] |
@@ -271,9 +272,9 @@ apply_split_config() {
     .route.rule_set += [{type:"remote",tag:$tag,format:$format,url:$url,download_detour:"direct",update_interval:"24h"}] |
     .route.rules += [
       ({rule_set:$tag,action:"route",outbound:$out_tag} +
-       (if $scope == "user" then {inbound:[("st-"+$user),("ss-"+$user),("ss-udp-"+$user),("anytls-"+$user)]} else {} end))
+       (if $scope == "user" then {inbound:$inbounds} else {} end))
     ]
-  ' --arg tag "$tag" --arg out_tag "$out_tag" --arg url "$url" --arg format "$format" --arg scope "$scope" --arg user "$user"
+  ' --arg tag "$tag" --arg out_tag "$out_tag" --arg url "$url" --arg format "$format" --arg scope "$scope" --argjson inbounds "$inbounds"
 }
 
 collect_managed_split_tags() {
@@ -355,9 +356,11 @@ split_user_inbound_tags() {
     first(.users[]? | select(.name == $name)) as $user |
     if $user == null then []
     else [
-      (if ($user.endpoints | type) == "array" then $user.endpoints[] else {protocol:($user.protocol // "ss2022")} end) |
+      (if ($user.endpoints | type) == "array" then $user.endpoints[]
+       else {protocol:($user.protocol // "ss2022"),transport:($user.transport // "shadowtls")} end) |
       if .protocol == "anytls" then "anytls-" + $name
-      else "st-" + $name, "ss-" + $name, "ss-udp-" + $name end
+      elif .transport == "shadowtls" then "st-" + $name, "ss-" + $name, "ss-udp-" + $name
+      else "ss-" + $name end
     ] | unique end
   ' "$STATE_FILE"
 }

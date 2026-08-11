@@ -207,6 +207,16 @@ restore_state_backup_atomically() {
 validate_state_user_endpoints() {
   local file="${1:-$STATE_FILE}"
   jq -e '
+    def valid_ss2022_endpoint:
+      (.transport == "direct" or .transport == "shadowtls") and
+      (.method == "2022-blake3-aes-128-gcm" or .method == "2022-blake3-aes-256-gcm") and
+      (.ss2022_password | type == "string" and length > 0) and
+      (if .transport == "shadowtls" then
+         (.shadowtls_password | type == "string" and length > 0) and
+         (.shadowtls_sni | type == "string" and length > 0)
+       else
+         (has("shadowtls_password") | not) and (has("shadowtls_sni") | not)
+       end);
     (.users | type == "array") and
     ([.users[].endpoints[].port] | length == (unique | length)) and
     all(.users[];
@@ -219,19 +229,21 @@ validate_state_user_endpoints() {
       all(.endpoints[];
         (.port | type == "number" and . == floor and . >= 1 and . <= 65535) and
         if .protocol == "ss2022" then
-          (.method == "2022-blake3-aes-128-gcm" or .method == "2022-blake3-aes-256-gcm") and
-          (.shadowtls_password | type == "string" and length > 0) and
-          (.ss2022_password | type == "string" and length > 0) and
-          (.shadowtls_sni | type == "string" and length > 0)
+          valid_ss2022_endpoint
         elif .protocol == "anytls" then
           (.anytls_password | type == "string" and length > 0) and
           (.tls_sni | type == "string" and length > 0)
         else false end) and
       if .protocol == "ss2022" then
+        (.transport == .endpoints[0].transport) and
         (.method == .endpoints[0].method) and
-        (.shadowtls_password == .endpoints[0].shadowtls_password) and
         (.ss2022_password == .endpoints[0].ss2022_password) and
-        (.shadowtls_sni == .endpoints[0].shadowtls_sni)
+        (if .transport == "shadowtls" then
+           (.shadowtls_password == .endpoints[0].shadowtls_password) and
+           (.shadowtls_sni == .endpoints[0].shadowtls_sni)
+         else
+           (has("shadowtls_password") | not) and (has("shadowtls_sni") | not)
+         end)
       elif .protocol == "anytls" then
         (.anytls_password == .endpoints[0].anytls_password) and
         (.tls_sni == .endpoints[0].tls_sni)
@@ -343,6 +355,21 @@ migrate_state() {
     fi
     schema=5
   fi
+  if ((schema == 5)); then
+    if ! atomic_state_update '
+      .users |= map(
+        .endpoints |= map(
+          if .protocol == "ss2022" then .transport = "shadowtls" else . end
+        ) |
+        if .protocol == "ss2022" then .transport = "shadowtls" else . end
+      ) |
+      .schema_version = 6
+    '; then
+      restore_state_backup_atomically "$backup" || die "SS2022 传输模式升级失败，且无法自动恢复原数据；备份：$backup"
+      die "SS2022 传输模式升级失败，原数据已自动恢复；备份：$backup"
+    fi
+    schema=6
+  fi
   if ((schema == STATE_SCHEMA_VERSION)) && [[ "$needs_usage_offset" == true && "$original_schema" == "$STATE_SCHEMA_VERSION" ]]; then
     if ! atomic_state_update '
       .users |= map(if has("usage_offset_bytes") then . else .usage_offset_bytes = 0 end)
@@ -356,6 +383,16 @@ migrate_state() {
     die "当前脚本无法升级这份旧用户数据，请先安装兼容版本（数据版本 ${schema}）"
   }
   jq -e --argjson schema "$STATE_SCHEMA_VERSION" '
+    def valid_ss2022_endpoint:
+      (.transport == "direct" or .transport == "shadowtls") and
+      (.method == "2022-blake3-aes-128-gcm" or .method == "2022-blake3-aes-256-gcm") and
+      (.ss2022_password | type == "string" and length > 0) and
+      (if .transport == "shadowtls" then
+         (.shadowtls_password | type == "string" and length > 0) and
+         (.shadowtls_sni | type == "string" and length > 0)
+       else
+         (has("shadowtls_password") | not) and (has("shadowtls_sni") | not)
+       end);
     .schema_version == $schema and (.users | type == "array") and (.splits | type == "array") and
     (.outbound_presets | type == "array") and (.rule_presets | type == "array") and
     ([.users[].endpoints[].port] | length == (unique | length)) and
@@ -369,19 +406,21 @@ migrate_state() {
       all(.endpoints[];
         (.port | type == "number" and . == floor and . >= 1 and . <= 65535) and
         if .protocol == "ss2022" then
-          (.method == "2022-blake3-aes-128-gcm" or .method == "2022-blake3-aes-256-gcm") and
-          (.shadowtls_password | type == "string" and length > 0) and
-          (.ss2022_password | type == "string" and length > 0) and
-          (.shadowtls_sni | type == "string" and length > 0)
+          valid_ss2022_endpoint
         elif .protocol == "anytls" then
           (.anytls_password | type == "string" and length > 0) and
           (.tls_sni | type == "string" and length > 0)
         else false end) and
       if .protocol == "ss2022" then
+        (.transport == .endpoints[0].transport) and
         (.method == .endpoints[0].method) and
-        (.shadowtls_password == .endpoints[0].shadowtls_password) and
         (.ss2022_password == .endpoints[0].ss2022_password) and
-        (.shadowtls_sni == .endpoints[0].shadowtls_sni)
+        (if .transport == "shadowtls" then
+           (.shadowtls_password == .endpoints[0].shadowtls_password) and
+           (.shadowtls_sni == .endpoints[0].shadowtls_sni)
+         else
+           (has("shadowtls_password") | not) and (has("shadowtls_sni") | not)
+         end)
       elif .protocol == "anytls" then
         (.anytls_password == .endpoints[0].anytls_password) and
         (.tls_sni == .endpoints[0].tls_sni)
