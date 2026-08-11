@@ -189,6 +189,60 @@ EOF
 grep -Fq '添加原生 SS2022' "$work/state-three-protocol-menu.txt"
 ! grep -Fq '添加 SS2022 + ShadowTLS' "$work/state-three-protocol-menu.txt"
 
+# 不计量用户的 metered=false 是合法状态；添加共享入口时不能把 jq -e 对 false 的
+# 返回码误判成读取失败，也不能在事务开始前静默退出。
+(
+  STATE_FILE="$work/unmetered-endpoint-add.json"
+  events="$work/unmetered-endpoint-add-events"
+  PORT_MIN=20001
+  PORT_MAX=30000
+  HANDSHAKE_PORT=443
+  SHADOWTLS_STRICT_MODE=true
+  cat > "$STATE_FILE" <<'EOF'
+{"schema_version":7,"users":[{"name":"crocell","port":21132,"protocol":"ss2022","transport":"shadowtls","shadowtls_password":"legacy-st","ss2022_password":"legacy-ss","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"legacy.example.com","metered":false,"expires_at":null,"limit_gib":null,"billing_anchor":null,"usage_offset_bytes":0,"status":"active","created_at":"2026-08-11T00:00:00+08:00","endpoints":[{"protocol":"ss2022","transport":"shadowtls","port":21132,"shadowtls_password":"legacy-st","ss2022_password":"legacy-ss","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"legacy.example.com"}]}],"splits":[],"outbound_presets":[],"rule_presets":[]}
+EOF
+  check_new_endpoint_conflicts() { :; }
+  nfuse() {
+    if [[ "${1:-}" == list ]]; then
+      printf '%s\n' '[{"name":"crocell","tier":"c","limit_gib":0,"used_bytes":0,"ports":[{"id":1,"start":21132,"end":21132}]}]'
+    else
+      printf 'unexpected direct nfuse call: %s\n' "$*" >&2
+      return 91
+    fi
+  }
+  generate_ss_password() { printf 'new-direct-secret\n'; }
+  ensure_safe_ssh_for_singbox_restart() { return 0; }
+  start_managed_operation() { printf 'start:%s\n' "$1" >> "$events"; }
+  run_managed_step() { printf 'step:%s\n' "$*" >> "$events"; }
+  rebuild_user_splits_if_needed() { return 0; }
+  finish_managed_operation() { printf 'finish\n' >> "$events"; }
+  cmd_export() { printf 'export:%s\n' "$1" >> "$events"; }
+
+  cmd_add_user_endpoint crocell ss2022-direct 27353 2022-blake3-aes-128-gcm '' >/dev/null
+  grep -Fxq 'start:add-user-endpoint:crocell:ss2022-direct' "$events"
+  grep -Fxq 'step:nfuse port add crocell 27353' "$events"
+  grep -Fxq finish "$events"
+  grep -Fxq export:crocell "$events"
+)
+
+# 损坏的非布尔计费字段仍须在事务开始前明确拒绝。
+(
+  STATE_FILE="$work/invalid-metered-endpoint-add.json"
+  transaction_marker="$work/invalid-metered-endpoint-add-transaction"
+  printf '%s\n' '{"schema_version":7,"users":[{"name":"broken","port":21133,"protocol":"ss2022","transport":"shadowtls","shadowtls_password":"legacy-st","ss2022_password":"legacy-ss","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"legacy.example.com","metered":"false","status":"disabled","endpoints":[{"protocol":"ss2022","transport":"shadowtls","port":21133,"shadowtls_password":"legacy-st","ss2022_password":"legacy-ss","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"legacy.example.com"}]}],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
+  PORT_MIN=20001
+  PORT_MAX=30000
+  check_new_endpoint_conflicts() { :; }
+  start_managed_operation() { printf 'unexpected\n' > "$transaction_marker"; }
+  if cmd_add_user_endpoint broken ss2022-direct 27354 2022-blake3-aes-128-gcm '' \
+      >"$work/invalid-metered-endpoint-add.out" 2>"$work/invalid-metered-endpoint-add.err"; then
+    echo 'endpoint add accepted a non-boolean metered field' >&2
+    exit 1
+  fi
+  grep -Fq '流量计费状态无效' "$work/invalid-metered-endpoint-add.err"
+  [[ ! -e "$transaction_marker" ]]
+)
+
 multi_add_body="$(declare -f cmd_add_multi)"
 multi_state_line="$(grep -n 'run_managed_step state_add_multi_user' <<<"$multi_add_body" | cut -d: -f1)"
 multi_register_line="$(grep -n 'register_new_user_nfuse_ports' <<<"$multi_add_body" | cut -d: -f1)"
