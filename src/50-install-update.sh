@@ -975,7 +975,7 @@ sync_manager_handoff_root_copy() {
 
 take_over_installed_manager() {
   local installed candidate candidate_source versions backup_script backup_versions
-  local target_version target_edition target_schema target_min_schema target_sha256
+  local target_version target_edition target_schema target_min_schema
   local current_version current_edition current_schema current_sha256
   [[ $# -eq 0 ]] || { echo '错误：管理脚本接管命令不接受额外参数。' >&2; return 64; }
   candidate="$SELF_PATH"
