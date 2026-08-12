@@ -2,11 +2,11 @@
 
 ## 状态
 
-已批准执行。受保护公开仓库已由干净快照建立并通过公开 PR 与 `main` CI；项目所有者随后决定长期保留原私有仓库及双版本发布，两个仓库不再改名。
+已执行。受保护公开仓库已由干净快照建立，v4.23.1 完成首个公开 Release，当前公开正式版为 v4.25.2；项目所有者决定长期保留原私有仓库及双版本发布，两个仓库不再改名。私有双版本的下一次同步等待 [Issue #255](https://github.com/DTB201/sb-user-manager/issues/255) 的外部条件恢复。
 
 ## 背景
 
-当前仓库是 GitHub Free 个人账户下的私有仓库。私有仓库的标准托管 Actions 每月只有固定免费分钟数，额度耗尽后，合并到 `main` 的任务会在启动前被 GitHub 阻止。审计与迁移门禁由 [Issue #250](https://github.com/DTB201/sb-user-manager/issues/250) 记录；MIT 许可的单一公开源码快照由 [Issue #252](https://github.com/DTB201/sb-user-manager/issues/252) 记录。
+作出本决定时，原仓库是 GitHub Free 个人账户下的私有仓库。私有仓库的标准托管 Actions 每月只有固定免费分钟数，额度耗尽后，合并到 `main` 的任务会在启动前被 GitHub 阻止。审计与迁移门禁由 [Issue #250](https://github.com/DTB201/sb-user-manager/issues/250) 记录；MIT 许可的单一公开源码快照由 [Issue #252](https://github.com/DTB201/sb-user-manager/issues/252) 记录。
 
 项目已经维护“私有版”和“分享版”：私有版通过只读 GitHub Token 访问管理仓库，分享版剥离管理脚本更新路径。当前仓库还保存 v5 休眠代码、设计文档、历史 Issue、Pull Request 和 Actions 日志。直接把现有仓库改为公开，会一次性公开全部可达历史与协作记录，并允许任何人永久保留 Fork 或副本。
 
