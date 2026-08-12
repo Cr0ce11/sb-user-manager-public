@@ -21,8 +21,10 @@
 | PROD-001 | — | 完成 | [Issue #96](https://github.com/DTB201/sb-user-manager/issues/96) | 首次正式环境上线 | v4.18.1 完成固定 Release 部署、真实客户端验收、30 分钟与 24 小时观察，最终 `release` 验收失败项为 0 |
 | QA-004 | — | 完成 | [Issue #94](https://github.com/DTB201/sb-user-manager/issues/94) | 评估阶段 1 退出条件 | 适用验收和失败恢复证据齐全，没有未解决 P0/P1；项目进入阶段 2 准备状态但未获部署授权 |
 | SUP-001 | P2 | 完成 | [Issue #126](https://github.com/DTB201/sb-user-manager/issues/126)、[PR #127](https://github.com/DTB201/sb-user-manager/pull/127) | 启用不可变 Release 并禁止覆盖同版本附件 | 草稿上传、四附件摘要校验、失败清理和正式发布顺序受自动检查保护；仓库设置已读回确认为启用，下一正式版继续执行端到端发布验收 |
-| GOV-002 | P1 | 进行中 | [Issue #250](https://github.com/DTB201/sb-user-manager/issues/250) | 建立受保护公开仓库的审计与迁移门禁 | 当前历史没有未解释的秘密命中；公开树能自动拒绝私有更新路径、缺失许可证和不安全 Actions；迁移与回退步骤形成正式记录，但不在本事项中改变仓库可见性 |
-| GOV-003 | P1 | 进行中 | [Issue #252](https://github.com/DTB201/sb-user-manager/issues/252) | 生成单一公开版源码快照并验证匿名更新 | 采用 MIT License；源码、生成物、CI、Release 和验收收敛为唯一公开脚本；旧 Token 仅兼容解析后丢弃；干净快照可确定性导出且完整门禁通过，不在本事项中创建或发布公开仓库 |
+| GOV-002 | P1 | 完成 | [Issue #250](https://github.com/DTB201/sb-user-manager/issues/250) | 建立受保护公开仓库的审计与迁移门禁 | 历史审计、公开树策略、许可证、Actions 安全、迁移与回退记录均已建立；受保护公开仓库已由干净快照创建并通过公开 CI |
+| GOV-003 | P1 | 完成 | [Issue #252](https://github.com/DTB201/sb-user-manager/issues/252) | 生成单一公开版源码快照并验证匿名更新 | v4.23.1 已完成首个公开快照和匿名 Release，旧 Token 只兼容解析后丢弃；后续公开版本已按同一模型发布到 v4.25.2 |
+| GOV-004 | P1 | 进行中 | [Issue #264](https://github.com/DTB201/sb-user-manager/issues/264) | 对齐公开 v4.25.2 项目状态与双仓库治理记录 | 长期状态文档反映实际公开版本、迁移完成状态、v5 暂停和私有同步边界；本地门禁与公开 CI 通过，不改变运行代码或服务器 |
+| GOV-005 | P1 | 阻塞 | [Issue #255](https://github.com/DTB201/sb-user-manager/issues/255) | 恢复私有仓库双版本同步 | 等待私有 Actions 额度和专用只读不可变 Release 凭据恢复；恢复后同步届时最新公开版本并重新通过私有双版本门禁，不按过期的 v4.23.5 候选继续发布 |
 | MAINT-001 | — | 完成 | [Issue #110](https://github.com/DTB201/sb-user-manager/issues/110)、[PR #111](https://github.com/DTB201/sb-user-manager/pull/111) | 机械模块化源码并确定性生成单脚本 | 模块源码、固定清单、确定性构建和 CI 校验通过；生成的 v4.20.1 与改造前逐字节相同，Debian 实机只读验收通过 |
 | MAINT-002 | P2 | 完成 | [Issue #113](https://github.com/DTB201/sb-user-manager/issues/113)、[PR #114](https://github.com/DTB201/sb-user-manager/pull/114) | 合并两种协议新增用户的共用执行流程 | 菜单、文案、事务顺序和服务器行为不变；计量与自用 Nfuse 登记共用实现并有确定性测试，本地与 CI 门禁通过 |
 | MAINT-003 | P2 | 完成 | [Issue #115](https://github.com/DTB201/sb-user-manager/issues/115)、[PR #116](https://github.com/DTB201/sb-user-manager/pull/116) | 统一两种协议新增用户的前置冲突检查 | 两种协议共用用户名、端口、标签、证书和 Nfuse 冲突检查；原检查顺序、错误提示和服务器行为不变，本地、CI 与 Debian 实机验收通过 |
@@ -47,7 +49,8 @@
 
 ## 当前最值得继续的顺序
 
-1. 完成 [Issue #250](https://github.com/DTB201/sb-user-manager/issues/250) 与 [Issue #252](https://github.com/DTB201/sb-user-manager/issues/252) 的审计门禁和单一公开源码快照；正式创建公开仓库、改名和发布仍需另行授权。
-2. v5 开发继续暂停；[Issue #88](https://github.com/DTB201/sb-user-manager/issues/88) 和 SEC-001 维持现有状态，不因公开化准备而自动启动。
+1. 完成 [Issue #264](https://github.com/DTB201/sb-user-manager/issues/264) 的长期状态收敛；不改变运行代码，不登录或修改服务器。
+2. 继续以真实使用中发现的 v4 缺陷驱动维护；当前公开仓库没有已知未解决的 P0/P1 运行缺陷。
+3. 私有 Actions 额度和发布凭据恢复后执行 [Issue #255](https://github.com/DTB201/sb-user-manager/issues/255)，同步届时最新公开版本；v5 继续暂停，[Issue #88](https://github.com/DTB201/sb-user-manager/issues/88) 和 SEC-001 维持现有状态。
 
 任何需要登录服务器、修改 SSH、恢复数据或操作正式环境的事项必须独立执行，先记录回滚方式并取得明确授权。
