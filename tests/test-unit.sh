@@ -4321,6 +4321,126 @@ printf '%s\n' 'a cat a-b (a) a_ a, a' > "$diagnostic_root/short-user-raw.txt"
   redact_diagnostic_file "$diagnostic_root/short-user-raw.txt" "$diagnostic_root/short-user-redacted.txt"
   grep -Fxq '[用户1] cat a-b ([用户1]) a_ [用户1], [用户1]' "$diagnostic_root/short-user-redacted.txt"
 )
+
+# 批量脱敏必须与旧实现逐字节一致，并覆盖短用户名、字面元字符、子串、秘密和网络地址。
+cat > "$diagnostic_root/batch-redaction-state.json" <<'EOF'
+{
+  "schema_version":7,
+  "users":[
+    {"name":"a","ss2022_password":"pass","endpoints":[]},
+    {"name":"ab","anytls_password":"pass-long-secret","endpoints":[]},
+    {"name":"abc","tls_sni":"private.sni.example","endpoints":[]},
+    {"name":"alpha","endpoints":[]},
+    {"name":"alpha-long","endpoints":[]}
+  ],
+  "splits":[{
+    "name":"route[1]*?","url":"https://private.example/rules?a=1",
+    "upstream":{"server":"203.0.113.20","password":"upstream-secret","sni":"upstream.private.example"}
+  }],
+  "outbound_presets":[],
+  "rule_presets":[]
+}
+EOF
+printf '%s' 'a cat a-b (a) a_ a, a
+ab abc alpha-long alpha route[1]*? route1
+pass-long-secret pass upstream-secret private.sni.example
+https://private.example/rules?a=1 203.0.113.20 [2001:db8::1] 2001:db8::2' \
+  > "$diagnostic_root/batch-redaction-raw.txt"
+(
+  STATE_FILE="$diagnostic_root/batch-redaction-state.json"
+  PUBLIC_SERVER_OVERRIDE=""
+  hostname() { printf '%s\n' diagnostic-host; }
+  build_diagnostic_redactions
+  redact_diagnostic_file_with_shell_tools \
+    "$diagnostic_root/batch-redaction-raw.txt" "$diagnostic_root/batch-redaction-expected.txt"
+  python_args="$diagnostic_root/batch-redaction-python.args"
+  python_calls="$diagnostic_root/batch-redaction-python.calls"
+  : > "$python_args"
+  : > "$python_calls"
+  python3() {
+    printf 'call\n' >> "$python_calls"
+    printf '%s\0' "$@" >> "$python_args"
+    command python3 "$@"
+  }
+  redact_diagnostic_file \
+    "$diagnostic_root/batch-redaction-raw.txt" "$diagnostic_root/batch-redaction-actual.txt"
+  [[ "$(wc -l < "$python_calls" | tr -d ' ')" == 1 ]]
+  cmp -s "$diagnostic_root/batch-redaction-expected.txt" "$diagnostic_root/batch-redaction-actual.txt"
+  [[ "$(grep -Fo '[用户1]' "$diagnostic_root/batch-redaction-actual.txt" | wc -l | tr -d ' ')" == 4 ]]
+  grep -Fq 'a-b' "$diagnostic_root/batch-redaction-actual.txt"
+  grep -Fq 'a_' "$diagnostic_root/batch-redaction-actual.txt"
+  grep -Fq '[分流1]' "$diagnostic_root/batch-redaction-actual.txt"
+  grep -Fq '[用户5] [用户4]' "$diagnostic_root/batch-redaction-actual.txt"
+  grep -Fq '[已隐藏密码] [已隐藏密码] [已隐藏密码]' "$diagnostic_root/batch-redaction-actual.txt"
+  grep -Fq '[已隐藏地址] [已隐藏服务器] [已隐藏IP] [已隐藏IP]' "$diagnostic_root/batch-redaction-actual.txt"
+  ! grep -Eq 'pass-long-secret|upstream-secret|private\.sni\.example|203\.0\.113\.20|2001:db8' \
+    "$diagnostic_root/batch-redaction-actual.txt"
+  ! tr '\0' '\n' < "$python_args" | grep -Eq \
+    'pass-long-secret|upstream-secret|private\.sni\.example|private\.example|203\.0\.113\.20|2001:db8'
+  command() {
+    if [[ "${1:-}" == -v && "${2:-}" == python3 ]]; then
+      return 1
+    fi
+    builtin command "$@"
+  }
+  redact_diagnostic_file \
+    "$diagnostic_root/batch-redaction-raw.txt" "$diagnostic_root/batch-redaction-fallback.txt"
+  cmp -s "$diagnostic_root/batch-redaction-expected.txt" "$diagnostic_root/batch-redaction-fallback.txt"
+)
+
+# 纯 C locale 下旧 Bash 边界按 ASCII 判断，Python 快速路径必须保持相同结果。
+(
+  export LC_ALL=C
+  DIAGNOSTIC_REDACT_VALUES=(a)
+  DIAGNOSTIC_REDACT_LABELS=('[用户1]')
+  DIAGNOSTIC_REDACT_TOKEN_ONLY=(true)
+  DIAGNOSTIC_REDACT_COUNT=1
+  printf '%s' 'aé éa (a) a-é a_ a-b' > "$diagnostic_root/batch-redaction-c-locale-raw.txt"
+  redact_diagnostic_file_with_shell_tools \
+    "$diagnostic_root/batch-redaction-c-locale-raw.txt" \
+    "$diagnostic_root/batch-redaction-c-locale-expected.txt"
+  redact_diagnostic_file \
+    "$diagnostic_root/batch-redaction-c-locale-raw.txt" \
+    "$diagnostic_root/batch-redaction-c-locale-actual.txt"
+  cmp -s "$diagnostic_root/batch-redaction-c-locale-expected.txt" \
+    "$diagnostic_root/batch-redaction-c-locale-actual.txt"
+)
+
+# 100 个短用户名和 20 行报告仍只启动一次 Python。
+(
+  DIAGNOSTIC_REDACT_VALUES=()
+  DIAGNOSTIC_REDACT_LABELS=()
+  DIAGNOSTIC_REDACT_TOKEN_ONLY=()
+  DIAGNOSTIC_REDACT_COUNT=0
+  scale_alphabet=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+  scale_line=""
+  for ((i=0; i<100; i++)); do
+    if ((i < 62)); then scale_name="${scale_alphabet:i:1}"
+    else scale_name="u$((i - 62))"; fi
+    add_diagnostic_redaction "$scale_name" "[用户$((i + 1))]" true
+    scale_line+="($scale_name),"
+  done
+  sort_diagnostic_redactions
+  for ((i=0; i<20; i++)); do printf '%s\n' "$scale_line"; done \
+    > "$diagnostic_root/batch-redaction-scale-raw.txt"
+  scale_python_calls="$diagnostic_root/batch-redaction-scale-python.calls"
+  : > "$scale_python_calls"
+  python3() {
+    printf 'call\n' >> "$scale_python_calls"
+    command python3 "$@"
+  }
+  redact_diagnostic_file "$diagnostic_root/batch-redaction-scale-raw.txt" \
+    "$diagnostic_root/batch-redaction-scale-output.txt"
+  [[ "$(wc -l < "$scale_python_calls" | tr -d ' ')" == 1 ]]
+  [[ "$(wc -l < "$diagnostic_root/batch-redaction-scale-output.txt" | tr -d ' ')" == 20 ]]
+)
+
+# 输入读取失败必须传播，不能留下看似可交付的成功结果。
+if redact_diagnostic_file "$diagnostic_root/missing-redaction-source.txt" \
+  "$diagnostic_root/batch-redaction-missing-output.txt" 2>/dev/null; then
+  echo 'missing diagnostic input must fail batch redaction' >&2
+  exit 1
+fi
 cat > "$diagnostic_bin/sing-box" <<'EOF'
 #!/usr/bin/env bash
 case "$1" in

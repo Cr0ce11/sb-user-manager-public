@@ -10087,7 +10087,7 @@ redact_diagnostic_token_in_line() {
   printf '%s' "$result$line"
 }
 
-redact_diagnostic_file() {
+redact_diagnostic_file_with_shell_tools() {
   local source="$1" target="$2" line i pattern replacement
   {
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -10107,6 +10107,86 @@ redact_diagnostic_file() {
       printf '%s\n' "$line"
     done < "$source"
   } | redact_diagnostic_networks > "$target"
+}
+
+write_diagnostic_redactions_nul() {
+  local i
+  for ((i=0; i<DIAGNOSTIC_REDACT_COUNT; i++)); do
+    printf '%s\0%s\0%s\0' \
+      "${DIAGNOSTIC_REDACT_VALUES[$i]}" \
+      "${DIAGNOSTIC_REDACT_LABELS[$i]}" \
+      "${DIAGNOSTIC_REDACT_TOKEN_ONLY[$i]:-false}"
+  done
+}
+
+redact_diagnostic_file() {
+  local source="$1" target="$2"
+  if ! command -v python3 >/dev/null 2>&1; then
+    redact_diagnostic_file_with_shell_tools "$source" "$target"
+    return
+  fi
+  write_diagnostic_redactions_nul | python3 -c '
+import locale
+import sys
+
+
+ctype_codeset = locale.nl_langinfo(locale.CODESET).upper()
+ascii_ctype = ctype_codeset in ("ANSI_X3.4-1968", "US-ASCII", "ASCII")
+
+
+def is_token_character(character):
+    if character in "_-":
+        return True
+    if ascii_ctype:
+        return character.isascii() and character.isalnum()
+    return character.isalnum()
+
+
+def replace_token_only(line, token, replacement):
+    result = []
+    start = 0
+    while True:
+        index = line.find(token, start)
+        if index < 0:
+            result.append(line[start:])
+            return "".join(result)
+        left_safe = index == 0 or not is_token_character(line[index - 1])
+        right_index = index + len(token)
+        right_safe = right_index == len(line) or not is_token_character(line[right_index])
+        if left_safe and right_safe:
+            result.append(line[start:index])
+            result.append(replacement)
+            start = right_index
+        else:
+            result.append(line[start:index + 1])
+            start = index + 1
+
+
+fields = sys.stdin.buffer.read().split(b"\0")
+if fields and fields[-1] == b"":
+    fields.pop()
+if len(fields) % 3:
+    raise SystemExit("invalid diagnostic redaction table")
+rules = []
+for index in range(0, len(fields), 3):
+    value, replacement, token_only = (
+        field.decode("utf-8") for field in fields[index:index + 3]
+    )
+    rules.append((value, replacement, token_only == "true"))
+
+with open(sys.argv[1], "r", encoding="utf-8", errors="surrogateescape", newline="") as source_file:
+    source = source_file.read()
+lines = [] if source == "" else source.split("\n")
+if source.endswith("\n"):
+    lines.pop()
+for line in lines:
+    for value, replacement, token_only in rules:
+        if token_only:
+            line = replace_token_only(line, value, replacement)
+        else:
+            line = line.replace(value, replacement)
+    sys.stdout.buffer.write((line + "\n").encode("utf-8", errors="surrogateescape"))
+' "$source" | redact_diagnostic_networks > "$target"
 }
 
 redact_diagnostic_networks() {
