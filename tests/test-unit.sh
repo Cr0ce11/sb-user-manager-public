@@ -5182,6 +5182,51 @@ fi
   [[ "$renewal_expiry_written" == "$renewal_expiry_before_failure" ]]
   grep -Fq '有效期调整未执行' "$work/renew-date-failure.out"
 )
+
+# 一条损坏的有效期不得静默放行或阻断后续正常到期用户。
+(
+  STATE_FILE="$work/expire-invalid-state.json"
+  expire_status_calls="$work/expire-status-calls"
+  expire_transaction_calls="$work/expire-transaction-calls"
+  printf '%s\n' '{"users":[{"name":"invalid-expiry","status":"active","expires_at":"not-a-date"},{"name":"expired-user","status":"active","expires_at":"expired-date"}]}' > "$STATE_FILE"
+  : > "$expire_status_calls"
+  : > "$expire_transaction_calls"
+  date() {
+    if [[ "$*" == '+%s' ]]; then
+      printf '2000\n'
+    elif [[ "${1:-}" == -d && "${2:-}" == expired-date && "${3:-}" == +%s ]]; then
+      printf '1000\n'
+    else
+      return 1
+    fi
+  }
+  log() { printf '%s\n' "$*"; }
+  ensure_safe_ssh_for_singbox_restart() { :; }
+  start_managed_operation() { printf '%s\n' "$1" >> "$expire_transaction_calls"; }
+  run_managed_step() { "$@"; }
+  nfuse_account_exists() { return 1; }
+  remove_user_inbounds() { :; }
+  rebuild_user_splits_if_needed() { :; }
+  check_singbox_and_restart() { :; }
+  finish_managed_operation() { :; }
+  state_set_status() {
+    printf '%s:%s\n' "$1" "$2" >> "$expire_status_calls"
+    atomic_state_update '(.users[] | select(.name == $name) | .status) = $status' \
+      --arg name "$1" --arg status "$2"
+  }
+
+  if ! cmd_expire > "$work/expire-invalid-output" 2>&1; then
+    echo 'an invalid expiry must not abort later expiry processing' >&2
+    exit 1
+  fi
+  grep -Fq '用户 invalid-expiry 的有效期格式无效，已跳过本次自动到期处理：not-a-date' "$work/expire-invalid-output"
+  ! grep -Fq 'syntax error' "$work/expire-invalid-output"
+  grep -Fxq 'expired-user:disabled' "$expire_status_calls"
+  [[ "$(wc -l < "$expire_status_calls" | tr -d ' ')" == 1 ]]
+  grep -Fxq 'expire-user:expired-user' "$expire_transaction_calls"
+  [[ "$(jq -r '.users[] | select(.name == "invalid-expiry") | .status' "$STATE_FILE")" == active ]]
+  [[ "$(jq -r '.users[] | select(.name == "expired-user") | .status' "$STATE_FILE")" == disabled ]]
+)
 (
   STATE_FILE="$work/unsafe-enable-state.json"
   printf '%s\n' '{"users":[{"name":"unsafe-user","port":22001,"status":"disabled","metered":false,"protocol":"anytls","anytls_password":"secret","tls_sni":"example.com"}],"splits":[]}' > "$STATE_FILE"
@@ -5318,6 +5363,13 @@ nfuse() {
 audit_consistency > "$work/audit-output"
 [[ "$AUDIT_ISSUES" == 0 ]]
 grep -Fq '一切正常' "$work/audit-output"
+jq '(.users[] | select(.name == "test2") | .expires_at) = "not-a-date"' "$STATE_FILE" > "$STATE_FILE.tmp"
+mv "$STATE_FILE.tmp" "$STATE_FILE"
+audit_consistency > "$work/audit-invalid-expiry-output"
+[[ "$AUDIT_ISSUES" == 1 && "$AUDIT_REPAIRABLE" == 0 ]]
+grep -Fq '[需要处理] 用户 test2 的有效期格式无效（not-a-date）' "$work/audit-invalid-expiry-output"
+jq '(.users[] | select(.name == "test2") | .expires_at) = null' "$STATE_FILE" > "$STATE_FILE.tmp"
+mv "$STATE_FILE.tmp" "$STATE_FILE"
 jq '(.inbounds[] | select(.tag == "ss-udp-crocell") | .network) = "tcp"' "$SINGBOX_CONFIG" > "$SINGBOX_CONFIG.tmp"
 mv "$SINGBOX_CONFIG.tmp" "$SINGBOX_CONFIG"
 audit_consistency > "$work/audit-udp-invalid-output"

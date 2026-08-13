@@ -1474,8 +1474,15 @@ cmd_list() {
   render_user_list "$(nfuse list --json)"
 }
 
+parse_expiry_epoch() {
+  local expires="$1" epoch
+  epoch="$(date -d "$expires" +%s 2>/dev/null)" || return 1
+  [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$epoch"
+}
+
 cmd_expire() {
-  local now name user expires
+  local now name user expires expires_epoch
   now="$(date +%s)"
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
@@ -1483,7 +1490,11 @@ cmd_expire() {
     expires="$(jq -r '.expires_at // empty' <<<"$user")"
     [[ -n "$expires" ]] || continue
     [[ "$(jq -r '.status' <<<"$user")" == active ]] || continue
-    if (( "$(date -d "$expires" +%s)" <= now )); then
+    if ! expires_epoch="$(parse_expiry_epoch "$expires")"; then
+      log "警告：用户 ${name} 的有效期格式无效，已跳过本次自动到期处理：${expires}"
+      continue
+    fi
+    if ((expires_epoch <= now)); then
       log "用户已到期，正在停用：$name"
       ensure_safe_ssh_for_singbox_restart || return 0
       start_managed_operation "expire-user:$name" || return 1
