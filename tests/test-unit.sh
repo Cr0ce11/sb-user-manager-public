@@ -1208,21 +1208,42 @@ grep -Fxq 'external executable' "$atomic_install_external"
   [[ "$(readlink "$shortcut")" == /usr/local/bin/another-program ]]
 
   rm -f "$shortcut"
-  startup_pause_marker="$work/shared-manager-startup-pause"
-  pause() { printf 'paused\n' > "$startup_pause_marker"; }
   ensure_manager_shortcut_for_interactive_startup
   [[ "$(readlink "$shortcut")" == /usr/local/sbin/sb-user-manager ]]
-  [[ ! -e "$startup_pause_marker" ]]
   ensure_manager_shortcut_for_interactive_startup
   [[ "$(readlink "$shortcut")" == /usr/local/sbin/sb-user-manager ]]
-  [[ ! -e "$startup_pause_marker" ]]
 
   rm -f "$shortcut"
   printf 'keep-startup-conflict\n' > "$shortcut"
-  startup_conflict_output="$(ensure_manager_shortcut_for_interactive_startup)"
+  if ! startup_conflict_output="$(ensure_manager_shortcut_for_interactive_startup <<<' ' 2>&1)"; then
+    echo 'an occupied sbm shortcut must not abort interactive startup' >&2
+    exit 1
+  fi
   grep -Fxq keep-startup-conflict "$shortcut"
   grep -Fq '脚本没有覆盖它' <<<"$startup_conflict_output"
-  grep -Fxq paused "$startup_pause_marker"
+  grep -Fq '按回车返回菜单' <<<"$startup_conflict_output"
+  if grep -Fq 'command not found' <<<"$startup_conflict_output"; then
+    echo 'an occupied sbm shortcut called an undefined command' >&2
+    exit 1
+  fi
+
+  rm -f "$shortcut"
+  if ! startup_install_failure_output="$(
+    {
+      install_manager_shortcut() { return 1; }
+      ensure_manager_shortcut_for_interactive_startup <<<' '
+    } 2>&1
+  )"; then
+    echo 'an sbm shortcut installation failure must not abort interactive startup' >&2
+    exit 1
+  fi
+  [[ ! -e "$shortcut" && ! -L "$shortcut" ]]
+  grep -Fq '未能自动创建 sbm 快捷入口' <<<"$startup_install_failure_output"
+  grep -Fq '按回车返回菜单' <<<"$startup_install_failure_output"
+  if grep -Fq 'command not found' <<<"$startup_install_failure_output"; then
+    echo 'an sbm shortcut installation failure called an undefined command' >&2
+    exit 1
+  fi
 
   LATEST_SINGBOX_VERSION=1.2.3
   LATEST_NFUSE_VERSION=4.5.6

@@ -33,6 +33,7 @@ if [[ "$decision_count" != 6 || -e docs/V5-ENTRY-CONTROLLER-POC.md ]]; then
 fi
 bash tools/build-manager.sh --check >/dev/null
 bash tests/check-managed-step-errexit.sh sb-user-manager.sh
+python3 tests/check-shell-call-targets.py sb-user-manager.sh
 if grep -REn --include='*.sh' \
   "<<-?[[:space:]]*['\"]?[A-Za-z_][A-Za-z0-9_]*['\"]?[[:space:]]*\\|\\|[[:space:]]*$" \
   src tests tools; then
@@ -42,7 +43,9 @@ fi
 
 managed_step_fixture="$(mktemp "${TMPDIR:-/tmp}/sb-managed-step-negative.XXXXXX")"
 managed_step_output="$(mktemp "${TMPDIR:-/tmp}/sb-managed-step-output.XXXXXX")"
-trap 'rm -f -- "$managed_step_fixture" "$managed_step_output"' EXIT
+shell_target_fixture="$(mktemp "${TMPDIR:-/tmp}/sb-shell-target-negative.XXXXXX")"
+shell_target_output="$(mktemp "${TMPDIR:-/tmp}/sb-shell-target-output.XXXXXX")"
+trap 'rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fixture" "$shell_target_output"' EXIT
 sed '/^download_binaries() {/,/^}$/ {
   /LATEST_SINGBOX_URL/ s/ || return 1//
 }' sb-user-manager.sh > "$managed_step_fixture"
@@ -69,7 +72,18 @@ if bash tests/check-managed-step-errexit.sh "$managed_step_fixture" >"$managed_s
 fi
 grep -Fq 'managed shell-function targets changed' "$managed_step_output"
 
-rm -f -- "$managed_step_fixture" "$managed_step_output"
+cp sb-user-manager.sh "$shell_target_fixture"
+printf '\nstatic_gate_negative_fixture() {\n  undefined_static_probe\n  if undefined_condition_probe; then :; fi\n  value="$(undefined_substitution_probe)"\n  printf x | undefined_pipeline_probe\n}\n' >> "$shell_target_fixture"
+if python3 tests/check-shell-call-targets.py "$shell_target_fixture" >"$shell_target_output" 2>&1; then
+  echo 'shell call-target check must reject an undefined bare command' >&2
+  exit 1
+fi
+grep -Fq 'undefined bare command target undefined_static_probe' "$shell_target_output"
+grep -Fq 'undefined bare command target undefined_condition_probe' "$shell_target_output"
+grep -Fq 'undefined bare command target undefined_substitution_probe' "$shell_target_output"
+grep -Fq 'undefined bare command target undefined_pipeline_probe' "$shell_target_output"
+
+rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fixture" "$shell_target_output"
 trap - EXIT
 
 version="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)"/\1/p' sb-user-manager.sh | head -n1)"
