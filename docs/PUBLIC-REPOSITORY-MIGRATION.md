@@ -10,7 +10,7 @@
 - 原私有版和分享版停止发布，原私有仓库永久退役；公开仓库保持现名，避免破坏现有公开客户端更新地址。
 - 旧私有版配置中的 `GITHUB_TOKEN` 只为迁移兼容而接受并立即丢弃，不载入进程、不发送到网络、不写回配置。
 - 仍运行旧私有版的服务器可以使用同版本或更高版本的公开 Release 执行 `--take-over-installed-manager`。接管只替换管理脚本与版本记录，不修改用户、流量、配额、有效期、证书、分流、sing-box 或 Nfuse，也不会启停服务。
-- 原 v5 方向永久终止；已经进入公开 v4.25.2 的休眠基础由 [公开 Issue #17](https://github.com/DTB201/sb-user-manager-public/issues/17) 独立清理。
+- 原 v5 方向永久终止；自 v4.25.2 起进入公开版本的休眠基础由 [公开 Issue #17](https://github.com/DTB201/sb-user-manager-public/issues/17) 独立清理。
 
 ## 初次公开审计基线
 
