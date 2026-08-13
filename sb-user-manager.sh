@@ -4455,9 +4455,12 @@ calculate_renewal_expiry() {
   local base_epoch="$1" months="$2" base_time
   [[ "$base_epoch" =~ ^[0-9]+$ && "$months" =~ ^-?[1-9][0-9]*$ ]] || return 1
   base_time="$(date -d "@$base_epoch" '+%Y-%m-%d %H:%M:%S')" || return 1
-  # 不要在完整时刻后使用 +N month；GNU date 会把 +N 误解析为数字时区，
-  # 剩余的裸 month 因而固定只增加一个月。
-  date -d "$base_time ${months} months" '+%Y-%m-%dT%H:%M:%S%z' || return 1
+  # 不要在完整时刻后直接使用 +N/-N month；GNU date 会把带符号数字误解析为时区。
+  if [[ "$months" == -* ]]; then
+    date -d "$base_time ${months#-} months ago" '+%Y-%m-%dT%H:%M:%S%z' || return 1
+  else
+    date -d "$base_time ${months} months" '+%Y-%m-%dT%H:%M:%S%z' || return 1
+  fi
 }
 
 cmd_renew() {
@@ -4472,7 +4475,7 @@ cmd_renew() {
     die "用户状态无效，不能调整有效期：$name"
   now_epoch="$(date +%s)" || return 1
   expires_epoch="$(date -d "$expires" +%s)" || die "用户有效期格式无效，不能调整：$name"
-  if ((months > 0 && expires_epoch <= now_epoch)); then
+  if [[ "$months" != -* ]] && ((expires_epoch <= now_epoch)); then
     base_epoch="$now_epoch"
   else
     base_epoch="$expires_epoch"
@@ -4481,7 +4484,7 @@ cmd_renew() {
     echo "错误：无法按 ${months} 个月计算用户的新到期时间，有效期调整未执行：$name" >&2
     return 1
   fi
-  if ((months < 0)); then
+  if [[ "$months" == -* ]]; then
     new_expiry_epoch="$(date -d "$new_expiry" +%s)" || {
       echo "错误：无法验证调整后的到期时间，有效期调整未执行：$name" >&2
       return 1
@@ -4491,19 +4494,19 @@ cmd_renew() {
       return 1
     fi
   fi
-  if [[ "$status" == disabled ]] && ((months > 0)); then
+  if [[ "$status" == disabled && "$months" != -* ]]; then
     prepare_user_enable "$name" || return 1
   fi
   start_managed_operation "adjust-user-expiry:$name" || return 1
   run_managed_step state_set_expiry "$name" "$new_expiry" || return 1
-  if [[ "$status" == disabled ]] && ((months > 0)); then
+  if [[ "$status" == disabled && "$months" != -* ]]; then
     if ! run_managed_step enable_user_without_transaction "$name"; then
       log "续期和自动启用失败，已恢复到续期前状态"
       return 1
     fi
   fi
   finish_managed_operation || return 1
-  if ((months > 0)); then
+  if [[ "$months" != -* ]]; then
     log "用户续期成功：${name}，新到期时间：${new_expiry}"
   else
     log "用户有效期已提前：${name}，新到期时间：${new_expiry}"
@@ -9119,7 +9122,7 @@ prompt_renew_user() {
     [[ "$months" =~ ^-?[1-9][0-9]*$ ]] && break
     echo '输入无效：调整月数必须是非零整数，请重新输入。'
   done
-  if ((months < 0)); then
+  if [[ "$months" == -* ]]; then
     expires_epoch="$(date -d "$expires" +%s)" || {
       echo "错误：用户有效期格式无效，不能调整：$name" >&2
       return 1

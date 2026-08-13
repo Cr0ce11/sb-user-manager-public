@@ -5028,6 +5028,7 @@ grep -Fq 'run_managed_step enable_user_without_transaction' <<<"$renew_body"
 renew_expiry_body="$(declare -f calculate_renewal_expiry)"
 grep -Fq 'date -d "$base_time ${months} months"' <<<"$renew_expiry_body"
 ! grep -Fq '+${months} month' <<<"$renew_expiry_body"
+grep -Fq 'date -d "$base_time ${months#-} months ago"' <<<"$renew_expiry_body"
 grep -Fq '^-?[1-9][0-9]*$' <<<"$renew_expiry_body"
 
 # GNU date 必须按输入增加或减少对应月份，并保持时分秒；旧表达式会把 +N 当成时区。

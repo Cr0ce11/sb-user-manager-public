@@ -602,7 +602,7 @@ prompt_renew_user() {
     [[ "$months" =~ ^-?[1-9][0-9]*$ ]] && break
     echo '输入无效：调整月数必须是非零整数，请重新输入。'
   done
-  if ((months < 0)); then
+  if [[ "$months" == -* ]]; then
     expires_epoch="$(date -d "$expires" +%s)" || {
       echo "错误：用户有效期格式无效，不能调整：$name" >&2
       return 1
