@@ -6001,6 +6001,128 @@ fi
   fi
 )
 
+# 用户审计批处理必须保持有效期、协议、启停、多入口和 Nfuse 问题的原有顺序、措辞与计数。
+(
+  STATE_FILE="$work/audit-batch-state.json"
+  SINGBOX_CONFIG="$work/audit-batch-config.json"
+  SINGBOX_BIN=audit_batch_singbox
+  printf '%s\n' '{
+    "schema_version":7,
+    "users":[
+      {"name":"shadow-active","status":"active","metered":false,"expires_at":"not-a-date","endpoints":[{"protocol":"ss2022","transport":"shadowtls","port":20001}]},
+      {"name":"any-disabled","status":"disabled","metered":true,"limit_gib":10,"endpoints":[{"protocol":"anytls","port":20002}]},
+      {"name":"direct-active","status":"active","metered":false,"endpoints":[{"protocol":"ss2022","transport":"direct","port":20003}]},
+      {"name":"multi","status":"active","metered":false,"endpoints":[{"protocol":"ss2022","transport":"shadowtls","port":20004},{"protocol":"ss2022","transport":"direct","port":20005}]},
+      {"name":"any-active","status":"active","metered":false,"endpoints":[{"protocol":"anytls","port":20006}]}
+    ],
+    "splits":[],
+    "outbound_presets":[],
+    "rule_presets":[]
+  }' > "$STATE_FILE"
+  printf '%s\n' '{
+    "inbounds":[
+      {"tag":"ss-shadow-active"},
+      {"type":"shadowsocks","tag":"ss-udp-shadow-active","network":"tcp","listen_port":20001},
+      {"tag":"anytls-any-disabled"},
+      {"type":"shadowsocks","tag":"ss-direct-active","listen_port":19999,"password":"audit-secret"},
+      {"tag":"st-direct-active"},
+      {"tag":"ss-udp-direct-active"},
+      {"tag":"st-multi"},
+      {"tag":"ss-multi"},
+      {"type":"shadowsocks","tag":"ss-udp-multi","network":"udp","listen_port":20004},
+      {"type":"shadowsocks","tag":"ss-direct-multi","listen_port":20005}
+    ],
+    "outbounds":[],
+    "route":{"rule_set":[],"rules":[]}
+  }' > "$SINGBOX_CONFIG"
+  audit_batch_nfuse_json='[
+    {"name":"any-disabled","tier":"c","ports":[{"start":20002,"end":20002}]},
+    {"name":"direct-active","tier":"c","ports":[{"start":21003,"end":21003}]},
+    {"name":"multi","tier":"c","ports":[{"start":20004,"end":20004}]},
+    {"name":"any-active","tier":"c","ports":[{"start":20006,"end":20006}]}
+  ]'
+  audit_batch_singbox() {
+    [[ "${1:-}" == format && "${2:-}" == -c && "${3:-}" == "$SINGBOX_CONFIG" ]] || return 1
+    command cat "$SINGBOX_CONFIG"
+  }
+  nfuse() {
+    [[ "${1:-}" == list && "${2:-}" == --json ]] || return 1
+    printf '%s\n' "$audit_batch_nfuse_json"
+  }
+  audit_output="$work/audit-batch-output"
+  audit_expected="$work/audit-batch-expected"
+  audit_consistency > "$audit_output"
+  [[ "$AUDIT_ISSUES" == 11 && "$AUDIT_REPAIRABLE" == 9 ]]
+  cat > "$audit_expected" <<'EOF'
+
+服务与配置检查结果
+
+  [需要处理] 用户 shadow-active 的有效期格式无效（not-a-date）
+  [可自动修复] 用户 shadow-active 缺少连接配置（st-shadow-active）
+  [可自动修复] 用户 shadow-active 的 UDP 连接配置不正确
+  [可自动修复] 用户 shadow-active 缺少流量统计记录
+  [可自动修复] 已停用用户 any-disabled 仍保留连接配置（anytls-any-disabled）
+  [需要处理] 用户 any-disabled 的流量记录类型不正确（应为 计量）
+  [可自动修复] 用户 direct-active 的原生 SS2022 连接配置不正确
+  [可自动修复] 用户 direct-active 的原生 SS2022 仍有旧版 ShadowTLS 连接残留
+  [可自动修复] 用户 direct-active 的端口 20003 尚未接入流量统计
+  [可自动修复] 用户 multi 的端口 20005 尚未接入流量统计
+  [可自动修复] 用户 any-active 缺少连接配置（anytls-any-active）
+
+共发现 11 个问题，其中 9 个可以自动修复。
+EOF
+  cmp -s "$audit_expected" "$audit_output"
+)
+
+# 50 个 ShadowTLS 用户的一致性检查固定批量处理；重构前该夹具会启动 409 次 jq。
+(
+  STATE_FILE="$work/audit-batch-count-state.json"
+  SINGBOX_CONFIG="$work/audit-batch-count-config.json"
+  SINGBOX_BIN=audit_batch_count_singbox
+  command jq -n '{
+    schema_version:7,
+    users:[range(0; 50) as $index | {
+      name:("user" + ($index | tostring)),status:"active",metered:false,
+      endpoints:[{protocol:"ss2022",transport:"shadowtls",port:(20000 + $index)}]
+    }],
+    splits:[],outbound_presets:[],rule_presets:[]
+  }' > "$STATE_FILE"
+  command jq -n '{
+    inbounds:[range(0; 50) as $index |
+      ("user" + ($index | tostring)) as $name | (20000 + $index) as $port |
+      {tag:("st-" + $name)},
+      {tag:("ss-" + $name)},
+      {type:"shadowsocks",tag:("ss-udp-" + $name),network:"udp",listen_port:$port,password:"audit-secret"}],
+    outbounds:[],route:{rule_set:[],rules:[]}
+  }' > "$SINGBOX_CONFIG"
+  audit_batch_count_nfuse="$(command jq -cn '[range(0; 50) as $index | {
+    name:("user" + ($index | tostring)),tier:"c",
+    ports:[{start:(20000 + $index),end:(20000 + $index)}]
+  }]')"
+  audit_batch_count_singbox() {
+    [[ "${1:-}" == format && "${2:-}" == -c && "${3:-}" == "$SINGBOX_CONFIG" ]] || return 1
+    command cat "$SINGBOX_CONFIG"
+  }
+  nfuse() {
+    [[ "${1:-}" == list && "${2:-}" == --json ]] || return 1
+    printf '%s\n' "$audit_batch_count_nfuse"
+  }
+  audit_jq_calls="$work/audit-batch-jq.calls"
+  audit_jq_args="$work/audit-batch-jq.args"
+  : > "$audit_jq_calls"
+  : > "$audit_jq_args"
+  jq() {
+    printf 'jq\n' >> "$audit_jq_calls"
+    printf '%s\0' "$@" >> "$audit_jq_args"
+    command jq "$@"
+  }
+  audit_consistency > "$work/audit-batch-count-output"
+  [[ "$AUDIT_ISSUES" == 0 && "$AUDIT_REPAIRABLE" == 0 ]]
+  grep -Fq '一切正常' "$work/audit-batch-count-output"
+  [[ "$(wc -l < "$audit_jq_calls" | tr -d ' ')" == 9 ]]
+  ! tr '\0' '\n' < "$audit_jq_args" | grep -Fq 'audit-secret'
+)
+
 printf '%s\n' '{"schema_version":3,"users":[{"name":"test","status":"disabled","port":10001,"metered":true,"limit_gib":1},{"name":"crocell","status":"active","port":10000,"metered":false},{"name":"test2","status":"active","port":22547,"metered":true,"limit_gib":2}],"splits":[{"name":"AI","status":"active","scope":"user","user":"crocell","rule_set_tag":"AI","outbound_tag":"Hinet"}]}' > "$STATE_FILE"
 printf '%s\n' '{"inbounds":[{"tag":"st-crocell"},{"tag":"ss-crocell"},{"type":"shadowsocks","tag":"ss-udp-crocell","network":"udp","listen_port":10000},{"tag":"st-test2"},{"tag":"ss-test2"},{"type":"shadowsocks","tag":"ss-udp-test2","network":"udp","listen_port":22547}],"outbounds":[{"tag":"Hinet"}],"route":{"rule_set":[{"tag":"AI"}],"rules":[{"rule_set":"AI","outbound":"Hinet","inbound":["st-crocell","ss-crocell","ss-udp-crocell"]}]}}' > "$SINGBOX_CONFIG"
 nfuse() {
