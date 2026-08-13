@@ -26,26 +26,13 @@
 从仓库根目录运行：
 
 ```bash
-bash -n sb-user-manager.sh tests/acceptance.sh tests/test-acceptance.sh tests/test-controller-state.sh tests/test-controller-role.sh tests/test-controller-role-repair.sh tests/test-controller-role-provision.sh tests/test-manager-role-detection.sh tests/test-standalone-startup.sh tests/test-manager-handoff.sh tests/test-controller-landing-transport.sh tests/test-controller-landing-registration.sh tests/test-controller-landing-credentials.sh tests/test-controller-landing-onboarding.sh tests/test-controller-landing-onboarding-journal.sh tests/test-landing-apply-protocol.sh tests/test-landing-agent.sh tests/test-landing-channel-install.sh tests/test-landing-bootstrap.sh tests/test-landing-channel-e2e.sh tests/test-landing-startup-gate.sh tools/build-manager.sh tools/audit-public-readiness.sh tools/export-public-snapshot.sh tests/test-build.sh tests/test-public.sh tests/test-public-readiness.sh tests/test-public-snapshot.sh tests/test-release-workflow.sh
+bash -n sb-user-manager.sh tests/acceptance.sh tests/check-managed-step-errexit.sh tests/test-acceptance.sh tests/test-standalone-startup.sh tests/test-manager-handoff.sh tools/build-manager.sh tools/audit-public-readiness.sh tools/export-public-snapshot.sh tools/check-immutable-release-setting.sh tests/test-build.sh tests/test-public.sh tests/test-public-readiness.sh tests/test-public-snapshot.sh tests/test-release-workflow.sh
 bash tools/build-manager.sh --check
 bash tests/test-build.sh
 bash tests/test-static.sh
 bash tests/test-unit.sh
-bash tests/test-controller-state.sh
-bash tests/test-controller-role.sh
-bash tests/test-controller-role-repair.sh
-bash tests/test-controller-role-provision.sh
-bash tests/test-manager-role-detection.sh
 bash tests/test-standalone-startup.sh
 bash tests/test-manager-handoff.sh
-bash tests/test-controller-landing-credentials.sh
-bash tests/test-controller-landing-onboarding.sh
-bash tests/test-controller-landing-onboarding-journal.sh
-bash tests/test-landing-apply-protocol.sh
-bash tests/test-landing-agent.sh
-bash tests/test-landing-channel-install.sh
-bash tests/test-landing-bootstrap.sh
-bash tests/test-landing-startup-gate.sh
 bash tests/test-acceptance.sh
 bash tests/test-public.sh
 bash tests/test-public-readiness.sh
@@ -55,11 +42,7 @@ bash tests/test-release-workflow.sh
 
 `tools/export-public-snapshot.sh` 只允许从干净、已提交并通过公开策略审计的工作区导出新目录；它拒绝覆盖已有目录和包含符号链接的源码树。公开仓库的初始提交必须来自这个导出结果，不能复制 `.git` 或手工挑文件。
 
-`tests/test-landing-channel-e2e.sh` 会创建并删除固定的本地系统账户、sudoers 和安装路径，并经临时真实 root SSH 执行一次性引导与精确回退，只能在 Linux root 的一次性隔离测试环境运行；CI 在 Ubuntu 24.04 与固定摘要、仅增加 `NET_ADMIN` 能力的 Debian 12 隔离容器中以 `SB_REQUIRE_LANDING_CHANNEL_E2E=true` 强制执行。Debian 容器的 PID 1 不是 systemd，测试只在确认一次性容器标记后临时安装严格的 `systemctl` 行为桩，并在退出时恢复原二进制；生产代码仍会在没有真实 systemd 时失败关闭。macOS 和有业务数据的服务器不得运行该 E2E。
-
-`tests/test-landing-startup-gate.sh` 在普通本地环境验证渲染内容、helper 顺序和失败传播；没有 `systemd-analyze` 时只跳过单元图语法检查。CI 必须设置 `SB_REQUIRE_LANDING_STARTUP_SYSTEMD_VERIFY=true`，在 Ubuntu 24.04 和 Debian 12 都强制执行该离线检查。Ubuntu 24.04 还以 root 设置 `SB_REQUIRE_LANDING_STARTUP_SYSTEMD_RUNTIME=true`，在真实 systemd PID 1 下运行唯一命名、只链接到 `/run` 的合成单元，验证成功顺序与失败阻断；该测试不使用或修改本机真实 sing-box 和项目正式门禁。Debian 容器的 PID 1 不是 systemd，因此只执行离线 `systemd-analyze verify`。
-
-`tests/test-controller-landing-onboarding-journal.sh` 只在临时目录中模拟控制器状态和远端调用，并真实终止一个测试子进程来验证日志可恢复性；它不登录服务器、不修改系统服务，也不发送网络请求。
+GitHub 分支保护仍要求历史检查名称 `debian-landing-e2e`。在单独调整仓库 Ruleset 前，该 job ID 不改名，但内部已经只运行固定 Debian 12 容器中的 standalone 启动、旧私有版接管和公开就绪检查，不再申请 `NET_ADMIN`、创建 SSH 账户或运行任何 v5 落地测试。
 
 安装了 ShellCheck 时还应运行 CI 中的对应检查。测试失败时不得通过修改测试期望来掩盖行为回归。
 
