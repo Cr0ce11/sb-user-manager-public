@@ -788,6 +788,60 @@ stderr_probe="$work/stderr-probe"
 } 2>"$stderr_probe"
 grep -Fxq 'stderr-preserved' "$stderr_probe"
 
+# 轻量操作锁必须能在全新环境创建父目录，并在释放后关闭 fd 9。
+(
+  LOCK_FILE="$work/fresh-operation-lock/run/lock/sb-user-manager.lock"
+  flock() { return 0; }
+  acquire_operation_lock
+  [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]]
+  release_operation_lock
+  if { printf x >&9; } 2>/dev/null; then
+    echo 'operation lock descriptor should be closed after release' >&2
+    exit 1
+  fi
+)
+
+# 锁目录或锁文件是符号链接时必须失败，不能跟随到非受管位置。
+(
+  lock_root="$work/unsafe-operation-lock"
+  mkdir -p "$lock_root/real"
+  ln -s "$lock_root/real" "$lock_root/link"
+  LOCK_FILE="$lock_root/link/manager.lock"
+  if acquire_operation_lock >/dev/null 2>&1; then
+    echo 'symlink operation lock directory should be rejected' >&2
+    exit 1
+  fi
+  [[ ! -e "$lock_root/real/manager.lock" ]]
+  rm -f -- "$lock_root/link"
+  : > "$lock_root/target"
+  ln -s "$lock_root/target" "$lock_root/manager.lock"
+  LOCK_FILE="$lock_root/manager.lock"
+  if acquire_operation_lock >/dev/null 2>&1; then
+    echo 'symlink operation lock file should be rejected' >&2
+    exit 1
+  fi
+)
+
+# Linux CI 使用真实 flock 证明另一个进程占锁时会明确拒绝且不会遗留 fd 9。
+if command -v flock >/dev/null 2>&1; then
+  (
+    LOCK_FILE="$work/contended-operation.lock"
+    exec 7>"$LOCK_FILE"
+    command flock -n 7
+    if acquire_operation_lock >"$work/contended-operation.out" 2>&1; then
+      echo 'contended operation lock should be rejected' >&2
+      exit 1
+    fi
+    [[ "$OPERATION_LOCK_ERROR" == '另一个管理操作正在进行，请等待完成后再试' ]]
+    if { printf x >&9; } 2>/dev/null; then
+      echo 'failed operation lock acquisition should close fd 9' >&2
+      exit 1
+    fi
+    command flock -u 7
+    exec 7>&-
+  )
+fi
+
 is_managed_temp_path /tmp/sb-runtime-test.example
 if is_managed_temp_path /etc/passwd; then
   echo 'unmanaged path should be rejected' >&2
@@ -1361,6 +1415,7 @@ grep -Fxq 'external executable' "$atomic_install_external"
   DIAGNOSTIC_REPORT_DIR="$uninstall_root/root/sb-user-manager-diagnostics"
   ENVIRONMENT_TRANSACTION_JOURNAL="$uninstall_root/var/lib/sb-user-manager.recovery.json"
   ENVIRONMENT_LOCK_FILE="$uninstall_root/run/lock/sb-user-manager-environment.lock"
+  LOCK_FILE="$uninstall_root/run/lock/sb-user-manager.lock"
   SB_SYSTEM_ROOT="$uninstall_root"
   mkdir -p \
     "$uninstall_root/etc/sing-box/backups" \
@@ -1410,7 +1465,8 @@ grep -Fxq 'external executable' "$atomic_install_external"
   [[ ! -e "$ENVIRONMENT_BACKUP_BASE/reports" ]]
   [[ ! -e "$DIAGNOSTIC_REPORT_DIR" ]]
   [[ ! -e "$ENVIRONMENT_TRANSACTION_JOURNAL" ]]
-  [[ ! -e "$ENVIRONMENT_LOCK_FILE" ]]
+  [[ -f "$ENVIRONMENT_LOCK_FILE" && ! -L "$ENVIRONMENT_LOCK_FILE" ]]
+  [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]]
 )
 
 (
@@ -1419,6 +1475,7 @@ grep -Fxq 'external executable' "$atomic_install_external"
   MIGRATION_BACKUP_DIR="$ENVIRONMENT_BACKUP_BASE/data"
   ENVIRONMENT_TRANSACTION_JOURNAL="$uninstall_root/var/lib/sb-user-manager.recovery.json"
   ENVIRONMENT_LOCK_FILE="$uninstall_root/run/lock/sb-user-manager-environment.lock"
+  LOCK_FILE="$uninstall_root/run/lock/sb-user-manager.lock"
   SB_SYSTEM_ROOT="$uninstall_root"
   mkdir -p \
     "$uninstall_root/etc/sing-box" \
@@ -1457,6 +1514,11 @@ grep -Fxq 'external executable' "$atomic_install_external"
   grep -Fxq rollback-cache "$uninstall_root/var/lib/sing-box/cache.db"
   [[ ! -e "$ENVIRONMENT_TRANSACTION_JOURNAL" ]]
   grep -Fq '服务器已经恢复到卸载前状态' "$work/uninstall-rollback-output"
+  [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]]
+  if { printf x >&9; } 2>/dev/null; then
+    echo 'uninstall rollback should release operation lock descriptor' >&2
+    exit 1
+  fi
 )
 
 (
@@ -1564,6 +1626,8 @@ set +e
   environment_is_deployed() { return 0; }
   load_runtime_config() { :; }
   need_cmd() { :; }
+  LOCK_FILE="$work/update-failure.lock"
+  flock() { return 0; }
   fetch_latest_releases() {
     LATEST_SINGBOX_VERSION=1.2.3
     LATEST_NFUSE_VERSION=4.5.6
@@ -1572,7 +1636,14 @@ set +e
   installed_singbox_version() { printf '1.0.0\n'; }
   installed_nfuse_version() { printf '4.5.6\n'; }
   installed_manager_version() { printf '%s\n' "$SCRIPT_VERSION"; }
-  deploy_environment() { printf 'UPDATE:deploy-called\n'; return 73; }
+  deploy_environment() {
+    if { printf x >&9; } 2>/dev/null; then
+      echo 'update check must release fd 9 before deployment reacquires it' >&2
+      return 74
+    fi
+    printf 'UPDATE:deploy-called\n'
+    return 73
+  }
   check_updates <<<'y'
 ) > "$work/update-failure" 2>&1
 update_failure_rc=$?
@@ -1589,6 +1660,8 @@ grep -Fxq 'UPDATE:deploy-called' "$work/update-failure"
 )
 (
   marker="$work/deploy-after-loopback-preflight"
+  acquire_operation_lock() { return 0; }
+  release_operation_lock() { :; }
   ensure_safe_ssh_for_singbox_restart() { return 0; }
   python3() { return 1; }
   validate_manager_shortcut_path() { : > "$marker"; return 0; }
@@ -1603,10 +1676,179 @@ grep -Fxq 'UPDATE:deploy-called' "$work/update-failure"
   grep -Fq '本次操作已在修改前取消' "$work/deploy-loopback-rejected"
 )
 
+# 三个会直接修改环境的入口必须先取 fd 9；锁冲突时连预检和备份都不能开始。
+for environment_entry in deploy takeover uninstall; do
+  (
+    side_effect_marker="$work/${environment_entry}-after-operation-lock"
+    acquire_operation_lock() {
+      OPERATION_LOCK_ERROR='另一个管理操作正在进行，请等待完成后再试'
+      return 1
+    }
+    ensure_safe_ssh_for_singbox_restart() { : > "$side_effect_marker"; }
+    ensure_safe_ssh_for_complete_uninstall() { : > "$side_effect_marker"; }
+    create_environment_backup() { : > "$side_effect_marker"; }
+    case "$environment_entry" in
+      deploy) deploy_environment false false ;;
+      takeover) takeover_existing_environment ;;
+      uninstall) uninstall_managed_environment ;;
+    esac
+  ) > "$work/${environment_entry}-operation-lock.out" 2>&1 && {
+    echo "$environment_entry should reject an occupied operation lock" >&2
+    exit 1
+  }
+  [[ ! -e "$work/${environment_entry}-after-operation-lock" ]]
+  grep -Fq '另一个管理操作正在进行，请等待完成后再试' "$work/${environment_entry}-operation-lock.out"
+done
+
+# 更新检查同样必须在联网查询前取锁；冲突时不得开始下载元数据。
+(
+  update_side_effect="$work/update-after-operation-lock"
+  environment_is_deployed() { return 0; }
+  load_runtime_config() { :; }
+  need_cmd() { :; }
+  acquire_operation_lock() {
+    OPERATION_LOCK_ERROR='另一个管理操作正在进行，请等待完成后再试'
+    return 1
+  }
+  fetch_latest_releases() { : > "$update_side_effect"; }
+  check_updates
+) > "$work/update-operation-lock.out" 2>&1 && {
+  echo 'update check should reject an occupied operation lock' >&2
+  exit 1
+}
+[[ ! -e "$work/update-after-operation-lock" ]]
+grep -Fq '另一个管理操作正在进行，请等待完成后再试' "$work/update-operation-lock.out"
+
+# 全新环境没有锁目录时，部署必须能创建锁、完成受管步骤并在结束后关闭 fd 9。
+(
+  fresh_root="$work/fresh-deploy-operation-lock"
+  LOCK_FILE="$fresh_root/run/lock/sb-user-manager.lock"
+  fresh_log="$fresh_root/deploy.log"
+  mkdir -p "$fresh_root"
+  flock() { return 0; }
+  ensure_safe_ssh_for_singbox_restart() { return 0; }
+  ensure_deploy_loopback_ready() { return 0; }
+  validate_manager_shortcut_path() { return 0; }
+  uname() { printf 'x86_64\n'; }
+  default_network_interface() { printf 'eth0\n'; }
+  register_temp_path() { return 0; }
+  create_environment_backup() {
+    ENV_BACKUP="$fresh_root/snapshot"
+    mkdir -p "$ENV_BACKUP"
+  }
+  begin_environment_transaction() { printf 'begin\n' >> "$fresh_log"; }
+  run_step_or_rollback() {
+    local rollback="$1" target="$2"
+    shift 2
+    if [[ "$target" == complete_environment_change ]]; then
+      "$target" "$@"
+    else
+      printf 'step:%s\n' "$target" >> "$fresh_log"
+    fi
+  }
+  complete_environment_change() { rm -rf -- "$1"; }
+  deployed_state_path() { printf '%s/managed-users.json\n' "$fresh_root"; }
+  sed() { printf '%s\n' "$SCRIPT_VERSION"; }
+  log() { printf '%s\n' "$*" >> "$fresh_log"; }
+  deploy_environment true false
+  [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]]
+  grep -Fxq begin "$fresh_log"
+  grep -Fq '部署完成' "$fresh_log"
+  if { printf x >&9; } 2>/dev/null; then
+    echo 'successful deployment should release operation lock descriptor' >&2
+    exit 1
+  fi
+)
+
+# 环境 journal 尚未建立时失败不得执行恢复；只清理临时目录并释放 fd 9。
+(
+  failed_root="$work/deploy-begin-transaction-failure"
+  LOCK_FILE="$failed_root/run/lock/sb-user-manager.lock"
+  mkdir -p "$failed_root"
+  flock() { return 0; }
+  ensure_safe_ssh_for_singbox_restart() { return 0; }
+  ensure_deploy_loopback_ready() { return 0; }
+  validate_manager_shortcut_path() { return 0; }
+  uname() { printf 'x86_64\n'; }
+  default_network_interface() { printf 'eth0\n'; }
+  register_temp_path() { return 0; }
+  create_environment_backup() { ENV_BACKUP="$failed_root/snapshot"; mkdir -p "$ENV_BACKUP"; }
+  begin_environment_transaction() { return 76; }
+  restore_failed_environment_change() { : > "$failed_root/unexpected-restore"; }
+  if deploy_environment false false >/dev/null 2>&1; then
+    echo 'deployment should stop when the environment journal cannot be created' >&2
+    exit 1
+  fi
+  [[ ! -e "$failed_root/unexpected-restore" ]]
+  if { printf x >&9; } 2>/dev/null; then
+    echo 'failed environment transaction setup should release fd 9' >&2
+    exit 1
+  fi
+)
+
+# 信号回滚回调必须恢复环境并释放 fd 9；这里不向真实系统写入。
+(
+  interrupted_root="$work/deploy-signal-rollback"
+  LOCK_FILE="$interrupted_root/run/lock/sb-user-manager.lock"
+  interrupted_work=""
+  mkdir -p "$interrupted_root"
+  flock() { return 0; }
+  ensure_safe_ssh_for_singbox_restart() { return 0; }
+  ensure_deploy_loopback_ready() { return 0; }
+  validate_manager_shortcut_path() { return 0; }
+  uname() { printf 'x86_64\n'; }
+  default_network_interface() { printf 'eth0\n'; }
+  register_temp_path() { interrupted_work="$1"; }
+  create_environment_backup() { ENV_BACKUP="$interrupted_root/snapshot"; mkdir -p "$ENV_BACKUP"; }
+  begin_environment_transaction() { return 0; }
+  set_signal_rollback() { ACTIVE_SIGNAL_ROLLBACK="$1"; }
+  clear_signal_rollback() { ACTIVE_SIGNAL_ROLLBACK=""; }
+  systemctl() { return 0; }
+  cleanup_deploy_created_paths() { return 0; }
+  restore_failed_environment_change() {
+    printf '%s\n' "$1:$2" > "$interrupted_root/restored"
+    rm -rf -- "$3"
+  }
+  run_step_or_rollback() {
+    local rollback="$1"
+    "$rollback" 143
+  }
+  if deploy_environment false false >/dev/null 2>&1; then
+    echo 'interrupted deployment should return failure after rollback' >&2
+    exit 1
+  fi
+  grep -Fq '部署:' "$interrupted_root/restored"
+  [[ -z "$ACTIVE_SIGNAL_ROLLBACK" && ! -e "$interrupted_work" ]]
+  if { printf x >&9; } 2>/dev/null; then
+    echo 'deployment signal rollback should release fd 9' >&2
+    exit 1
+  fi
+)
+
+# 更新元数据查询失败时也必须释放 fd 9。
 (
   environment_is_deployed() { return 0; }
   load_runtime_config() { :; }
   need_cmd() { :; }
+  LOCK_FILE="$work/update-fetch-failure.lock"
+  flock() { return 0; }
+  fetch_latest_releases() { return 77; }
+  if check_updates >/dev/null 2>&1; then
+    echo 'failed release metadata query should stop update checking' >&2
+    exit 1
+  fi
+  if { printf x >&9; } 2>/dev/null; then
+    echo 'failed update metadata query should release fd 9' >&2
+    exit 1
+  fi
+)
+
+(
+  environment_is_deployed() { return 0; }
+  load_runtime_config() { :; }
+  need_cmd() { :; }
+  LOCK_FILE="$work/preview-update.lock"
+  flock() { return 0; }
   fetch_latest_releases() {
     LATEST_SINGBOX_VERSION=1.13.14
     LATEST_SINGBOX_URL=https://example.com/stable.tar.gz
@@ -1621,6 +1863,10 @@ grep -Fxq 'UPDATE:deploy-called' "$work/update-failure"
   installed_manager_version() { printf '9.0.0\n'; }
   deploy_environment() { echo 'preview channel must not use stable deployment' >&2; return 1; }
   check_updates
+  if { printf x >&9; } 2>/dev/null; then
+    echo 'no-update path should release operation lock descriptor' >&2
+    exit 1
+  fi
 ) > "$work/preview-update-guard"
 grep -Fq '测试通道请在「sing-box 版本管理 → 更新当前通道」中更新' "$work/preview-update-guard"
 grep -Fq '其余组件已经是最新版本' "$work/preview-update-guard"
@@ -2908,6 +3154,7 @@ fi
   BACKUP_DIR="$work/durable-transaction-backups"
   TRANSACTION_DIR="$work/durable-transactions"
   TRANSACTION_JOURNAL="$TRANSACTION_DIR/active.json"
+  ENVIRONMENT_TRANSACTION_JOURNAL="$work/durable-environment-recovery.json"
   SINGBOX_CONFIG="$work/durable-config.json"
   STATE_FILE="$work/durable-state.json"
   CONF_FILE="$work/durable-manager.conf"
@@ -2970,6 +3217,15 @@ fi
     esac
   }
 
+  printf '%s\n' '{}' > "$ENVIRONMENT_TRANSACTION_JOURNAL"
+  if begin_operation_transaction 'blocked-by-environment' > "$work/operation-blocked-by-environment.out" 2>&1; then
+    echo 'user transaction should reject an active environment journal' >&2
+    exit 1
+  fi
+  [[ ! -e "$TRANSACTION_JOURNAL" ]]
+  grep -Fq '发现尚未完成的环境操作' "$work/operation-blocked-by-environment.out"
+  rm -f -- "$ENVIRONMENT_TRANSACTION_JOURNAL"
+
   begin_operation_transaction 'unit-power-loss'
   [[ -f "$TRANSACTION_JOURNAL" ]]
   validate_transaction_journal
@@ -3020,6 +3276,7 @@ fi
   ENVIRONMENT_BACKUP_BASE="$work/environment-snapshots"
   ENVIRONMENT_TRANSACTION_JOURNAL="$work/environment-recovery.json"
   ENVIRONMENT_LOCK_FILE="$work/environment-recovery.lock"
+  TRANSACTION_JOURNAL="$work/environment-operation-active.json"
   flock() { return 0; }
   mkdir -p "$SB_SYSTEM_ROOT/etc/sing-box" "$SB_SYSTEM_ROOT/etc" "$SB_SYSTEM_ROOT/usr/local/bin"
   printf 'before\n' > "$SB_SYSTEM_ROOT/etc/sb-user-manager.conf"
@@ -3030,6 +3287,19 @@ fi
   snapshot="$ENV_BACKUP"
   # v4.22.7 及更早快照会保留可执行文件的 755；新版必须先安全迁移权限，再删除任何当前文件。
   chmod 755 "$snapshot/root/usr/local/bin/sing-box"
+  printf '%s\n' '{}' > "$TRANSACTION_JOURNAL"
+  if begin_environment_transaction environment-blocked "$snapshot" /usr/local/bin/nfuse \
+      > "$work/environment-blocked-by-operation.out" 2>&1; then
+    echo 'environment transaction should reject an active user journal' >&2
+    exit 1
+  fi
+  [[ ! -e "$ENVIRONMENT_TRANSACTION_JOURNAL" ]]
+  grep -Fq '发现尚未完成的用户或分流操作' "$work/environment-blocked-by-operation.out"
+  if { printf x >&8; } 2>/dev/null; then
+    echo 'rejected environment transaction should close fd 8' >&2
+    exit 1
+  fi
+  rm -f -- "$TRANSACTION_JOURNAL"
   begin_environment_transaction environment-unit "$snapshot" /usr/local/bin/nfuse
   [[ -f "$ENVIRONMENT_TRANSACTION_JOURNAL" ]]
   validate_environment_transaction
@@ -3047,6 +3317,10 @@ fi
   [[ -f "$ENVIRONMENT_TRANSACTION_JOURNAL" ]]
   recover_environment_transaction
   [[ ! -e "$ENVIRONMENT_TRANSACTION_JOURNAL" && ! -e "$SB_SYSTEM_ROOT/usr/local/bin/nfuse" ]]
+  if { printf x >&8; } 2>/dev/null; then
+    echo 'successful environment recovery should close fd 8' >&2
+    exit 1
+  fi
   grep -Fxq before "$SB_SYSTEM_ROOT/etc/sb-user-manager.conf"
   jq -e '.marker == "before"' "$SB_SYSTEM_ROOT/etc/sing-box/config.json" >/dev/null
   grep -Fxq old-sing-box "$SB_SYSTEM_ROOT/usr/local/bin/sing-box"

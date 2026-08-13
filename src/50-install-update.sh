@@ -1841,16 +1841,22 @@ deploy_environment() {
   local fresh="$1" update_manager="${2:-false}" iface work backup path deployed_state_file
   local -a deploy_created=()
   local deploy_created_count=0
-  ensure_safe_ssh_for_singbox_restart || return 0
-  ensure_deploy_loopback_ready || return 1
-  validate_manager_shortcut_path ||
+  if ! acquire_operation_lock; then
+    log "错误：$OPERATION_LOCK_ERROR"
+    return 1
+  fi
+  ensure_safe_ssh_for_singbox_restart || { release_operation_lock; return 0; }
+  ensure_deploy_loopback_ready || { release_operation_lock; return 1; }
+  validate_manager_shortcut_path || {
+    release_operation_lock
     die "检测到 /usr/local/bin/sbm 已被其他文件或链接占用；为避免覆盖现有程序，本次操作已停止"
-  [[ "$(uname -m)" == x86_64 ]] || die "仅支持 x86_64 Linux"
-  iface="$(default_network_interface)"
-  [[ -n "$iface" ]] || die "无法识别默认网络接口"
-  work="$(mktemp -d /tmp/sb-user-manager.XXXXXX)"
-  register_temp_path "$work"
-  create_environment_backup
+  }
+  [[ "$(uname -m)" == x86_64 ]] || { release_operation_lock; die "仅支持 x86_64 Linux"; }
+  iface="$(default_network_interface)" || { release_operation_lock; die "无法识别默认网络接口"; }
+  [[ -n "$iface" ]] || { release_operation_lock; die "无法识别默认网络接口"; }
+  work="$(mktemp -d /tmp/sb-user-manager.XXXXXX)" || { release_operation_lock; return 1; }
+  register_temp_path "$work" || { rm -rf -- "$work"; release_operation_lock; return 1; }
+  create_environment_backup || { rm -rf -- "$work"; release_operation_lock; return 1; }
   backup="$ENV_BACKUP"
   rollback_deploy() {
     local rc="${1:-$?}"
@@ -1867,10 +1873,9 @@ deploy_environment() {
       rm -rf /var/lib/sb-user-manager
     fi
     restore_failed_environment_change 部署 "$backup" "$work"
+    release_operation_lock
     return "$rc"
   }
-  trap rollback_deploy ERR
-  set_signal_rollback rollback_deploy
   for path in \
     "$CONF_FILE" \
     /etc/sing-box \
@@ -1900,8 +1905,13 @@ deploy_environment() {
       ((deploy_created_count+=1))
     fi
   done
-  run_step_or_rollback rollback_deploy begin_environment_transaction \
-    "deploy-environment" "$backup" "${deploy_created[@]}" || return 1
+  if ! begin_environment_transaction "deploy-environment" "$backup" "${deploy_created[@]}"; then
+    rm -rf -- "$work"
+    release_operation_lock
+    return 1
+  fi
+  trap rollback_deploy ERR
+  set_signal_rollback rollback_deploy
   run_step_or_rollback rollback_deploy download_binaries "$work" || return 1
   run_step_or_rollback rollback_deploy install -d -m 700 \
     /etc/sing-box /etc/sing-box/backups /etc/sing-box/cert /var/lib/nfuse /usr/local/sbin || return 1
@@ -1938,28 +1948,42 @@ deploy_environment() {
   if [[ "$update_manager" == true ]]; then
     sync_manager_launch_copy /usr/local/sbin/sb-user-manager
   fi
+  release_operation_lock
   log "部署完成；备份位于 $backup"
 }
 
 takeover_existing_environment() {
   local iface work normalized tmp nfuse_compatible=false path existing_singbox_bin
   local -a takeover_created=()
-  ensure_safe_ssh_for_singbox_restart || return 0
-  validate_manager_shortcut_path ||
+  if ! acquire_operation_lock; then
+    log "错误：$OPERATION_LOCK_ERROR"
+    return 1
+  fi
+  ensure_safe_ssh_for_singbox_restart || { release_operation_lock; return 0; }
+  validate_manager_shortcut_path || {
+    release_operation_lock
     die "检测到 /usr/local/bin/sbm 已被其他文件或链接占用；为避免覆盖现有程序，本次操作已停止"
+  }
   existing_singbox_bin="$(command -v sing-box 2>/dev/null || true)"
-  [[ -f /etc/sing-box/config.json && -n "$existing_singbox_bin" && -x "$existing_singbox_bin" ]] ||
+  [[ -f /etc/sing-box/config.json && -n "$existing_singbox_bin" && -x "$existing_singbox_bin" ]] || {
+    release_operation_lock
     die "保留配置接管要求现有 sing-box 配置和 PATH 中可执行的 sing-box 均存在"
-  "$existing_singbox_bin" check -c /etc/sing-box/config.json || die "现有 sing-box 配置校验失败，拒绝接管"
+  }
+  "$existing_singbox_bin" check -c /etc/sing-box/config.json || {
+    release_operation_lock
+    die "现有 sing-box 配置校验失败，拒绝接管"
+  }
   if [[ -f /etc/systemd/system/nfuse.service ]]; then
     if grep -Fq -- '--db /var/lib/nfuse/nfuse.db' /etc/systemd/system/nfuse.service &&
        grep -Fq -- '--socket /run/nfuse.sock' /etc/systemd/system/nfuse.service; then nfuse_compatible=true
-    else die "现有流量统计服务使用了特殊存储或通信位置，脚本无法安全接管；请选择备份后重新安装"
+    else
+      release_operation_lock
+      die "现有流量统计服务使用了特殊存储或通信位置，脚本无法安全接管；请选择备份后重新安装"
     fi
   fi
-  iface="$(default_network_interface)"
-  [[ -n "$iface" ]] || die "无法识别默认网络接口"
-  create_environment_backup
+  iface="$(default_network_interface)" || { release_operation_lock; die "无法识别默认网络接口"; }
+  [[ -n "$iface" ]] || { release_operation_lock; die "无法识别默认网络接口"; }
+  create_environment_backup || { release_operation_lock; return 1; }
   for path in \
     /etc/sb-user-manager.conf \
     /etc/sing-box/managed-users.json \
@@ -1974,20 +1998,24 @@ takeover_existing_environment() {
     /etc/sing-box/cert/anytls.key; do
     [[ -e "$path" || -L "$path" ]] || takeover_created+=("$path")
   done
-  work="$(mktemp -d /tmp/sb-user-manager.takeover.XXXXXX)"
-  register_temp_path "$work"
+  work="$(mktemp -d /tmp/sb-user-manager.takeover.XXXXXX)" || { release_operation_lock; return 1; }
+  register_temp_path "$work" || { rm -rf -- "$work"; release_operation_lock; return 1; }
   rollback_takeover() {
     local rc="${1:-$?}"
     trap - ERR
     clear_signal_rollback
     for path in "${takeover_created[@]}"; do rm -f -- "$path" || true; done
     restore_failed_environment_change 接管 "$ENV_BACKUP" "$work"
+    release_operation_lock
     return "$rc"
   }
+  if ! begin_environment_transaction "takeover-environment" "$ENV_BACKUP" "${takeover_created[@]}"; then
+    rm -rf -- "$work"
+    release_operation_lock
+    return 1
+  fi
   trap rollback_takeover ERR
   set_signal_rollback rollback_takeover
-  run_step_or_rollback rollback_takeover begin_environment_transaction \
-    "takeover-environment" "$ENV_BACKUP" "${takeover_created[@]}" || return 1
   run_step_or_rollback rollback_takeover fetch_latest_releases false || return 1
   run_step_or_rollback rollback_takeover download_binaries "$work" || return 1
   if normalized="$(mktemp /etc/sing-box/.takeover-normalized.XXXXXX)"; then :; else
@@ -2042,6 +2070,7 @@ takeover_existing_environment() {
   run_step_or_rollback rollback_takeover write_deployed_versions "$SCRIPT_VERSION" || return 1
   run_step_or_rollback rollback_takeover activate_managed_services || return 1
   run_step_or_rollback rollback_takeover complete_environment_change "$work" || return 1
+  release_operation_lock
   log "现有环境已在保留 sing-box 配置的前提下接管；原环境备份：$ENV_BACKUP"
   log "原有节点和路由会继续保留，但不会自动出现在本脚本的用户或分流列表中"
 }
@@ -2196,7 +2225,7 @@ EOF
 }
 
 cleanup_internal_material_after_uninstall() {
-  local base data path name operation_lock failed=false
+  local base data path name failed=false
   base="${ENVIRONMENT_BACKUP_BASE:-/root/sb-user-manager-backups}"
   data="$(migration_backup_dir)"
   if [[ -d "$base" && ! -L "$base" ]]; then
@@ -2220,8 +2249,7 @@ cleanup_internal_material_after_uninstall() {
     else rm -f -- "$path" || failed=true
     fi
   fi
-  operation_lock="${LOCK_FILE:-$(system_path /run/lock/sb-user-manager.lock)}"
-  rm -f -- "$ENVIRONMENT_LOCK_FILE" "$operation_lock" 2>/dev/null || failed=true
+  # 两个锁文件都保持在原位；删除仍被进程持有的锁会让另一进程创建新 inode 并绕过互斥。
   [[ "$failed" == false ]]
 }
 
@@ -2229,9 +2257,15 @@ uninstall_managed_environment() {
   local work backup candidate="" cleanup_failed=false migration_dir
   local -a uninstall_paths=()
   local uninstall_path_count=0 path installed self
-  ensure_safe_ssh_for_complete_uninstall || return 0
-  [[ ! -e "$ENVIRONMENT_TRANSACTION_JOURNAL" && ! -L "$ENVIRONMENT_TRANSACTION_JOURNAL" ]] ||
+  if ! acquire_operation_lock; then
+    log "错误：$OPERATION_LOCK_ERROR"
+    return 1
+  fi
+  ensure_safe_ssh_for_complete_uninstall || { release_operation_lock; return 0; }
+  [[ ! -e "$ENVIRONMENT_TRANSACTION_JOURNAL" && ! -L "$ENVIRONMENT_TRANSACTION_JOURNAL" ]] || {
+    release_operation_lock
     die "检测到尚未完成的环境操作，请重新运行脚本让它先自动恢复"
+  }
   installed="$(readlink -f -- /usr/local/sbin/sb-user-manager 2>/dev/null || printf '%s' /usr/local/sbin/sb-user-manager)"
   self="$(readlink -f -- "$SELF_PATH" 2>/dev/null || printf '%s' "$SELF_PATH")"
   if [[ "$self" != "$installed" && -f "$self" && ! -L "$self" &&
@@ -2242,9 +2276,9 @@ uninstall_managed_environment() {
     uninstall_paths[uninstall_path_count]="$path"
     ((uninstall_path_count+=1))
   done < <(managed_uninstall_paths)
-  work="$(mktemp -d /tmp/sb-user-manager-uninstall.XXXXXX)"
-  register_temp_path "$work"
-  create_environment_backup
+  work="$(mktemp -d /tmp/sb-user-manager-uninstall.XXXXXX)" || { release_operation_lock; return 1; }
+  register_temp_path "$work" || { rm -rf -- "$work"; release_operation_lock; return 1; }
+  create_environment_backup || { rm -rf -- "$work"; release_operation_lock; return 1; }
   backup="$ENV_BACKUP"
 
   rollback_uninstall() {
@@ -2267,13 +2301,17 @@ uninstall_managed_environment() {
       log "严重错误：自动恢复失败，请保留完整备份并停止继续操作：$backup"
     fi
     rm -rf -- "$work"
+    release_operation_lock
     return "$rollback_rc"
   }
 
+  if ! begin_environment_transaction "uninstall-environment" "$backup" "${uninstall_paths[@]}"; then
+    rm -rf -- "$work"
+    release_operation_lock
+    return 1
+  fi
   trap rollback_uninstall ERR
   set_signal_rollback rollback_uninstall
-  run_step_or_rollback rollback_uninstall begin_environment_transaction \
-    "uninstall-environment" "$backup" "${uninstall_paths[@]}" || return 1
   run_step_or_rollback rollback_uninstall stop_managed_services_for_uninstall || return 1
   run_step_or_rollback rollback_uninstall remove_managed_uninstall_paths || return 1
   if [[ -z "${SB_SYSTEM_ROOT:-}" ]]; then
@@ -2305,6 +2343,7 @@ uninstall_managed_environment() {
     printf '提示：少量非运行文件未能自动清理，不影响卸载结果；服务器上已经没有本项目服务在运行。\n'
   fi
   printf 'Debian 共用工具和无法确认归属的 root 文件没有删除。\n'
+  release_operation_lock
   exit 0
 }
 
@@ -2384,8 +2423,12 @@ check_updates() {
   environment_is_deployed || { echo "检测结果：尚未安装，请先选择「安装或修复环境」。"; return 0; }
   load_runtime_config
   need_cmd curl; need_cmd jq
+  if ! acquire_operation_lock; then
+    echo "错误：$OPERATION_LOCK_ERROR"
+    return 1
+  fi
   echo "正在查询稳定版更新…"
-  fetch_latest_releases true
+  fetch_latest_releases true || { release_operation_lock; return 1; }
   current_singbox="$(installed_singbox_version)"; current_nfuse="$(installed_nfuse_version)"
   current_manager="$(installed_manager_version)"
   current_channel="$(current_singbox_channel)"
@@ -2426,10 +2469,20 @@ check_updates() {
     if [[ "$current_channel" == preview ]]; then printf '\n其余组件已经是最新版本。\n'
     else printf '\n当前环境已经是最新版本。\n'
     fi
+    release_operation_lock
     return 0
   fi
-  read -r -p $'\n检测到可更新内容，是否现在更新？[y/N]：' answer
-  [[ "$answer" =~ ^[Yy]$ ]] || { echo "已取消更新。"; return 0; }
+  read -r -p $'\n检测到可更新内容，是否现在更新？[y/N]：' answer || {
+    release_operation_lock
+    return 1
+  }
+  if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+    echo "已取消更新。"
+    release_operation_lock
+    return 0
+  fi
+  # deploy_environment 会重新取锁；先释放，避免重开 fd 9 时短暂丢失原有 flock。
+  release_operation_lock
   deploy_environment false "$update_manager" || return 1
   if [[ "$update_manager" == true ]]; then
     printf '\n管理脚本已更新到 %s，正在切换到新进程。\n' "$LATEST_MANAGER_VERSION"

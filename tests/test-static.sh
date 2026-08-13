@@ -318,6 +318,15 @@ grep -Fq 'run_step_or_rollback()' sb-user-manager.sh
 grep -Fq 'run_managed_step()' sb-user-manager.sh
 grep -Fq 'begin_environment_transaction()' sb-user-manager.sh
 grep -Fq 'recover_environment_transaction()' sb-user-manager.sh
+grep -Fq 'acquire_operation_lock()' sb-user-manager.sh
+[[ "$(grep -Fc 'if ! acquire_operation_lock; then' sb-user-manager.sh)" == 4 ]]
+grep -Fq '发现尚未完成的环境操作。为保护现有数据，本次用户或分流操作已停止' sb-user-manager.sh
+grep -Fq '发现尚未完成的用户或分流操作。为保护现有数据，本次环境操作已停止' sb-user-manager.sh
+if awk '/^cleanup_internal_material_after_uninstall\(\) \{/{inside=1} inside{print} inside && /^}/{exit}' \
+    sb-user-manager.sh | grep -Eq 'rm .*\$(ENVIRONMENT_LOCK_FILE|LOCK_FILE)|operation_lock'; then
+  echo 'complete uninstall must not unlink persistent lock files' >&2
+  exit 1
+fi
 grep -Fq 'migrate_backup_retention_once()' sb-user-manager.sh
 [[ "$(grep -Fc 'migrate_backup_retention_once' sb-user-manager.sh)" == 2 ]]
 grep -Fq 'SB_BACKUP_RETENTION_MIGRATION_MARKER' sb-user-manager.sh

@@ -748,8 +748,12 @@ begin_operation_transaction() {
     ((ACTIVE_TRANSACTION_DEPTH+=1))
     return 0
   fi
-  if [[ -e "$TRANSACTION_JOURNAL" ]]; then
+  if [[ -e "$TRANSACTION_JOURNAL" || -L "$TRANSACTION_JOURNAL" ]]; then
     printf '错误：发现上次未完成的操作，而且尚未恢复。为保护现有数据，本次操作已停止。恢复记录：%s\n' "$TRANSACTION_JOURNAL" >&2
+    return 1
+  fi
+  if [[ -e "$ENVIRONMENT_TRANSACTION_JOURNAL" || -L "$ENVIRONMENT_TRANSACTION_JOURNAL" ]]; then
+    printf '错误：发现尚未完成的环境操作。为保护现有数据，本次用户或分流操作已停止。恢复记录：%s\n' "$ENVIRONMENT_TRANSACTION_JOURNAL" >&2
     return 1
   fi
   install -d -m 700 "$TRANSACTION_DIR" "$BACKUP_DIR" || return 1
@@ -949,12 +953,21 @@ release_environment_lock() {
 }
 
 begin_environment_transaction() {
-  local operation="$1" snapshot="$2" tmp path
+  local operation="$1" snapshot="$2" tmp path operation_journal
   shift 2
+  operation_journal="${TRANSACTION_JOURNAL:-$(system_path /var/lib/sb-user-manager/transactions/active.json)}" || return 1
   install -d -m 755 "$(dirname "$ENVIRONMENT_LOCK_FILE")" || return 1
   exec 8>"$ENVIRONMENT_LOCK_FILE"
   flock -n 8 || { release_environment_lock; return 1; }
-  [[ ! -e "$ENVIRONMENT_TRANSACTION_JOURNAL" ]] || { release_environment_lock; return 1; }
+  [[ ! -e "$ENVIRONMENT_TRANSACTION_JOURNAL" && ! -L "$ENVIRONMENT_TRANSACTION_JOURNAL" ]] || {
+    release_environment_lock
+    return 1
+  }
+  if [[ -e "$operation_journal" || -L "$operation_journal" ]]; then
+    printf '错误：发现尚未完成的用户或分流操作。为保护现有数据，本次环境操作已停止。恢复记录：%s\n' "$operation_journal" >&2
+    release_environment_lock
+    return 1
+  fi
   verify_environment_backup "$snapshot" || { release_environment_lock; return 1; }
   for path in "$@"; do is_environment_recovery_path "$path" || { release_environment_lock; return 1; }; done
   install -d -m 700 "$(dirname "$ENVIRONMENT_TRANSACTION_JOURNAL")" || { release_environment_lock; return 1; }
