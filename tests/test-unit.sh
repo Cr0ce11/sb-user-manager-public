@@ -2861,6 +2861,78 @@ EOF
   jq -e '.protocol == "shadowsocks" and .server == "keep.example.com" and .server_port == 443 and .method == "aes-256-gcm" and .password == "keep-secret"' <<<"$PROMPTED_SPLIT_UPSTREAM" >/dev/null
 )
 
+# 分流标签收集必须保持旧标签、运行标签、稳定摘要以及 jq unique 的字典序语义。
+(
+  STATE_FILE="$work/managed-split-tags-golden.json"
+  printf '%s\n' '{"splits":[
+    {"name":"alpha","rule_preset":"AI","outbound_preset":"Hinet","rule_set_tag":"z-rule","outbound_tag":"z-out"},
+    {"name":"beta","rule_preset":"AI","outbound_preset":"Hinet","rule_set_tag":"a-rule","outbound_tag":"a-out"},
+    {"name":"gamma","runtime_rule_tag":"explicit-rule","runtime_outbound_tag":"explicit-out","runtime_transport_tag":"explicit-transport","rule_set_tag":"gamma-rule","outbound_tag":"gamma-out"}
+  ]}' > "$STATE_FILE"
+  expected='{"rule_tags":["a-rule","explicit-rule","gamma-rule","mpr-f052daa870ac655071c548ad","z-rule"],"out_tags":["a-out","explicit-out","gamma-out","mpo-4d35dfa55179af04d424f1ab","z-out"],"transport_tags":["explicit-transport","managed-transport-alpha","managed-transport-beta","managed-transport-gamma","mpt-ced47d379049ed35b7fabc43"]}'
+  [[ "$(collect_managed_split_tags)" == "$expected" ]]
+  printf '%s\n' '{"splits":[]}' > "$STATE_FILE"
+  [[ "$(collect_managed_split_tags)" == '{"rule_tags":[],"out_tags":[],"transport_tags":[]}' ]]
+)
+
+# 异常分隔符和 Unicode 预置也必须与原有 shell 路径逐字节一致；缺少 Python 时安全回退。
+(
+  STATE_FILE="$work/managed-split-tags-edge.json"
+  printf '%s\n' '{"splits":[
+    {"name":"pipe-name","rule_preset":"规则|集","outbound_preset":"出口|一","rule_set_tag":"legacy|rule","outbound_tag":"legacy|out"}
+  ]}' > "$STATE_FILE"
+  expected="$(collect_managed_split_tags_with_shell_tools)"
+  [[ "$(collect_managed_split_tags)" == "$expected" ]]
+  printf '%s\n' '{"splits":[
+    {"name":"numeric-preset","rule_preset":1e6,"outbound_preset":1e6,"rule_set_tag":"numeric-rule","outbound_tag":"numeric-out"}
+  ]}' > "$STATE_FILE"
+  expected="$(collect_managed_split_tags_with_shell_tools)"
+  [[ "$(collect_managed_split_tags)" == "$expected" ]]
+  command() {
+    if [[ "${1:-}" == "-v" && "${2:-}" == "python3" ]]; then
+      return 1
+    fi
+    builtin command "$@"
+  }
+  [[ "$(collect_managed_split_tags)" == "$expected" ]]
+)
+
+# 20 条旧分流共享 4 个规则预置和 3 个出口预置时，标签收集固定为一次 Python，且不再逐条启动 jq/sha256sum/awk。
+(
+  STATE_FILE="$work/managed-split-tags-count.json"
+  jq -n '{
+    splits:[range(0; 20) as $index | {
+      name:("split-" + ($index | tostring)),
+      rule_preset:("rule-" + (($index % 4) | tostring)),
+      outbound_preset:("out-" + (($index % 3) | tostring)),
+      rule_set_tag:("legacy-rule-" + ($index | tostring)),
+      outbound_tag:("legacy-out-" + ($index | tostring))
+    }]
+  }' > "$STATE_FILE"
+  jq_calls="$work/managed-split-tags-jq.calls"
+  python_calls="$work/managed-split-tags-python.calls"
+  sha_calls="$work/managed-split-tags-sha.calls"
+  awk_calls="$work/managed-split-tags-awk.calls"
+  : > "$jq_calls"
+  : > "$python_calls"
+  jq() { printf 'jq\n' >> "$jq_calls"; command jq "$@"; }
+  python3() { printf 'python3\n' >> "$python_calls"; command python3 "$@"; }
+  sha256sum() { printf 'sha256sum\n' >> "$sha_calls"; command sha256sum "$@"; }
+  awk() { printf 'awk\n' >> "$awk_calls"; command awk "$@"; }
+  tags="$(collect_managed_split_tags)"
+  [[ ! -s "$jq_calls" ]]
+  [[ "$(wc -l < "$python_calls" | tr -d ' ')" == 1 ]]
+  [[ ! -e "$sha_calls" && ! -e "$awk_calls" ]]
+  jq -e '
+    (.rule_tags | length) == 24 and
+    (.out_tags | length) == 23 and
+    (.transport_tags | length) == 23 and
+    (.rule_tags == (.rule_tags | sort | unique)) and
+    (.out_tags == (.out_tags | sort | unique)) and
+    (.transport_tags == (.transport_tags | sort | unique))
+  ' <<<"$tags" >/dev/null
+)
+
 (
   STATE_FILE="$work/split-maintenance-state.json"
   SINGBOX_CONFIG="$work/split-maintenance-config.json"

@@ -5528,7 +5528,7 @@ apply_split_config() {
   ' --arg tag "$tag" --arg out_tag "$out_tag" --arg url "$url" --arg format "$format" --arg scope "$scope" --argjson inbounds "$inbounds"
 }
 
-collect_managed_split_tags() {
+collect_managed_split_tags_with_shell_tools() {
   local split rows rule_tags='[]' out_tags='[]' transport_tags='[]' tag stored
   rows="$(jq -c '.splits[]' "$STATE_FILE")" || return 1
   while IFS= read -r split; do
@@ -5545,6 +5545,90 @@ collect_managed_split_tags() {
   done <<<"$rows"
   jq -cn --argjson rules "$rule_tags" --argjson outbounds "$out_tags" --argjson transports "$transport_tags" \
     '{rule_tags:$rules,out_tags:$outbounds,transport_tags:$transports}'
+}
+
+collect_managed_split_tags() {
+  local fast_rc
+  if ! command -v python3 >/dev/null 2>&1; then
+    collect_managed_split_tags_with_shell_tools
+    return
+  fi
+  if python3 - "$STATE_FILE" <<'PY'
+import hashlib
+import json
+import sys
+
+prefixes = {
+    "rule": "mpr-",
+    "outbound": "mpo-",
+    "transport": "mpt-",
+}
+
+
+class ShellFallbackRequired(Exception):
+    pass
+
+
+def stable_tag(kind, name):
+    digest = hashlib.sha256(f"{kind}:{name}".encode("utf-8")).hexdigest()[:24]
+    return prefixes[kind] + digest
+
+
+def optional_text(split, key, default=""):
+    value = split.get(key)
+    if value is None or value is False:
+        return default
+    if not isinstance(value, str):
+        raise ShellFallbackRequired
+    return value
+
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as state_file:
+        state = json.load(state_file)
+    if not isinstance(state, dict):
+        raise ValueError("state must be an object")
+    splits = state.get("splits")
+    if not isinstance(splits, list):
+        raise ValueError("splits must be an array")
+    rule_tags = set()
+    out_tags = set()
+    transport_tags = set()
+    for split in splits:
+        if not isinstance(split, dict) or not isinstance(split.get("name"), str):
+            raise ShellFallbackRequired
+        name = split["name"]
+        rule_preset = optional_text(split, "rule_preset")
+        outbound_preset = optional_text(split, "outbound_preset")
+        stored_rule = optional_text(split, "rule_set_tag", "managed-split-" + name)
+        stored_out = optional_text(split, "outbound_tag", "managed-out-" + name)
+        stored_transport = "managed-transport-" + name
+        runtime_rule = optional_text(split, "runtime_rule_tag")
+        runtime_out = optional_text(split, "runtime_outbound_tag")
+        runtime_transport = optional_text(split, "runtime_transport_tag")
+        rule_tags.update((runtime_rule or (stable_tag("rule", rule_preset) if rule_preset else stored_rule), stored_rule))
+        out_tags.update((runtime_out or (stable_tag("outbound", outbound_preset) if outbound_preset else stored_out), stored_out))
+        transport_tags.update((runtime_transport or (stable_tag("transport", outbound_preset) if outbound_preset else stored_transport), stored_transport))
+    print(json.dumps({
+        "rule_tags": sorted(rule_tags),
+        "out_tags": sorted(out_tags),
+        "transport_tags": sorted(transport_tags),
+    }, ensure_ascii=False, separators=(",", ":")))
+except ShellFallbackRequired:
+    sys.exit(75)
+except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+    sys.exit(1)
+PY
+  then
+    return 0
+  else
+    fast_rc=$?
+  fi
+  if [[ "$fast_rc" == 75 ]]; then
+    collect_managed_split_tags_with_shell_tools
+    return
+  fi
+  return "$fast_rc"
 }
 
 collect_legacy_split_cleanup_plan_from_config() {
