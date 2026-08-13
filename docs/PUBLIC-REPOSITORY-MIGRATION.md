@@ -4,7 +4,7 @@
 
 ## 最终结果（2026-08-13）
 
-- `DTB201/sb-user-manager-public` 由经过审计的干净历史建立，采用 MIT License；当前正式版为不可变 [v4.25.4 Release](https://github.com/DTB201/sb-user-manager-public/releases/tag/v4.25.4)。
+- `DTB201/sb-user-manager-public` 由经过审计的干净历史建立，采用 MIT License；当前正式版为不可变 [v4.25.5 Release](https://github.com/DTB201/sb-user-manager-public/releases/tag/v4.25.5)。
 - 公开仓库独立承担源码、Issue、Pull Request、确定性构建、完整 CI、匿名在线更新、私密安全报告和不可变 Release。
 - `main` 要求 Pull Request、`validate`、`jq16-compat`、`debian-standalone-e2e`、对话解决和线性历史，禁止强推、删除及管理员绕过。
 - 原私有版和分享版停止发布，原私有仓库永久退役；公开仓库保持现名，避免破坏现有公开客户端更新地址。
