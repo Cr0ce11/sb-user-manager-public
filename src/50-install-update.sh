@@ -1291,13 +1291,13 @@ ensure_manager_shortcut_for_interactive_startup() {
   [[ -x "$installed" ]] || return 0
   if ! validate_manager_shortcut_path; then
     log "提示：/usr/local/bin/sbm 已被其他文件或链接占用，脚本没有覆盖它；完整命令 sb-user-manager 仍可正常使用"
-    pause
+    pause_menu
     return 0
   fi
   [[ -e "$shortcut" || -L "$shortcut" ]] && return 0
   if ! install_manager_shortcut; then
     log "警告：未能自动创建 sbm 快捷入口；完整命令 sb-user-manager 仍可正常使用"
-    pause
+    pause_menu
   fi
 }
 
