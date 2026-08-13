@@ -307,6 +307,22 @@ register_temp_path() {
   ((RUNTIME_TEMP_PATH_COUNT+=1))
 }
 
+unregister_temp_path() {
+  local path="$1" read_index write_index=0 registered
+  [[ -n "$path" ]] || die "拒绝取消登记空临时路径"
+  is_managed_temp_path "$path" || die "拒绝取消登记不受管临时路径：$path"
+  for ((read_index=0; read_index<RUNTIME_TEMP_PATH_COUNT; read_index++)); do
+    registered="${RUNTIME_TEMP_PATHS[$read_index]}"
+    [[ "$registered" == "$path" ]] && continue
+    RUNTIME_TEMP_PATHS[write_index]="$registered"
+    write_index=$((write_index + 1))
+  done
+  for ((read_index=write_index; read_index<RUNTIME_TEMP_PATH_COUNT; read_index++)); do
+    unset "RUNTIME_TEMP_PATHS[$read_index]"
+  done
+  RUNTIME_TEMP_PATH_COUNT="$write_index"
+}
+
 cleanup_runtime_temp_paths() {
   local i path
   [[ -z "$RUNTIME_TRAP_PID" || "${BASHPID:-$$}" == "$RUNTIME_TRAP_PID" ]] || return 0

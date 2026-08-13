@@ -138,6 +138,7 @@ rewrite_singbox_config() {
     return 1
   fi
   rm -f -- "$normalized"
+  unregister_temp_path "$normalized"
   if ! chmod --reference="$SINGBOX_CONFIG" "$tmp" 2>/dev/null; then
     if ! chmod 600 "$tmp"; then
       rm -f -- "$tmp"
@@ -149,6 +150,7 @@ rewrite_singbox_config() {
     rm -f -- "$tmp"
     return 1
   fi
+  unregister_temp_path "$tmp"
 }
 
 append_inbounds() {
