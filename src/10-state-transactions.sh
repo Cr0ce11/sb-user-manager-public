@@ -191,6 +191,7 @@ atomic_state_update() {
     rm -f -- "$tmp"
     return 1
   fi
+  unregister_temp_path "$tmp" || return 1
 }
 
 restore_state_backup_atomically() {
@@ -679,7 +680,8 @@ restore_backup() {
   fi
   rm -f -- "$previous_state"
   if [[ -n "$manager_tmp" ]]; then
-    if ! bash -n "$manager_tmp" || ! mv -- "$manager_tmp" "$CONF_FILE" || ! load_runtime_config; then
+    # 管理配置不作为 shell 脚本执行；文件属性和内容合法性由 load_runtime_config 的白名单解析验证。
+    if ! mv -- "$manager_tmp" "$CONF_FILE" || ! load_runtime_config; then
       rm -f -- "$manager_tmp"
       log "严重错误：无法从备份恢复管理配置"
       return 1

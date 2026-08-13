@@ -137,7 +137,8 @@ rewrite_singbox_config() {
     printf '错误：无法生成新的 sing-box 配置\n' >&2
     return 1
   fi
-  rm -f -- "$normalized"
+  rm -f -- "$normalized" || return 1
+  unregister_temp_path "$normalized" || return 1
   if ! chmod --reference="$SINGBOX_CONFIG" "$tmp" 2>/dev/null; then
     if ! chmod 600 "$tmp"; then
       rm -f -- "$tmp"
@@ -149,6 +150,7 @@ rewrite_singbox_config() {
     rm -f -- "$tmp"
     return 1
   fi
+  unregister_temp_path "$tmp" || return 1
 }
 
 append_inbounds() {

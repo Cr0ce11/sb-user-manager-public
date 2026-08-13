@@ -1198,11 +1198,12 @@ atomic_install_file() {
     ! actual_mode="$(manager_file_mode "$tmp")" ||
     [[ "$actual_mode" != "${mode#0}" ]] ||
     ! sync_transaction_path "$tmp" ||
-    ! mv -- "$tmp" "$target" ||
-    ! sync_transaction_path "$parent"; then
+    ! mv -- "$tmp" "$target"; then
     rm -f -- "$tmp" || true
     return 1
   fi
+  unregister_temp_path "$tmp" || return 1
+  sync_transaction_path "$parent" || return 1
 }
 
 download_binaries() {

@@ -307,6 +307,22 @@ register_temp_path() {
   ((RUNTIME_TEMP_PATH_COUNT+=1))
 }
 
+unregister_temp_path() {
+  local path="$1" read_index write_index=0 registered
+  [[ -n "$path" ]] || die "拒绝取消登记空临时路径"
+  is_managed_temp_path "$path" || die "拒绝取消登记不受管临时路径：$path"
+  for ((read_index=0; read_index<RUNTIME_TEMP_PATH_COUNT; read_index++)); do
+    registered="${RUNTIME_TEMP_PATHS[$read_index]}"
+    [[ "$registered" == "$path" ]] && continue
+    RUNTIME_TEMP_PATHS[write_index]="$registered"
+    write_index=$((write_index + 1))
+  done
+  for ((read_index=write_index; read_index<RUNTIME_TEMP_PATH_COUNT; read_index++)); do
+    unset "RUNTIME_TEMP_PATHS[$read_index]"
+  done
+  RUNTIME_TEMP_PATH_COUNT="$write_index"
+}
+
 cleanup_runtime_temp_paths() {
   local i path
   [[ -z "$RUNTIME_TRAP_PID" || "${BASHPID:-$$}" == "$RUNTIME_TRAP_PID" ]] || return 0
@@ -552,6 +568,7 @@ atomic_state_update() {
     rm -f -- "$tmp"
     return 1
   fi
+  unregister_temp_path "$tmp" || return 1
 }
 
 restore_state_backup_atomically() {
@@ -1040,7 +1057,8 @@ restore_backup() {
   fi
   rm -f -- "$previous_state"
   if [[ -n "$manager_tmp" ]]; then
-    if ! bash -n "$manager_tmp" || ! mv -- "$manager_tmp" "$CONF_FILE" || ! load_runtime_config; then
+    # 管理配置不作为 shell 脚本执行；文件属性和内容合法性由 load_runtime_config 的白名单解析验证。
+    if ! mv -- "$manager_tmp" "$CONF_FILE" || ! load_runtime_config; then
       rm -f -- "$manager_tmp"
       log "严重错误：无法从备份恢复管理配置"
       return 1
@@ -3563,7 +3581,8 @@ rewrite_singbox_config() {
     printf '错误：无法生成新的 sing-box 配置\n' >&2
     return 1
   fi
-  rm -f -- "$normalized"
+  rm -f -- "$normalized" || return 1
+  unregister_temp_path "$normalized" || return 1
   if ! chmod --reference="$SINGBOX_CONFIG" "$tmp" 2>/dev/null; then
     if ! chmod 600 "$tmp"; then
       rm -f -- "$tmp"
@@ -3575,6 +3594,7 @@ rewrite_singbox_config() {
     rm -f -- "$tmp"
     return 1
   fi
+  unregister_temp_path "$tmp" || return 1
 }
 
 append_inbounds() {
@@ -7329,11 +7349,12 @@ atomic_install_file() {
     ! actual_mode="$(manager_file_mode "$tmp")" ||
     [[ "$actual_mode" != "${mode#0}" ]] ||
     ! sync_transaction_path "$tmp" ||
-    ! mv -- "$tmp" "$target" ||
-    ! sync_transaction_path "$parent"; then
+    ! mv -- "$tmp" "$target"; then
     rm -f -- "$tmp" || true
     return 1
   fi
+  unregister_temp_path "$tmp" || return 1
+  sync_transaction_path "$parent" || return 1
 }
 
 download_binaries() {

@@ -894,6 +894,27 @@ register_temp_path "$first_runtime_temp"
 cleanup_runtime_temp_paths
 [[ ! -e "$first_runtime_temp" && "$RUNTIME_TEMP_PATH_COUNT" == 0 ]]
 
+# 成功移走的临时路径应立即取消登记；中间项移除后数组和手工计数仍保持紧凑一致。
+RUNTIME_TEMP_PATHS=()
+RUNTIME_TEMP_PATH_COUNT=0
+first_registered_temp="$(mktemp /tmp/sb-runtime-unregister-first.XXXXXX)"
+moved_registered_temp="$(mktemp /tmp/sb-runtime-unregister-moved.XXXXXX)"
+last_registered_temp="$(mktemp /tmp/sb-runtime-unregister-last.XXXXXX)"
+register_temp_path "$first_registered_temp"
+register_temp_path "$moved_registered_temp"
+register_temp_path "$last_registered_temp"
+moved_registered_destination="$work/runtime-unregistered-destination"
+mv -- "$moved_registered_temp" "$moved_registered_destination"
+unregister_temp_path "$moved_registered_temp"
+[[ "$RUNTIME_TEMP_PATH_COUNT" == 2 ]]
+[[ "${RUNTIME_TEMP_PATHS[0]}" == "$first_registered_temp" ]]
+[[ "${RUNTIME_TEMP_PATHS[1]}" == "$last_registered_temp" ]]
+unregister_temp_path "$moved_registered_temp"
+[[ "$RUNTIME_TEMP_PATH_COUNT" == 2 ]]
+cleanup_runtime_temp_paths
+[[ ! -e "$first_registered_temp" && ! -e "$last_registered_temp" ]]
+[[ -f "$moved_registered_destination" && "$RUNTIME_TEMP_PATH_COUNT" == 0 ]]
+
 runtime_temp="$(mktemp -d /tmp/sb-runtime-cleanup.XXXXXX)"
 RUNTIME_TRAP_PID="${BASHPID:-$$}"
 RUNTIME_TRAP_SUBSHELL="$BASH_SUBSHELL"
@@ -1174,8 +1195,11 @@ mkdir -p "$atomic_install_root"
 printf 'new executable\n' > "$atomic_install_source"
 printf 'old executable\n' > "$atomic_install_target"
 (
+  RUNTIME_TEMP_PATHS=()
+  RUNTIME_TEMP_PATH_COUNT=0
   sync_transaction_path() { printf '%s\n' "$1" >> "$atomic_install_sync_log"; }
   atomic_install_file "$atomic_install_source" "$atomic_install_target" 755
+  [[ "$RUNTIME_TEMP_PATH_COUNT" == 0 ]]
 )
 cmp -s "$atomic_install_source" "$atomic_install_target"
 [[ "$(manager_file_mode "$atomic_install_target")" == 755 ]]
@@ -3001,6 +3025,45 @@ grep -Fxq triggered "$rollback_marker"
 MOCK_SINGBOX_FORMAT_FAIL=false
 cmp -s "$SINGBOX_CONFIG" "$work/config.before-failure.json"
 rm -f "$rollback_marker"
+
+# 长交互会话中的成功原子写入不得持续累积已经移走或删除的临时路径。
+(
+  RUNTIME_TEMP_PATHS=()
+  RUNTIME_TEMP_PATH_COUNT=0
+  STATE_FILE="$work/temp-registry-state.json"
+  SINGBOX_CONFIG="$work/temp-registry-config.json"
+  SINGBOX_BIN=mock_singbox
+  printf '%s\n' '{"schema_version":7,"users":[],"splits":[],"outbound_presets":[],"rule_presets":[],"counter":0}' > "$STATE_FILE"
+  printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rules":[],"rule_set":[]}}' > "$SINGBOX_CONFIG"
+  for iteration in 1 2 3 4 5 6 7 8 9 10; do
+    atomic_state_update '.counter += 1'
+    rewrite_singbox_config '.'
+    [[ "$RUNTIME_TEMP_PATH_COUNT" == 0 ]]
+  done
+  [[ "$(jq -r '.counter' "$STATE_FILE")" == 10 ]]
+)
+
+# 格式化中间文件删除失败时必须保留登记并报告失败，交给统一退出清理重试。
+(
+  RUNTIME_TEMP_PATHS=()
+  RUNTIME_TEMP_PATH_COUNT=0
+  SINGBOX_CONFIG="$work/normalized-remove-failure-config.json"
+  SINGBOX_BIN=mock_singbox
+  printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rules":[],"rule_set":[]}}' > "$SINGBOX_CONFIG"
+  rm() {
+    [[ "${*: -1}" != *'/.normalized.'* ]] || return 77
+    command rm "$@"
+  }
+  if rewrite_singbox_config '.' >/dev/null 2>&1; then
+    echo 'config rewrite should fail when the normalized staging file cannot be removed' >&2
+    exit 1
+  fi
+  [[ "$RUNTIME_TEMP_PATH_COUNT" == 2 ]]
+  for registered_temp in "${RUNTIME_TEMP_PATHS[@]}"; do
+    command rm -f -- "$registered_temp"
+  done
+)
+
 set +e
 (
   trap 'printf "triggered\n" > "$rollback_marker"' ERR
@@ -3160,6 +3223,96 @@ fi
     exit 1
   fi
 )
+
+# 管理配置恢复由文件属性检查和白名单解析负责，不再把配置误当成 shell 脚本校验。
+(
+  BACKUP_DIR="$work/manager-config-restore-backups"
+  SINGBOX_CONFIG="$work/manager-config-restore-config.json"
+  STATE_FILE="$work/manager-config-restore-state.json"
+  CONF_FILE="$work/manager-config-restore.conf"
+  SINGBOX_BIN=restore_manager_mock_singbox
+  SINGBOX_SERVICE=sing-box
+  mkdir -p "$BACKUP_DIR"
+  printf '%s\n' '{"marker":"current-config"}' > "$SINGBOX_CONFIG"
+  printf '%s\n' '{"marker":"current-state"}' > "$STATE_FILE"
+  printf '%s\n' 'HANDSHAKE_PORT=443' > "$CONF_FILE"
+  chmod 600 "$CONF_FILE"
+  printf '%s\n' '{"marker":"backup-config"}' > "$BACKUP_DIR/config.json.manager-valid"
+  printf '%s\n' '{"marker":"backup-state"}' > "$BACKUP_DIR/managed-users.json.manager-valid"
+  printf '%s\n' 'HANDSHAKE_PORT=8443' 'ANYTLS_SNI="restore.example.com"' > "$BACKUP_DIR/sb-user-manager.conf.manager-valid"
+  chmod 600 "$BACKUP_DIR/sb-user-manager.conf.manager-valid"
+  restore_manager_mock_singbox() {
+    [[ "${1:-}" == check && "${2:-}" == -c ]] || return 1
+    jq -e 'type == "object"' "$3" >/dev/null
+  }
+  systemctl() { return 0; }
+  restore_backup manager-valid
+  [[ "$HANDSHAKE_PORT" == 8443 && "$ANYTLS_SNI" == restore.example.com ]]
+  grep -Fxq 'HANDSHAKE_PORT=8443' "$CONF_FILE"
+)
+
+(
+  BACKUP_DIR="$work/manager-config-reject-backups"
+  SINGBOX_CONFIG="$work/manager-config-reject-config.json"
+  STATE_FILE="$work/manager-config-reject-state.json"
+  CONF_FILE="$work/manager-config-reject.conf"
+  SINGBOX_BIN=restore_manager_reject_mock_singbox
+  SINGBOX_SERVICE=sing-box
+  command_marker="$work/manager-config-restore-command-ran"
+  mkdir -p "$BACKUP_DIR"
+  printf '%s\n' '{"marker":"current-config"}' > "$SINGBOX_CONFIG"
+  printf '%s\n' '{"marker":"current-state"}' > "$STATE_FILE"
+  printf '%s\n' 'HANDSHAKE_PORT=443' > "$CONF_FILE"
+  chmod 600 "$CONF_FILE"
+  printf '%s\n' '{"marker":"backup-config"}' > "$BACKUP_DIR/config.json.manager-invalid"
+  printf '%s\n' '{"marker":"backup-state"}' > "$BACKUP_DIR/managed-users.json.manager-invalid"
+  printf 'GITHUB_TOKEN="$(touch %s)"\n' "$command_marker" > "$BACKUP_DIR/sb-user-manager.conf.manager-invalid"
+  chmod 600 "$BACKUP_DIR/sb-user-manager.conf.manager-invalid"
+  restore_manager_reject_mock_singbox() {
+    [[ "${1:-}" == check && "${2:-}" == -c ]] || return 1
+    jq -e 'type == "object"' "$3" >/dev/null
+  }
+  systemctl() { return 0; }
+  restore_backup manager-invalid
+) >/dev/null 2>&1 && {
+  echo 'runtime config shell syntax should be rejected by the whitelist parser during restore' >&2
+  exit 1
+}
+[[ ! -e "$work/manager-config-restore-command-ran" ]]
+
+# 未知配置键也必须在真实恢复链中由白名单拒绝。
+(
+  BACKUP_DIR="$work/manager-config-unknown-backups"
+  SINGBOX_CONFIG="$work/manager-config-unknown-config.json"
+  STATE_FILE="$work/manager-config-unknown-state.json"
+  CONF_FILE="$work/manager-config-unknown.conf"
+  SINGBOX_BIN=restore_manager_unknown_mock_singbox
+  SINGBOX_SERVICE=sing-box
+  mkdir -p "$BACKUP_DIR"
+  printf '%s\n' '{"marker":"current-config"}' > "$SINGBOX_CONFIG"
+  printf '%s\n' '{"marker":"current-state"}' > "$STATE_FILE"
+  printf '%s\n' 'HANDSHAKE_PORT=443' > "$CONF_FILE"
+  chmod 600 "$CONF_FILE"
+  printf '%s\n' '{"marker":"backup-config"}' > "$BACKUP_DIR/config.json.manager-unknown"
+  printf '%s\n' '{"marker":"backup-state"}' > "$BACKUP_DIR/managed-users.json.manager-unknown"
+  printf '%s\n' 'UNEXPECTED_SETTING=value' > "$BACKUP_DIR/sb-user-manager.conf.manager-unknown"
+  chmod 600 "$BACKUP_DIR/sb-user-manager.conf.manager-unknown"
+  restore_manager_unknown_mock_singbox() {
+    [[ "${1:-}" == check && "${2:-}" == -c ]] || return 1
+    jq -e 'type == "object"' "$3" >/dev/null
+  }
+  systemctl() { return 0; }
+  restore_backup manager-unknown
+) >/dev/null 2>&1 && {
+  echo 'unknown runtime config settings should be rejected by the whitelist parser during restore' >&2
+  exit 1
+}
+
+restore_backup_body="$(declare -f restore_backup)"
+if grep -Fq 'bash -n "$manager_tmp"' <<<"$restore_backup_body"; then
+  echo 'restore_backup must not treat the runtime config as a shell script' >&2
+  exit 1
+fi
 
 (
   BACKUP_DIR="$work/durable-transaction-backups"
