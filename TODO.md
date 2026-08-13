@@ -36,6 +36,7 @@
 | REL-003 | P1 | 完成 | [Issue #194](https://github.com/DTB201/sb-user-manager/issues/194)、[PR #195](https://github.com/DTB201/sb-user-manager/pull/195) | 准备并发布 v4.22.9 数据安全与可靠性修复版本 | 版本、迭代记录和长期状态文档一致；本地门禁、GitHub CI、标签 CI、四个 Release 附件独立复核和不可变保护全部通过；未登录或修改服务器 |
 | REL-004 | P1 | 完成 | [Issue #242](https://github.com/DTB201/sb-user-manager/issues/242)、[PR #243](https://github.com/DTB201/sb-user-manager/pull/243) | 准备并发布 v4.23.0 休眠态 v5 安全基础版本 | 版本、迭代记录和长期状态文档一致；本地门禁、PR、main 与标签 CI、四个 Release 附件摘要和不可变保护全部通过；未登录或修改服务器 |
 | REL-005 | P1 | 完成 | [公开 Issue #22](https://github.com/DTB201/sb-user-manager-public/issues/22)、[公开 PR #23](https://github.com/DTB201/sb-user-manager-public/pull/23) | 准备并发布 v4.25.3 续期修复版本 | 版本、迭代记录、本地门禁、PR、main 与标签 CI、两个 Release 附件摘要和不可变保护全部通过；未登录或修改服务器 |
+| REL-006 | P1 | 进行中 | [公开 Issue #28](https://github.com/DTB201/sb-user-manager-public/issues/28) | 准备并发布 v4.25.4 纯 v4 维护版本 | 待版本、生成物、本地门禁、PR、main 与标签 CI、两个 Release 附件摘要和不可变保护全部通过；不登录或修改服务器 |
 | UX-001 | P2 | 完成 | [Issue #65](https://github.com/DTB201/sb-user-manager/issues/65) | 修正子菜单返回文案 | 返回项显示“返回上一级”，实际返回层级和提示词通过真实伪终端测试 |
 | SEC-002 | P2 | 完成 | [Issue #66](https://github.com/DTB201/sb-user-manager/issues/66) | 收紧完整快照最外层目录权限 | 新建快照最外层、数据目录和清单权限符合最小访问原则，恢复兼容性不变 |
 | SEC-003 | P2 | 完成 | [Issue #78](https://github.com/DTB201/sb-user-manager/issues/78) | 自动迁移历史完整快照权限 | 启动时只收紧有效历史快照权限，无关目录和符号链接不受影响，重复执行安全，实机验收通过 |
