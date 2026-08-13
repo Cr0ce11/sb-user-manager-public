@@ -39,6 +39,7 @@
 | REL-005 | P1 | 完成 | [公开 Issue #22](https://github.com/DTB201/sb-user-manager-public/issues/22)、[公开 PR #23](https://github.com/DTB201/sb-user-manager-public/pull/23) | 准备并发布 v4.25.3 续期修复版本 | 版本、迭代记录、本地门禁、PR、main 与标签 CI、两个 Release 附件摘要和不可变保护全部通过；未登录或修改服务器 |
 | REL-006 | P1 | 完成 | [公开 Issue #28](https://github.com/DTB201/sb-user-manager-public/issues/28)、[公开 PR #29](https://github.com/DTB201/sb-user-manager-public/pull/29) | 准备并发布 v4.25.4 纯 v4 维护版本 | 版本、生成物、本地门禁、PR、main 与标签 CI、两个 Release 附件摘要和不可变保护全部通过；未登录或修改服务器 |
 | REL-007 | P1 | 完成 | [公开 Issue #33](https://github.com/DTB201/sb-user-manager-public/issues/33)、[公开 PR #34](https://github.com/DTB201/sb-user-manager-public/pull/34) | 准备并发布 v4.25.5 用户有效期调整版本 | 版本、生成物、本地门禁、PR、main 与标签 CI、两个 Release 附件摘要和不可变保护全部通过；未登录或修改服务器 |
+| REL-008 | P1 | 进行中 | [公开 Issue #57](https://github.com/DTB201/sb-user-manager-public/issues/57) | 准备并发布 v4.25.6 代码审计修复版本 | 待完成版本与生成物、本地门禁、PR、main、发布保护预检、标签 CI、两个 Release 附件摘要和不可变保护核验；不登录或修改服务器 |
 | UX-004 | P2 | 完成 | [公开 Issue #31](https://github.com/DTB201/sb-user-manager-public/issues/31)、[公开 PR #32](https://github.com/DTB201/sb-user-manager-public/pull/32) | 支持按月提前或延长用户有效期 | 正数行为兼容既有续期；负数预览确认、只调整有效期且不得落到当前或过去；生成物、本地门禁、PR 与主分支 CI 全部通过 |
 | UX-001 | P2 | 完成 | [Issue #65](https://github.com/DTB201/sb-user-manager/issues/65) | 修正子菜单返回文案 | 返回项显示“返回上一级”，实际返回层级和提示词通过真实伪终端测试 |
 | SEC-002 | P2 | 完成 | [Issue #66](https://github.com/DTB201/sb-user-manager/issues/66) | 收紧完整快照最外层目录权限 | 新建快照最外层、数据目录和清单权限符合最小访问原则，恢复兼容性不变 |
@@ -63,6 +64,6 @@
 
 ## 当前最值得继续的顺序
 
-1. 继续以真实使用中发现的 v4 缺陷驱动维护；[公开 Issue #16](https://github.com/DTB201/sb-user-manager-public/issues/16) 和 SEC-001 维持现有暂缓状态。
+1. 完成 [公开 Issue #57](https://github.com/DTB201/sb-user-manager-public/issues/57) 的 v4.25.6 发布；其后继续以真实使用中发现的 v4 缺陷驱动维护，[公开 Issue #16](https://github.com/DTB201/sb-user-manager-public/issues/16) 和 SEC-001 维持现有暂缓状态。
 
 任何需要登录服务器、修改 SSH、恢复数据或操作正式环境的事项必须独立执行，先记录回滚方式并取得明确授权。
