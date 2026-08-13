@@ -26,7 +26,7 @@
 从仓库根目录运行：
 
 ```bash
-bash -n sb-user-manager.sh tests/acceptance.sh tests/test-acceptance.sh tests/test-controller-state.sh tests/test-controller-role.sh tests/test-controller-role-repair.sh tests/test-controller-role-provision.sh tests/test-manager-role-detection.sh tests/test-manager-role-routing.sh tests/test-manager-handoff.sh tests/test-controller-landing-transport.sh tests/test-controller-landing-registration.sh tests/test-controller-landing-credentials.sh tests/test-controller-landing-onboarding.sh tests/test-controller-landing-onboarding-journal.sh tests/test-landing-apply-protocol.sh tests/test-landing-agent.sh tests/test-landing-channel-install.sh tests/test-landing-bootstrap.sh tests/test-landing-channel-e2e.sh tests/test-landing-startup-gate.sh tools/build-manager.sh tools/audit-public-readiness.sh tools/export-public-snapshot.sh tests/test-build.sh tests/test-public.sh tests/test-public-readiness.sh tests/test-public-snapshot.sh tests/test-release-workflow.sh
+bash -n sb-user-manager.sh tests/acceptance.sh tests/test-acceptance.sh tests/test-controller-state.sh tests/test-controller-role.sh tests/test-controller-role-repair.sh tests/test-controller-role-provision.sh tests/test-manager-role-detection.sh tests/test-standalone-startup.sh tests/test-manager-handoff.sh tests/test-controller-landing-transport.sh tests/test-controller-landing-registration.sh tests/test-controller-landing-credentials.sh tests/test-controller-landing-onboarding.sh tests/test-controller-landing-onboarding-journal.sh tests/test-landing-apply-protocol.sh tests/test-landing-agent.sh tests/test-landing-channel-install.sh tests/test-landing-bootstrap.sh tests/test-landing-channel-e2e.sh tests/test-landing-startup-gate.sh tools/build-manager.sh tools/audit-public-readiness.sh tools/export-public-snapshot.sh tests/test-build.sh tests/test-public.sh tests/test-public-readiness.sh tests/test-public-snapshot.sh tests/test-release-workflow.sh
 bash tools/build-manager.sh --check
 bash tests/test-build.sh
 bash tests/test-static.sh
@@ -36,7 +36,7 @@ bash tests/test-controller-role.sh
 bash tests/test-controller-role-repair.sh
 bash tests/test-controller-role-provision.sh
 bash tests/test-manager-role-detection.sh
-bash tests/test-manager-role-routing.sh
+bash tests/test-standalone-startup.sh
 bash tests/test-manager-handoff.sh
 bash tests/test-controller-landing-credentials.sh
 bash tests/test-controller-landing-onboarding.sh

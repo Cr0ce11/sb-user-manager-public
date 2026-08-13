@@ -239,7 +239,7 @@ main() {
     fi
   fi
   case "${1:-}" in
-    "") dispatch_interactive_startup "$@" ;;
+    "") run_standalone_interactive_startup "${@:2}" ;;
     --internal-expire) run_standalone_internal_expire "${@:2}" ;;
     --take-over-installed-manager) take_over_installed_manager "${@:2}" ;;
     *) die "本脚本采用交互方式，请直接运行且不要添加参数" ;;
@@ -248,13 +248,8 @@ main() {
 
 if [[ "${SB_USER_MANAGER_LIBRARY:-false}" != true ]]; then
   case "${0##*/}" in
-    sb-user-manager-landing-agent)
-      install_landing_apply_runtime_traps
-      landing_agent_main "$@"
-      ;;
-    sb-user-manager-landing-apply)
-      install_landing_apply_runtime_traps
-      landing_apply_helper_main "$@"
+    sb-user-manager-landing-agent|sb-user-manager-landing-apply)
+      die 'v5 入口与落地能力已经退役，拒绝运行遗留 helper 入口'
       ;;
     *)
       install_runtime_traps
