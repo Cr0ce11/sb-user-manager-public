@@ -15,6 +15,7 @@ trap 'rm -rf -- "$work"' EXIT
 cat > "$work/expected-direct-functions" <<'EOF'
 activate_managed_services
 append_inbounds
+append_inbounds_from_new_user_snapshot
 atomic_install_file
 begin_environment_transaction
 check_singbox_and_restart

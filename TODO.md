@@ -45,6 +45,7 @@
 | SEC-003 | P2 | 完成 | [Issue #78](https://github.com/DTB201/sb-user-manager/issues/78) | 自动迁移历史完整快照权限 | 启动时只收紧有效历史快照权限，无关目录和符号链接不受影响，重复执行安全，实机验收通过 |
 | BUG-001 | P1 | 完成 | [Issue #81](https://github.com/DTB201/sb-user-manager/issues/81) | 修复 SS2022 + ShadowTLS 的 Surge UDP 支持 | 同端口 UDP、Surge 导出、用户生命周期、分流、Nfuse 计量和配额阻断均通过自动化与实机验收 |
 | PERF-001 | P1 | 完成 | [Issue #84](https://github.com/DTB201/sb-user-manager/issues/84) | 修复脚本启动阶段重复扫描导致的变慢 | 无变化时跳过历史快照全量扫描，目录变化后自动重检，nube2 启动耗时明显下降且验收通过 |
+| PERF-002 | P2 | 完成 | [公开 Issue #44](https://github.com/DTB201/sb-user-manager-public/issues/44) / [PR #45](https://github.com/DTB201/sb-user-manager-public/pull/45) | 新增用户时只解析一次 sing-box 配置 | 三个候选 tag 由单次格式化和单个参数化 jq 检查，最终配置复用同一快照且逐字节等价；50 用户夹具格式化调用减少 75%，中位耗时约降低 16%，生成物、本地门禁和公开 CI 通过 |
 | UX-002 | P1 | 完成 | [Issue #85](https://github.com/DTB201/sb-user-manager/issues/85) | Shadowrocket 导出改为官方 URL 与二维码 | 自动化门禁、nube2 和当前正式版 Shadowrocket 的 AnyTLS、SS2022 + ShadowTLS 真实扫码、TCP、UDP 均已通过，PR #87 已合并 |
 | BUG-002 | P1 | 完成 | [Issue #91](https://github.com/DTB201/sb-user-manager/issues/91) | 防止本机代理回连 SSH 在重启 sing-box 时断联 | v4.18.1 已发布；air 原故障路径正确拦截，nube2 真实菜单更新和 `release` 验收失败项为 0 |
 | SPLIT-001 | P1 | 完成 | [Issue #98](https://github.com/DTB201/sb-user-manager/issues/98) | 增加预置出口和预置规则管理 | v4.19.0 已发布；本地、CI、生命周期、完整恢复、智能合并恢复、预置关联、Nfuse 用量恢复和两台测试机发布后验收均通过 |

@@ -246,7 +246,7 @@ EOF
 multi_add_body="$(declare -f cmd_add_multi)"
 multi_state_line="$(grep -n 'run_managed_step state_add_multi_user' <<<"$multi_add_body" | cut -d: -f1)"
 multi_register_line="$(grep -n 'register_new_user_nfuse_ports' <<<"$multi_add_body" | cut -d: -f1)"
-multi_listener_line="$(grep -n 'run_managed_step append_inbounds' <<<"$multi_add_body" | cut -d: -f1)"
+multi_listener_line="$(grep -n 'run_managed_step append_inbounds_from_new_user_snapshot' <<<"$multi_add_body" | cut -d: -f1)"
 [[ "$multi_state_line" =~ ^[0-9]+$ && "$multi_register_line" =~ ^[0-9]+$ && "$multi_listener_line" =~ ^[0-9]+$ ]]
 ((multi_state_line < multi_register_line && multi_register_line < multi_listener_line))
 multi_remove_body="$(declare -f cmd_remove_user_endpoint)"
@@ -270,7 +270,7 @@ multi_nfuse_remove_line="$(grep -n 'run_managed_step nfuse port rm' <<<"$multi_r
   finish_managed_operation() { printf 'finish\n' >> "$events"; }
   run_managed_step() { printf 'step:%s\n' "$1" >> "$events"; "$@"; }
   nfuse() { printf 'nfuse:%s\n' "$*" >> "$events"; }
-  append_inbounds() { printf 'append\n' >> "$events"; }
+  append_inbounds_from_new_user_snapshot() { printf 'append\n' >> "$events"; }
   check_singbox_and_restart() { printf 'restart\n' >> "$events"; }
   cmd_export() { printf 'export:%s\n' "$1" >> "$events"; }
   cmd_add_multi self live-multi 24001 24002 2022-blake3-aes-128-gcm at.example.com >/dev/null
@@ -288,20 +288,23 @@ multi_nfuse_remove_line="$(grep -n 'run_managed_step nfuse port rm' <<<"$multi_r
 # 新增用户的公共冲突检查保持两个协议原有顺序；AnyTLS 仅额外检查证书。
 (
   trace="$work/new-user-preflight-ss2022"
+  config_snapshot="" config_source=""
   user_exists() { printf 'user %s\n' "$1" >> "$trace"; return 1; }
   port_in_state() { printf 'state-port %s\n' "$1" >> "$trace"; return 1; }
   port_is_listening() { printf 'listen-port %s\n' "$1" >> "$trace"; return 1; }
-  tag_exists_in_config() { printf 'tag %s\n' "$1" >> "$trace"; return 1; }
+  load_new_user_config_snapshot() {
+    printf 'config-snapshot\n' >> "$trace"
+    printf -v "$1" '%s' '{"inbounds":[]}'
+    printf -v "$2" '%064d' 0
+  }
   nfuse_account_exists() { printf 'nfuse-account %s\n' "$1" >> "$trace"; return 1; }
   nfuse_port_exists() { printf 'nfuse-port %s\n' "$1" >> "$trace"; return 1; }
-  check_new_user_conflicts ss2022 alice 23001
+  check_new_user_conflicts ss2022 alice 23001 config_snapshot config_source
   diff -u <(cat <<'EOF'
 user alice
 state-port 23001
 listen-port 23001
-tag st-alice
-tag ss-alice
-tag ss-udp-alice
+config-snapshot
 nfuse-account alice
 nfuse-port 23001
 EOF
@@ -309,19 +312,24 @@ EOF
 )
 (
   trace="$work/new-user-preflight-anytls"
+  config_snapshot="" config_source=""
   user_exists() { printf 'user %s\n' "$1" >> "$trace"; return 1; }
   port_in_state() { printf 'state-port %s\n' "$1" >> "$trace"; return 1; }
   port_is_listening() { printf 'listen-port %s\n' "$1" >> "$trace"; return 1; }
-  tag_exists_in_config() { printf 'tag %s\n' "$1" >> "$trace"; return 1; }
+  load_new_user_config_snapshot() {
+    printf 'config-snapshot\n' >> "$trace"
+    printf -v "$1" '%s' '{"inbounds":[]}'
+    printf -v "$2" '%064d' 0
+  }
   anytls_certificate_ready() { printf 'certificate\n' >> "$trace"; }
   nfuse_account_exists() { printf 'nfuse-account %s\n' "$1" >> "$trace"; return 1; }
   nfuse_port_exists() { printf 'nfuse-port %s\n' "$1" >> "$trace"; return 1; }
-  check_new_user_conflicts anytls bob 23002
+  check_new_user_conflicts anytls bob 23002 config_snapshot config_source
   diff -u <(cat <<'EOF'
 user bob
 state-port 23002
 listen-port 23002
-tag anytls-bob
+config-snapshot
 certificate
 nfuse-account bob
 nfuse-port 23002
@@ -391,6 +399,124 @@ if unknown_protocol_output="$(check_new_user_conflicts unknown alice 23001 2>&1)
   exit 1
 fi
 grep -Fq '内部错误：不支持的新增用户协议：unknown' <<<"$unknown_protocol_output"
+
+# 新增用户冲突检查只格式化一次配置，按候选顺序报告冲突，并让最终写入复用同一快照。
+(
+  SINGBOX_CONFIG="$work/new-user-single-pass-config.json"
+  SINGBOX_BIN=counting_new_user_singbox
+  format_calls="$work/new-user-single-pass-format.calls"
+  base_config="$work/new-user-single-pass-base.json"
+  expected_config="$work/new-user-single-pass-expected.json"
+  fragment='[{"type":"shadowsocks","tag":"ss-fresh","listen":"::","listen_port":23001,"method":"2022-blake3-aes-128-gcm","password":"fixture"}]'
+  printf '%s\n' '{"inbounds":[{"type":"mixed","tag":"existing","listen_port":1080}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[],"rule_set":[]}}' > "$base_config"
+  cp "$base_config" "$SINGBOX_CONFIG"
+  : > "$format_calls"
+  counting_new_user_singbox() {
+    [[ "${1:-}" == format && "${2:-}" == -c ]] || return 1
+    printf 'format\n' >> "$format_calls"
+    command jq . "$3"
+  }
+  user_exists() { return 1; }
+  port_in_state() { return 1; }
+  port_is_listening() { return 1; }
+  nfuse_account_exists() { return 1; }
+  nfuse_port_exists() { return 1; }
+  anytls_certificate_ready() { return 0; }
+
+  # 旧通用重写助手作为黄金基准；新路径必须生成逐字节相同的配置。
+  SB_JQ_NEW_INBOUNDS="$fragment" rewrite_singbox_config \
+    '($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_inbounds |
+     .inbounds = ((.inbounds // []) + $new_inbounds)'
+  cp "$SINGBOX_CONFIG" "$expected_config"
+
+  cp "$base_config" "$SINGBOX_CONFIG"
+  : > "$format_calls"
+  config_snapshot="" config_source=""
+  check_new_user_conflicts ss2022 fresh 23001 config_snapshot config_source
+  [[ "$(wc -l < "$format_calls" | tr -d ' ')" == 1 ]]
+  append_inbounds_from_new_user_snapshot "$config_snapshot" "$config_source" "$fragment"
+  [[ "$(wc -l < "$format_calls" | tr -d ' ')" == 1 ]]
+  cmp -s "$expected_config" "$SINGBOX_CONFIG"
+
+  # 双协议的第二次冲突检查复用同一快照，不应再次 format。
+  cp "$base_config" "$SINGBOX_CONFIG"
+  : > "$format_calls"
+  config_snapshot="" config_source=""
+  check_new_user_conflicts ss2022 multi 23002 config_snapshot config_source
+  check_new_user_conflicts anytls multi 23003 config_snapshot config_source
+  [[ "$(wc -l < "$format_calls" | tr -d ' ')" == 1 ]]
+
+  # 配置顺序不能改变候选 tag 的既有优先级。
+  printf '%s\n' '{"inbounds":[{"tag":"ss-conflict"},{"tag":"st-conflict"}],"outbounds":[],"route":{"rules":[],"rule_set":[]}}' > "$SINGBOX_CONFIG"
+  config_snapshot="" config_source=""
+  if conflict_output="$(check_new_user_conflicts ss2022 conflict 23004 config_snapshot config_source 2>&1)"; then
+    echo 'new user conflict check should reject an existing candidate tag' >&2
+    exit 1
+  fi
+  grep -Fq 'sing-box 已存在 tag：st-conflict' <<<"$conflict_output"
+
+  printf '%s\n' '{"inbounds":[{"tag":"anytls-conflict"}],"outbounds":[],"route":{"rules":[],"rule_set":[]}}' > "$SINGBOX_CONFIG"
+  config_snapshot="" config_source=""
+  if anytls_conflict_output="$(check_new_user_conflicts anytls conflict 23004 config_snapshot config_source 2>&1)"; then
+    echo 'AnyTLS user conflict check should reject an existing candidate tag' >&2
+    exit 1
+  fi
+  grep -Fq '错误：tag 已存在' <<<"$anytls_conflict_output"
+
+  # 预检后配置发生变化时不得用旧快照覆盖新内容。
+  cp "$base_config" "$SINGBOX_CONFIG"
+  config_snapshot="" config_source=""
+  check_new_user_conflicts ss2022 stale 23005 config_snapshot config_source
+  printf '%s\n' '{"inbounds":[{"tag":"changed-after-preflight"}],"outbounds":[],"route":{"rules":[],"rule_set":[]}}' > "$SINGBOX_CONFIG"
+  if append_inbounds_from_new_user_snapshot "$config_snapshot" "$config_source" "$fragment" >"$work/new-user-stale.out" 2>&1; then
+    echo 'stale new user config snapshot should be rejected before write' >&2
+    exit 1
+  fi
+  grep -Fq '配置在新增用户预检后发生变化' "$work/new-user-stale.out"
+  grep -Fq changed-after-preflight "$SINGBOX_CONFIG"
+
+  # 指纹必须包含尾部换行；只改变换行字节也不能被旧快照覆盖。
+  cp "$base_config" "$SINGBOX_CONFIG"
+  config_snapshot="" config_source=""
+  check_new_user_conflicts ss2022 trailing-newline 23006 config_snapshot config_source
+  printf '\n' >> "$SINGBOX_CONFIG"
+  cp "$SINGBOX_CONFIG" "$work/new-user-trailing-newline.expected"
+  if append_inbounds_from_new_user_snapshot "$config_snapshot" "$config_source" "$fragment" >"$work/new-user-trailing-newline.out" 2>&1; then
+    echo 'trailing-newline-only config changes must invalidate the snapshot' >&2
+    exit 1
+  fi
+  grep -Fq '配置在新增用户预检后发生变化' "$work/new-user-trailing-newline.out"
+  cmp -s "$work/new-user-trailing-newline.expected" "$SINGBOX_CONFIG"
+
+  # 临时配置已经生成后若原文件再变化，最终原子替换前的第二次核验必须拦截。
+  cp "$base_config" "$SINGBOX_CONFIG"
+  config_snapshot="" config_source=""
+  check_new_user_conflicts ss2022 changed-during-write 23007 config_snapshot config_source
+  cp "$base_config" "$work/new-user-change-during-write.expected"
+  printf '\n' >> "$work/new-user-change-during-write.expected"
+  jq() {
+    command jq "$@"
+    local rc=$?
+    printf '\n' >> "$SINGBOX_CONFIG"
+    return "$rc"
+  }
+  if append_inbounds_from_new_user_snapshot "$config_snapshot" "$config_source" "$fragment" >"$work/new-user-change-during-write.out" 2>&1; then
+    echo 'config changes during snapshot write must be rejected before replacement' >&2
+    exit 1
+  fi
+  unset -f jq
+  grep -Fq '配置在新增用户预检后发生变化' "$work/new-user-change-during-write.out"
+  cmp -s "$work/new-user-change-during-write.expected" "$SINGBOX_CONFIG"
+
+  # format 失败必须在事务前失败关闭，并保留原有配置错误文案。
+  counting_new_user_singbox() { return 77; }
+  config_snapshot="" config_source=""
+  if format_failure_output="$(check_new_user_conflicts ss2022 broken 23008 config_snapshot config_source 2>&1)"; then
+    echo 'new user preflight should fail closed when sing-box format fails' >&2
+    exit 1
+  fi
+  grep -Fq "无法解析或格式化 sing-box 配置：$SINGBOX_CONFIG" <<<"$format_failure_output"
+)
 
 # 用户状态变化只有在存在专属分流时才重建配置；失败继续返回给既有事务回滚路径。
 (
@@ -4327,10 +4453,10 @@ state_remove_user anytls-custom
   PORT_MAX=30000
   printf '%s\n' '{"schema_version":3,"users":[],"splits":[]}' > "$STATE_FILE"
   port_is_listening() { return 1; }
-  tag_exists_in_config() { return 1; }
+  check_new_user_conflicts() { printf -v "$4" '%s' '{"inbounds":[]}'; printf -v "$5" '%064d' 0; }
   generate_st_password() { printf 'self-st\n'; }
   generate_ss_password() { printf 'self-ss\n'; }
-  append_inbounds() { return 0; }
+  append_inbounds_from_new_user_snapshot() { return 0; }
   check_singbox_and_restart() { return 0; }
   start_managed_operation() { return 0; }
   finish_managed_operation() { return 0; }
@@ -4354,7 +4480,7 @@ state_remove_user anytls-custom
   PORT_MAX=30000
   printf '%s\n' '{"schema_version":3,"users":[],"splits":[]}' > "$STATE_FILE"
   port_is_listening() { return 1; }
-  tag_exists_in_config() { return 1; }
+  check_new_user_conflicts() { printf -v "$4" '%s' '{"inbounds":[]}'; printf -v "$5" '%064d' 0; }
   generate_st_password() { printf 'blocked-st\n'; }
   generate_ss_password() { printf 'blocked-ss\n'; }
   ensure_safe_ssh_for_singbox_restart() { return 1; }
