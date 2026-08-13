@@ -1063,20 +1063,33 @@ cmd_enable() {
   fi
 }
 
+calculate_renewal_expiry() {
+  [[ $# -eq 2 ]] || return 64
+  local base_epoch="$1" months="$2" base_time
+  [[ "$base_epoch" =~ ^[0-9]+$ && "$months" =~ ^[1-9][0-9]*$ ]] || return 1
+  base_time="$(date -d "@$base_epoch" '+%Y-%m-%d %H:%M:%S')" || return 1
+  # 不要在完整时刻后使用 +N month；GNU date 会把 +N 误解析为数字时区，
+  # 剩余的裸 month 因而固定只增加一个月。
+  date -d "$base_time ${months} months" '+%Y-%m-%dT%H:%M:%S%z' || return 1
+}
+
 cmd_renew() {
-  local name="$1" months="$2" user expires status now_epoch expires_epoch base_epoch base_time new_expiry
+  local name="$1" months="$2" user expires status now_epoch expires_epoch base_epoch new_expiry
   validate_name "$name"
   [[ "$months" =~ ^[1-9][0-9]*$ ]] || die "续期月数必须是正整数"
   user_exists "$name" || die "用户不存在：$name"
-  user="$(get_user_json "$name")"
-  expires="$(jq -r '.expires_at // empty' <<<"$user")"
+  user="$(get_user_json "$name")" || return 1
+  expires="$(jq -r '.expires_at // empty' <<<"$user")" || return 1
   [[ -n "$expires" ]] || die "自用用户没有有效期，不能续期"
-  status="$(jq -r '.status' <<<"$user")"
-  now_epoch="$(date +%s)"
-  expires_epoch="$(date -d "$expires" +%s)"
+  status="$(jq -er '.status | select(. == "active" or . == "disabled")' <<<"$user")" ||
+    die "用户状态无效，不能续期：$name"
+  now_epoch="$(date +%s)" || return 1
+  expires_epoch="$(date -d "$expires" +%s)" || die "用户有效期格式无效，不能续期：$name"
   if ((expires_epoch > now_epoch)); then base_epoch="$expires_epoch"; else base_epoch="$now_epoch"; fi
-  base_time="$(date -d "@$base_epoch" '+%Y-%m-%d %H:%M:%S')"
-  new_expiry="$(date -d "$base_time +${months} month" '+%Y-%m-%dT%H:%M:%S%z')"
+  if ! new_expiry="$(calculate_renewal_expiry "$base_epoch" "$months")"; then
+    echo "错误：无法按 ${months} 个月计算用户的新到期时间，续期未执行：$name" >&2
+    return 1
+  fi
   if [[ "$status" == disabled ]]; then
     prepare_user_enable "$name" || return 1
   fi

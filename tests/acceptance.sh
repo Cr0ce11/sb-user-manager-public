@@ -385,6 +385,7 @@ remove_full_test_users() {
 
 run_lifecycle() {
   local suffix ss_port anytls_port sni edited_expiry old_secret new_secret limit_bytes list_output expires usage
+  local renew_started renew_finished renewed_expiry renewed_epoch renew_lower_bound renew_upper_bound
   [[ "$CONFIRM" == YES ]] || { fail '写入型验收授权' '必须设置 SB_ACCEPTANCE_CONFIRM=YES'; return 1; }
   if ((FAILURES > 0)); then fail '写入型验收前置检查' '只读验收存在失败项'; return 1; fi
   prepare_core
@@ -516,8 +517,23 @@ run_lifecycle() {
   expires="$(date -d '-1 minute' '+%Y-%m-%dT%H:%M:%S%z')"
   run_mutation '到期用户自动停用' expire_acceptance_user "$ANYTLS_USER" "$expires"
   verify_state_value '到期后状态为停用' ".users[] | select(.name == \"$ANYTLS_USER\") | .status" disabled || return 1
-  run_mutation '续期并自动启用用户' cmd_renew "$ANYTLS_USER" 1
+  renew_started="$(date +%s)"
+  run_mutation '续期 6 个月并自动启用用户' cmd_renew "$ANYTLS_USER" 6
+  renew_finished="$(date +%s)"
   verify_state_value '续期后状态为启用' ".users[] | select(.name == \"$ANYTLS_USER\") | .status" active || return 1
+  renewed_expiry="$(jq -r --arg name "$ANYTLS_USER" '.users[] | select(.name == $name) | .expires_at' "$STATE_FILE")"
+  renewed_epoch="$(date -d "$renewed_expiry" +%s)"
+  renew_lower_bound="$(date -d "$(calculate_renewal_expiry "$renew_started" 6)" +%s)"
+  renew_upper_bound="$(date -d "$(calculate_renewal_expiry "$renew_finished" 6)" +%s)"
+  if ((renew_lower_bound > renew_upper_bound)); then
+    expires="$renew_lower_bound"; renew_lower_bound="$renew_upper_bound"; renew_upper_bound="$expires"
+  fi
+  if ((renewed_epoch >= renew_lower_bound && renewed_epoch <= renew_upper_bound)); then
+    pass '已过期用户按输入续期 6 个月'
+  else
+    fail '已过期用户按输入续期 6 个月' "实际到期 ${renewed_expiry}"
+    return 1
+  fi
   usage="$(nfuse list --json | jq -r --arg name "$ANYTLS_USER" '.[] | select(.name == $name) | .used_bytes')"
   if [[ "$usage" == 0 ]]; then pass '续期启用后已用流量清零'; else fail '续期启用后已用流量清零' "实际 $usage"; return 1; fi
 

@@ -8,6 +8,7 @@
 
 ## Unreleased
 
+- 修复“续期用户”把输入月数误解析为数字时区、导致 2/3/6/12 等输入仍通常只增加 1 个月的问题；续期现在使用无歧义的月份表达式，并在有效期或日期计算异常时于事务开始前停止。新增多月确切到期时间、已过期用户和真实 GNU date 回归测试。本项对应 [公开 Issue #20](https://github.com/DTB201/sb-user-manager-public/issues/20)，不改变菜单、状态 schema、迁移格式、自动启用、流量清零或事务顺序。
 - 项目永久收敛到 `DTB201/sb-user-manager-public`：公开仓库成为代码、Issue、Pull Request、完整 CI、匿名更新与不可变 Release 的唯一正式来源，私有双版本和原 v5 方向不再恢复；仍运行旧私有版的服务器继续保留单向无损接管到公开版的兼容路径。公开 Issues 与私密漏洞报告已启用，Mihomo 候选需求已迁移，休眠 v5 清理由独立 Issue 跟踪。本项对应 [公开 Issue #15](https://github.com/DTB201/sb-user-manager-public/issues/15)，不修改运行代码、版本、状态 schema、服务器或用户数据。
 - 此前已按当时决定对齐 v4.25.2 的公开迁移与双仓库边界；该边界现由上方单一公开仓库决定取代。本项只记录治理演进，不改变运行代码或服务器；原工作由公开 [PR #14](https://github.com/DTB201/sb-user-manager-public/pull/14) 完成。
 
