@@ -1126,6 +1126,15 @@ set -e
   [[ "$environment_step_rc" == 68 && "$environment_rollback_rc" == 68 && "$environment_rollback_calls" == 1 ]]
 )
 
+set +e
+missing_rollback_output="$(
+  (run_step_or_rollback missing_operation_rollback true) 2>&1
+)"
+missing_rollback_rc=$?
+set -e
+[[ "$missing_rollback_rc" == 1 ]]
+grep -Fq '错误：操作回滚函数不存在：missing_operation_rollback' <<<"$missing_rollback_output"
+
 pause_output="$(printf '\n' | pause_menu)"
 grep -Fq '按回车返回菜单…' <<<"$pause_output"
 MANAGER_INSTALLED_PATH="$work/installed-manager"

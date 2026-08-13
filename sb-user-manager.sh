@@ -1458,6 +1458,7 @@ rollback_active_operation() {
 
 run_step_or_rollback() {
   local rollback="$1" rc
+  declare -F "$rollback" >/dev/null || die "操作回滚函数不存在：$rollback"
   shift
   if "$@"; then
     return 0
@@ -8919,6 +8920,7 @@ check_updates() {
     return 0
   fi
   # deploy_environment 识别当前进程已持锁，不会重开 fd 9；查询、确认与部署保持同一互斥区间。
+  # deploy_environment 返回前会释放操作锁；此行之后不得添加需要互斥保护的逻辑。
   if ! deploy_environment false "$update_manager"; then
     release_operation_lock
     return 1

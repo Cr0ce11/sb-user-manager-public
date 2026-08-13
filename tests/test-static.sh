@@ -74,6 +74,7 @@ grep -Fq 'managed shell-function targets changed' "$managed_step_output"
 
 cp sb-user-manager.sh "$shell_target_fixture"
 printf '\nstatic_gate_negative_fixture() {\n  undefined_static_probe\n  if undefined_condition_probe; then :; fi\n  value="$(undefined_substitution_probe)"\n  printf x | undefined_pipeline_probe\n}\n' >> "$shell_target_fixture"
+printf '\nstatic_dispatch_gate_negative_fixture() {\n  run_step_or_rollback undefined_rollback_dispatch_probe undefined_step_dispatch_probe\n  run_managed_step undefined_managed_dispatch_probe\n  run_managed_step run_quietly undefined_nested_dispatch_probe\n  run_managed_step "undefined_quoted_dispatch_probe"\n  run_quietly undefined_quiet_dispatch_probe\n  write_command_output output undefined_output_dispatch_probe\n  validate_without_exit undefined_validator_dispatch_probe value\n  read_validated_value prompt default cancel undefined_read_validator_dispatch_probe\n  prompt_user_status_action undefined_status_action_dispatch_probe active label\n  dynamic_dispatch_target=undefined_dynamic_dispatch_probe\n  run_managed_step "$dynamic_dispatch_target"\n}\n' >> "$shell_target_fixture"
 if python3 tests/check-shell-call-targets.py "$shell_target_fixture" >"$shell_target_output" 2>&1; then
   echo 'shell call-target check must reject an undefined bare command' >&2
   exit 1
@@ -82,6 +83,20 @@ grep -Fq 'undefined bare command target undefined_static_probe' "$shell_target_o
 grep -Fq 'undefined bare command target undefined_condition_probe' "$shell_target_output"
 grep -Fq 'undefined bare command target undefined_substitution_probe' "$shell_target_output"
 grep -Fq 'undefined bare command target undefined_pipeline_probe' "$shell_target_output"
+grep -Fq 'undefined bare command target undefined_rollback_dispatch_probe' "$shell_target_output"
+grep -Fq 'undefined bare command target undefined_step_dispatch_probe' "$shell_target_output"
+grep -Fq 'undefined bare command target undefined_managed_dispatch_probe' "$shell_target_output"
+grep -Fq 'undefined bare command target undefined_nested_dispatch_probe' "$shell_target_output"
+grep -Fq 'undefined bare command target undefined_quoted_dispatch_probe' "$shell_target_output"
+grep -Fq 'undefined bare command target undefined_quiet_dispatch_probe' "$shell_target_output"
+grep -Fq 'undefined bare command target undefined_output_dispatch_probe' "$shell_target_output"
+grep -Fq 'undefined bare command target undefined_validator_dispatch_probe' "$shell_target_output"
+grep -Fq 'undefined bare command target undefined_read_validator_dispatch_probe' "$shell_target_output"
+grep -Fq 'undefined bare command target undefined_status_action_dispatch_probe' "$shell_target_output"
+if grep -Fq 'undefined_dynamic_dispatch_probe' "$shell_target_output"; then
+  echo 'shell call-target check must skip dynamically expanded dispatch targets' >&2
+  exit 1
+fi
 
 rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fixture" "$shell_target_output"
 trap - EXIT

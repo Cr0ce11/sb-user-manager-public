@@ -2492,6 +2492,7 @@ check_updates() {
     return 0
   fi
   # deploy_environment 识别当前进程已持锁，不会重开 fd 9；查询、确认与部署保持同一互斥区间。
+  # deploy_environment 返回前会释放操作锁；此行之后不得添加需要互斥保护的逻辑。
   if ! deploy_environment false "$update_manager"; then
     release_operation_lock
     return 1

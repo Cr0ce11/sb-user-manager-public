@@ -176,6 +176,31 @@ EXTERNAL_TARGETS = {
     "xargs",
 }
 
+# These helpers execute one or more positional arguments as commands.  Literal
+# targets must pass the same allowlist as an ordinary bare command.  Dynamic
+# targets such as "$action" remain a runtime concern and are deliberately
+# skipped by this static gate.  The forwarded position identifies the command
+# that receives all following arguments, so nested wrappers such as
+# `run_managed_step run_quietly nfuse ...` are checked recursively.
+DISPATCH_TARGET_POSITIONS = {
+    "run_step_or_rollback": (1, 2),
+    "run_managed_step": (1,),
+    "run_quietly": (1,),
+    "write_command_output": (2,),
+    "validate_without_exit": (1,),
+    "read_validated_value": (4,),
+    "prompt_user_status_action": (1,),
+}
+DISPATCH_FORWARDED_POSITION = {
+    "run_step_or_rollback": 2,
+    "run_managed_step": 1,
+    "run_quietly": 1,
+    "write_command_output": 2,
+    "validate_without_exit": 1,
+    "read_validated_value": 4,
+    "prompt_user_status_action": 1,
+}
+
 
 @dataclass(frozen=True)
 class Token:
@@ -214,6 +239,7 @@ OPERATORS = (
 )
 SEPARATORS = {"\n", ";", "&&", "||", "|", "&", "(", "{"}
 REDIRECTIONS = {"<<<", "<<", ">>", "<&", ">&", "<>", ">|", "<", ">"}
+COMMAND_TERMINATORS = SEPARATORS | {")", "}", ";;", ";&", ";;&"}
 
 
 def mask_heredoc_bodies(source: str) -> str:
@@ -495,6 +521,63 @@ def tokenize(source: str, first_line: int = 1) -> list[list[Token]]:
     return streams
 
 
+def simple_command_arguments(tokens: list[Token], start: int) -> list[Token]:
+    arguments: list[Token] = []
+    i = start
+    while i < len(tokens):
+        value = tokens[i].value
+        if value in COMMAND_TERMINATORS:
+            break
+        if value.isdigit() and i + 1 < len(tokens) and tokens[i + 1].value in REDIRECTIONS:
+            i += 2
+            if i < len(tokens):
+                i += 1
+            continue
+        if value in REDIRECTIONS:
+            i += 2
+            continue
+        arguments.append(tokens[i])
+        i += 1
+    return arguments
+
+
+def literal_dispatch_target(token: Token) -> Token | None:
+    if token.bare and (COMMAND_NAME.match(token.value) or token.value == "["):
+        return token
+    if (
+        len(token.value) >= 2
+        and token.value[0] == token.value[-1]
+        and token.value[0] in "'\""
+    ):
+        value = token.value[1:-1]
+        if COMMAND_NAME.match(value) or value == "[":
+            return Token(value, token.line)
+    return None
+
+
+def dispatched_command_calls(command: str, arguments: list[Token]) -> list[Token]:
+    calls: list[Token] = []
+    for position in DISPATCH_TARGET_POSITIONS.get(command, ()):
+        if position > len(arguments):
+            continue
+        target = literal_dispatch_target(arguments[position - 1])
+        if target is not None:
+            calls.append(target)
+
+    forwarded_position = DISPATCH_FORWARDED_POSITION.get(command)
+    if forwarded_position is None or forwarded_position > len(arguments):
+        return calls
+    forwarded = literal_dispatch_target(arguments[forwarded_position - 1])
+    if forwarded is not None and forwarded.value in DISPATCH_TARGET_POSITIONS:
+        calls.extend(
+            dispatched_command_calls(
+                forwarded.value,
+                arguments[forwarded_position:],
+            )
+        )
+    return calls
+
+
 def command_calls(tokens: list[Token]) -> list[Token]:
     calls: list[Token] = []
     expect_command = True
@@ -605,6 +688,7 @@ def command_calls(tokens: list[Token]) -> list[Token]:
             continue
         if token.bare and (COMMAND_NAME.match(value) or value == "["):
             calls.append(token)
+            calls.extend(dispatched_command_calls(value, simple_command_arguments(tokens, i + 1)))
         expect_command = False
         i += 1
     return calls
