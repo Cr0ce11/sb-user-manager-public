@@ -8,6 +8,8 @@
 
 ## Unreleased
 
+- 加固命令目标检查：静态门禁现在会识别事务、校验和用户状态调度器参数中的字面量命令，并递归检查嵌套包装器；`run_step_or_rollback` 同时在运行期拒绝不存在的回滚回调。更新流程注释明确内层部署返回后操作锁已经释放，避免后续维护误把无锁区当作互斥区；不引入高风险的锁深度计数，对应 [公开 Issue #60](https://github.com/DTB201/sb-user-manager-public/issues/60)。
+
 ## 4.25.6 - 2026-08-14
 
 - 修复首次交互启动维护 `sbm` 快捷入口时调用未定义 `pause` 的问题：快捷入口被占用或自动创建失败时现在使用真实菜单暂停函数，显示提示后继续进入管理界面，不再出现 `command not found` 或提前退出。移除会掩盖缺陷的测试桩，并新增裸命令目标静态门禁及反向样例，对应 [公开 Issue #36](https://github.com/DTB201/sb-user-manager-public/issues/36)。

@@ -1081,6 +1081,7 @@ rollback_active_operation() {
 
 run_step_or_rollback() {
   local rollback="$1" rc
+  declare -F "$rollback" >/dev/null || die "操作回滚函数不存在：$rollback"
   shift
   if "$@"; then
     return 0
