@@ -89,14 +89,12 @@ assert_case_data_unchanged() {
 }
 
 public_current="$WORK/public-current.sh"
-private_current="$WORK/private-current.sh"
 private_old="$WORK/private-old.sh"
 public_old="$WORK/public-old.sh"
 private_future="$WORK/private-future.sh"
 schema_future="$WORK/schema-future.sh"
 public_min5="$WORK/public-min5.sh"
 make_manager_fixture "$public_current" 4.23.5 公开版 5 0
-make_manager_fixture "$private_current" 4.23.5 私有版 5 0
 make_manager_fixture "$private_old" 4.22.9 私有版 4 0
 make_manager_fixture "$public_old" 4.22.9 公开版 4 0
 make_manager_fixture "$private_future" 9.0.0 私有版 5 0
@@ -118,13 +116,10 @@ grep -Fxq 'NFUSE_VERSION=0.1.13' "$DEPLOYED_VERSIONS_FILE" || fail 'Nfuse versio
 [[ ! -e "$MANAGER_HANDOFF_JOURNAL" ]] || fail 'successful handoff left an active journal'
 assert_case_data_unchanged
 
-# 同版本公开版与私有版必须可以反复双向接管。
-activate_candidate "$private_current" 4.23.5 私有版 5 0
-take_over_installed_manager >/dev/null || fail 'public manager could not hand off to same-version private manager'
-cmp -s "$private_current" "$MANAGER_INSTALLED_PATH" || fail 'private target was not installed'
+# 已接管的公开版必须允许同版本公开目标安全重复执行，不再承诺切回私有发布渠道。
 activate_candidate "$public_current" 4.23.5 公开版 5 0
-take_over_installed_manager >/dev/null || fail 'private manager could not hand off back to same-version public manager'
-cmp -s "$public_current" "$MANAGER_INSTALLED_PATH" || fail 'public target was not restored after repeated handoff'
+take_over_installed_manager >/dev/null || fail 'same-version public handoff was not idempotent'
+cmp -s "$public_current" "$MANAGER_INSTALLED_PATH" || fail 'same-version public target was not preserved'
 assert_case_data_unchanged
 
 # 同渠道也允许严格向前升级。

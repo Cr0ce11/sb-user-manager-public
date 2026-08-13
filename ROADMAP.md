@@ -60,7 +60,7 @@
 
 目标：保持稳定发布节奏，以真实问题驱动迭代。
 
-当前阶段：公开仓库最新正式版为不可变 [v4.25.2 Release](https://github.com/DTB201/sb-user-manager-public/releases/tag/v4.25.2)。v4.25.0 完成同一用户多协议共享账户能力，v4.25.1 修复不计量用户添加共享入口时的静默退出，v4.25.2 增加安装与更新前的本机回环地址预检；本地门禁、公开 PR、`main`、标签 CI 和 Release 保护均已通过，本轮没有登录或修改服务器。公开仓库是 v4 公开源码、完整 CI 和匿名 Release 的正式来源；原私有仓库继续保存完整历史与双版本，待 [Issue #255](https://github.com/DTB201/sb-user-manager/issues/255) 的 Actions 额度和发布凭据条件恢复后，再同步届时最新公开版本。正式业务环境最后一次进入记录的统一版本为 v4.22.1，升级需要独立 Issue、回退准备和明确授权；当前没有已知未解决的 P0 或 P1 运行缺陷。
+当前阶段：公开仓库最新正式版为不可变 [v4.25.2 Release](https://github.com/DTB201/sb-user-manager-public/releases/tag/v4.25.2)。v4.25.0 完成同一用户多协议共享账户能力，v4.25.1 修复不计量用户添加共享入口时的静默退出，v4.25.2 增加安装与更新前的本机回环地址预检；本地门禁、公开 PR、`main`、标签 CI 和 Release 保护均已通过，本轮没有登录或修改服务器。`DTB201/sb-user-manager-public` 是代码、Issue、Pull Request、完整 CI、匿名更新和 Release 的唯一正式来源；原私有仓库和双版本发布永久退役。正式业务环境最后一次进入记录的统一版本为 v4.22.1，升级需要独立公开 Issue、回退准备和明确授权；当前没有已知未解决的 P0 或 P1 运行缺陷。
 
 - 缺陷和需求统一进入 Issue，按用户影响和风险排序。
 - 每次 Release 执行发布后更新测试和只读验收。
@@ -69,13 +69,11 @@
 - 推进 Release 独立签名、构建证明和标签保护，降低供应链风险。
 - [Issue #126](https://github.com/DTB201/sb-user-manager/issues/126) 与 [PR #127](https://github.com/DTB201/sb-user-manager/pull/127) 已完成当前套餐可用的最小方案：草稿 Release 上传并校验全部附件后再发布，禁止覆盖同版本，并已启用 GitHub 不可变 Release。当前套餐不可用的私有仓库 Artifact Attestations 与 Ruleset 不纳入本阶段，也不为此升级付费。
 
-## 候选阶段 4：入口集中管理与多出口共享配额（已暂停）
+## 已终止方向：入口集中管理与多出口共享配额
 
 目标：在不破坏 v4 `standalone` 的前提下，让一个可信入口完成 AnyTLS 认证、认证后共享配额、现有分流和多个落地的集中管理。
 
-[Issue #197](https://github.com/DTB201/sb-user-manager/issues/197) 和 [ADR 0005](docs/DECISIONS/0005-entry-authenticated-multi-egress-controller.md) 记录已经确认的产品边界。开始运行代码实现前，必须先按 [v5 POC 验收方案](docs/V5-ENTRY-CONTROLLER-POC.md) 证明：错误认证零计费、所有有效出口恰好计费一次、两个用户相互隔离、受管落地与现有 AnyTLS 分流共享同一用户配额，以及受限远程应用可以幂等回退。
-
-本阶段仍是候选阶段，不改变项目当前处于阶段 3 的事实，也不授权登录、部署或修改任何服务器。现有设计、POC 代码和 Issue 保留为历史及续作入口；项目所有者重新启动 v5 并提供隔离测试环境之前，不继续实现或验收。未来恢复时仍须先满足既定 POC 门禁，不能退回认证前计费的透明 TLS 方案。
+原 v5 方向从未开放正式入口数据面或多落地业务菜单，现已由项目所有者永久终止，不再作为候选阶段或续作入口。已经进入 v4.25.2 的休眠基础不会在仓库退役任务中直接删除；后续只按公开 [Issue #17](https://github.com/DTB201/sb-user-manager-public/issues/17) 分阶段清理，并以 standalone 菜单、状态、迁移和运行行为不变为强制门禁。
 
 ## 暂不优先
 
