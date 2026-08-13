@@ -1202,7 +1202,7 @@ atomic_install_file() {
     rm -f -- "$tmp" || true
     return 1
   fi
-  unregister_temp_path "$tmp"
+  unregister_temp_path "$tmp" || return 1
   sync_transaction_path "$parent" || return 1
 }
 

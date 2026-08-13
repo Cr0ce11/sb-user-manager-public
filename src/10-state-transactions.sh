@@ -191,7 +191,7 @@ atomic_state_update() {
     rm -f -- "$tmp"
     return 1
   fi
-  unregister_temp_path "$tmp"
+  unregister_temp_path "$tmp" || return 1
 }
 
 restore_state_backup_atomically() {

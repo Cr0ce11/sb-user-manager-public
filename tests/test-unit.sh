@@ -3043,6 +3043,27 @@ rm -f "$rollback_marker"
   [[ "$(jq -r '.counter' "$STATE_FILE")" == 10 ]]
 )
 
+# 格式化中间文件删除失败时必须保留登记并报告失败，交给统一退出清理重试。
+(
+  RUNTIME_TEMP_PATHS=()
+  RUNTIME_TEMP_PATH_COUNT=0
+  SINGBOX_CONFIG="$work/normalized-remove-failure-config.json"
+  SINGBOX_BIN=mock_singbox
+  printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rules":[],"rule_set":[]}}' > "$SINGBOX_CONFIG"
+  rm() {
+    [[ "${*: -1}" != *'/.normalized.'* ]] || return 77
+    command rm "$@"
+  }
+  if rewrite_singbox_config '.' >/dev/null 2>&1; then
+    echo 'config rewrite should fail when the normalized staging file cannot be removed' >&2
+    exit 1
+  fi
+  [[ "$RUNTIME_TEMP_PATH_COUNT" == 2 ]]
+  for registered_temp in "${RUNTIME_TEMP_PATHS[@]}"; do
+    command rm -f -- "$registered_temp"
+  done
+)
+
 set +e
 (
   trap 'printf "triggered\n" > "$rollback_marker"' ERR
@@ -3258,6 +3279,34 @@ fi
   exit 1
 }
 [[ ! -e "$work/manager-config-restore-command-ran" ]]
+
+# 未知配置键也必须在真实恢复链中由白名单拒绝。
+(
+  BACKUP_DIR="$work/manager-config-unknown-backups"
+  SINGBOX_CONFIG="$work/manager-config-unknown-config.json"
+  STATE_FILE="$work/manager-config-unknown-state.json"
+  CONF_FILE="$work/manager-config-unknown.conf"
+  SINGBOX_BIN=restore_manager_unknown_mock_singbox
+  SINGBOX_SERVICE=sing-box
+  mkdir -p "$BACKUP_DIR"
+  printf '%s\n' '{"marker":"current-config"}' > "$SINGBOX_CONFIG"
+  printf '%s\n' '{"marker":"current-state"}' > "$STATE_FILE"
+  printf '%s\n' 'HANDSHAKE_PORT=443' > "$CONF_FILE"
+  chmod 600 "$CONF_FILE"
+  printf '%s\n' '{"marker":"backup-config"}' > "$BACKUP_DIR/config.json.manager-unknown"
+  printf '%s\n' '{"marker":"backup-state"}' > "$BACKUP_DIR/managed-users.json.manager-unknown"
+  printf '%s\n' 'UNEXPECTED_SETTING=value' > "$BACKUP_DIR/sb-user-manager.conf.manager-unknown"
+  chmod 600 "$BACKUP_DIR/sb-user-manager.conf.manager-unknown"
+  restore_manager_unknown_mock_singbox() {
+    [[ "${1:-}" == check && "${2:-}" == -c ]] || return 1
+    jq -e 'type == "object"' "$3" >/dev/null
+  }
+  systemctl() { return 0; }
+  restore_backup manager-unknown
+) >/dev/null 2>&1 && {
+  echo 'unknown runtime config settings should be rejected by the whitelist parser during restore' >&2
+  exit 1
+}
 
 restore_backup_body="$(declare -f restore_backup)"
 if grep -Fq 'bash -n "$manager_tmp"' <<<"$restore_backup_body"; then
