@@ -3468,6 +3468,28 @@ tag_exists_in_config() {
     jq -e --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' >/dev/null
 }
 
+read_singbox_config_source() {
+  local output_name="$1" content=""
+  # `read -d ''` reads through EOF without command substitution, so trailing
+  # newlines remain part of the snapshot. A successful read means an embedded
+  # NUL was found; that is not valid JSON and must be rejected.
+  if IFS= read -r -d '' content < "$SINGBOX_CONFIG"; then
+    return 1
+  elif [[ ! -r "$SINGBOX_CONFIG" ]]; then
+    return 1
+  fi
+  printf -v "$output_name" '%s' "$content"
+}
+
+load_new_user_config_snapshot() {
+  local json_output_name="$1" source_output_name="$2"
+  local source_before snapshot_json
+  read_singbox_config_source source_before || return 1
+  snapshot_json="$("$SINGBOX_BIN" format -c "$SINGBOX_CONFIG")" || return 1
+  printf -v "$json_output_name" '%s' "$snapshot_json"
+  printf -v "$source_output_name" '%s' "$source_before"
+}
+
 nfuse_account_exists() {
   nfuse list --json 2>/dev/null | jq -e --arg name "$1" '.[] | select(.name == $name)' >/dev/null
 }
@@ -3592,6 +3614,53 @@ rewrite_singbox_config() {
   chown --reference="$SINGBOX_CONFIG" "$tmp" 2>/dev/null || true
   if ! mv -- "$tmp" "$SINGBOX_CONFIG"; then
     rm -f -- "$tmp"
+    return 1
+  fi
+  unregister_temp_path "$tmp" || return 1
+}
+
+append_inbounds_from_new_user_snapshot() {
+  local config_json="$1" expected_source="$2" fragment="$3"
+  local config_dir current_source tmp
+  config_dir="$(dirname "$SINGBOX_CONFIG")" || return 1
+  tmp="$(mktemp "$config_dir/.config.XXXXXX")" || return 1
+  register_temp_path "$tmp" || { rm -f -- "$tmp" || true; return 1; }
+  if ! SB_JQ_NEW_INBOUNDS="$fragment" jq '
+    ($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_inbounds |
+    .inbounds = ((.inbounds // []) + $new_inbounds)
+  ' <<<"$config_json" > "$tmp"; then
+    if rm -f -- "$tmp"; then
+      unregister_temp_path "$tmp" || return 1
+    fi
+    printf '错误：无法生成新的 sing-box 配置\n' >&2
+    return 1
+  fi
+  if ! chmod --reference="$SINGBOX_CONFIG" "$tmp" 2>/dev/null; then
+    if ! chmod 600 "$tmp"; then
+      if rm -f -- "$tmp"; then
+        unregister_temp_path "$tmp" || return 1
+      fi
+      return 1
+    fi
+  fi
+  chown --reference="$SINGBOX_CONFIG" "$tmp" 2>/dev/null || true
+  read_singbox_config_source current_source || {
+    if rm -f -- "$tmp"; then
+      unregister_temp_path "$tmp" || return 1
+    fi
+    return 1
+  }
+  if [[ "$current_source" != "$expected_source" ]]; then
+    if rm -f -- "$tmp"; then
+      unregister_temp_path "$tmp" || return 1
+    fi
+    printf '错误：sing-box 配置在新增用户预检后发生变化，请重新操作\n' >&2
+    return 1
+  fi
+  if ! mv -- "$tmp" "$SINGBOX_CONFIG"; then
+    if rm -f -- "$tmp"; then
+      unregister_temp_path "$tmp" || return 1
+    fi
     return 1
   fi
   unregister_temp_path "$tmp" || return 1
@@ -4024,11 +4093,14 @@ anytls_certificate_ready() {
 }
 
 check_new_user_conflicts() {
-  local protocol="$1" name="$2" port="$3"
+  local protocol="$1" name="$2" port="$3" config_output_name="${4:-}" source_output_name="${5:-}"
+  local config_json source_snapshot current_source tags_json conflict_tag
   case "$protocol" in
     ss2022|anytls) ;;
     *) die "内部错误：不支持的新增用户协议：$protocol";;
   esac
+  [[ -n "$config_output_name" && -n "$source_output_name" ]] ||
+    die "内部错误：新增用户冲突检查缺少配置快照接收变量"
   user_exists "$name" && die "用户已存在：$name"
   if port_in_state "$port"; then
     if [[ "$protocol" == ss2022 ]]; then
@@ -4044,12 +4116,37 @@ check_new_user_conflicts() {
       die "端口已被监听"
     fi
   fi
+  config_json="${!config_output_name:-}"
+  source_snapshot="${!source_output_name:-}"
+  if [[ -n "$config_json" && -n "$source_snapshot" ]]; then
+    read_singbox_config_source current_source || die "无法解析或格式化 sing-box 配置：$SINGBOX_CONFIG"
+    if [[ "$current_source" != "$source_snapshot" ]]; then
+      config_json=""
+      source_snapshot=""
+    fi
+  fi
+  if [[ -z "$config_json" || -z "$source_snapshot" ]]; then
+    load_new_user_config_snapshot config_json source_snapshot ||
+      die "无法解析或格式化 sing-box 配置：$SINGBOX_CONFIG"
+    printf -v "$config_output_name" '%s' "$config_json"
+    printf -v "$source_output_name" '%s' "$source_snapshot"
+  fi
   if [[ "$protocol" == ss2022 ]]; then
-    tag_exists_in_config "st-$name" && die "sing-box 已存在 tag：st-$name"
-    tag_exists_in_config "ss-$name" && die "sing-box 已存在 tag：ss-$name"
-    tag_exists_in_config "ss-udp-$name" && die "sing-box 已存在 tag：ss-udp-$name"
+    tags_json="[\"st-$name\",\"ss-$name\",\"ss-udp-$name\"]"
   else
-    tag_exists_in_config "anytls-$name" && die "tag 已存在"
+    tags_json="[\"anytls-$name\"]"
+  fi
+  conflict_tag="$(jq -r --argjson tags "$tags_json" '
+    [$tags[] as $wanted | select(any(.inbounds[]?; .tag == $wanted)) | $wanted][0] // empty
+  ' <<<"$config_json")" || die "无法解析或格式化 sing-box 配置：$SINGBOX_CONFIG"
+  if [[ -n "$conflict_tag" ]]; then
+    if [[ "$protocol" == ss2022 ]]; then
+      die "sing-box 已存在 tag：$conflict_tag"
+    else
+      die "tag 已存在"
+    fi
+  fi
+  if [[ "$protocol" == anytls ]]; then
     anytls_certificate_ready || die "AnyTLS 证书不存在，请先重新安装环境"
   fi
   if nfuse_account_exists "$name"; then
@@ -4134,7 +4231,8 @@ cmd_add() {
     validate_limit "$limit"
     validate_anchor "$anchor"
   fi
-  check_new_user_conflicts ss2022 "$name" "$port"
+  local config_snapshot="" config_source=""
+  check_new_user_conflicts ss2022 "$name" "$port" config_snapshot config_source
 
   local ss_password fragment
   ss_password="$(generate_ss_password "$method")" || return 1
@@ -4144,7 +4242,7 @@ cmd_add() {
 
   run_managed_step state_add_user "$name" "$port" "$ss_password" "$limit" "$anchor" "$metered" "$expires_at" "$method" || return 1
   register_new_user_nfuse "$name" "$port" "$metered" "$limit" "$anchor" || return 1
-  run_managed_step append_inbounds "$fragment" || return 1
+  run_managed_step append_inbounds_from_new_user_snapshot "$config_snapshot" "$config_source" "$fragment" || return 1
   run_managed_step check_singbox_and_restart || return 1
 
   finish_managed_operation || return 1
@@ -4164,7 +4262,8 @@ cmd_add_anytls() {
   validate_name "$name"
   validate_port "$port"
   validate_shadowtls_sni "$tls_sni"
-  check_new_user_conflicts anytls "$name" "$port"
+  local config_snapshot="" config_source=""
+  check_new_user_conflicts anytls "$name" "$port" config_snapshot config_source
   local password fragment
   password="$(generate_st_password)"
   fragment="$(make_anytls_inbound "$name" "$port" "$password")"
@@ -4172,7 +4271,7 @@ cmd_add_anytls() {
   start_managed_operation "add-anytls-user:$name" || return 1
   run_managed_step state_add_anytls "$name" "$port" "$password" "$limit" "$anchor" "$metered" "$expires_at" "$tls_sni" || return 1
   register_new_user_nfuse "$name" "$port" "$metered" "$limit" "$anchor" || return 1
-  run_managed_step append_inbounds "$fragment" || return 1
+  run_managed_step append_inbounds_from_new_user_snapshot "$config_snapshot" "$config_source" "$fragment" || return 1
   run_managed_step check_singbox_and_restart || return 1
   finish_managed_operation || return 1
   if [[ "$metered" == true ]]; then
@@ -4205,8 +4304,9 @@ cmd_add_multi() {
   [[ "$ss_port" != "$anytls_port" ]] || die "两个协议必须使用不同端口"
   validate_ss2022_method "$method"
   validate_shadowtls_sni "$tls_sni"
-  check_new_user_conflicts ss2022 "$name" "$ss_port"
-  check_new_user_conflicts anytls "$name" "$anytls_port"
+  local config_snapshot="" config_source=""
+  check_new_user_conflicts ss2022 "$name" "$ss_port" config_snapshot config_source
+  check_new_user_conflicts anytls "$name" "$anytls_port" config_snapshot config_source
 
   local ss_password anytls_password prospective fragment
   ss_password="$(generate_ss_password "$method")" || return 1
@@ -4227,7 +4327,7 @@ cmd_add_multi() {
   run_managed_step state_add_multi_user "$name" "$ss_port" "$anytls_port" "$ss_password" "$anytls_password" \
     "$limit" "$anchor" "$metered" "$expires_at" "$method" "$tls_sni" || return 1
   register_new_user_nfuse_ports "$name" "$metered" "$limit" "$anchor" "$ss_port" "$anytls_port" || return 1
-  run_managed_step append_inbounds "$fragment" || return 1
+  run_managed_step append_inbounds_from_new_user_snapshot "$config_snapshot" "$config_source" "$fragment" || return 1
   run_managed_step check_singbox_and_restart || return 1
   finish_managed_operation || return 1
 
