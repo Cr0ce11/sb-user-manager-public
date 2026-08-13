@@ -728,7 +728,7 @@ EOF
 }
 
 audit_consistency() {
-  local config_json nfuse_json user_rows split_rows split name status protocol transport port metered has_legacy expected expected_tier tag split_status rule_tag out_tag scope scope_user scope_tags
+  local config_json nfuse_json user_rows expiry_rows split_rows split name status protocol transport port metered has_legacy expected expected_tier tag split_status rule_tag out_tag scope scope_user scope_tags expires
   local preset_link_rows preset_kind preset_reason managed_tags legacy_cleanup legacy_count
   AUDIT_ISSUES=0
   AUDIT_REPAIRABLE=0
@@ -744,8 +744,16 @@ audit_consistency() {
      (($user.metered // ($user.limit_gib != null))|tostring),
      (any($user.endpoints[]?; .protocol == "ss2022" and .transport == "shadowtls") | tostring)] | @tsv
   ' "$STATE_FILE")" || return 1
+  expiry_rows="$(jq -r '.users[] | select(.expires_at != null) | [.name, (.expires_at | tostring)] | @tsv' "$STATE_FILE")" || return 1
   split_rows="$(jq -c '.splits[]?' "$STATE_FILE")" || return 1
   printf '\n服务与配置检查结果\n\n'
+  while IFS=$'\t' read -r name expires; do
+    [[ -n "$name" ]] || continue
+    if ! parse_expiry_epoch "$expires" >/dev/null; then
+      printf '  [需要处理] 用户 %s 的有效期格式无效（%s）\n' "$name" "$expires"
+      ((AUDIT_ISSUES+=1))
+    fi
+  done <<<"$expiry_rows"
   while IFS=$'\t' read -r name status protocol transport port metered has_legacy; do
     [[ -n "$name" ]] || continue
     if [[ "$protocol" == anytls ]]; then expected="anytls-$name"
