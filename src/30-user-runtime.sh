@@ -1066,7 +1066,7 @@ cmd_enable() {
 calculate_renewal_expiry() {
   [[ $# -eq 2 ]] || return 64
   local base_epoch="$1" months="$2" base_time
-  [[ "$base_epoch" =~ ^[0-9]+$ && "$months" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "$base_epoch" =~ ^[0-9]+$ && "$months" =~ ^-?[1-9][0-9]*$ ]] || return 1
   base_time="$(date -d "@$base_epoch" '+%Y-%m-%d %H:%M:%S')" || return 1
   # 不要在完整时刻后使用 +N month；GNU date 会把 +N 误解析为数字时区，
   # 剩余的裸 month 因而固定只增加一个月。
@@ -1074,35 +1074,53 @@ calculate_renewal_expiry() {
 }
 
 cmd_renew() {
-  local name="$1" months="$2" user expires status now_epoch expires_epoch base_epoch new_expiry
+  local name="$1" months="$2" user expires status now_epoch expires_epoch base_epoch new_expiry new_expiry_epoch
   validate_name "$name"
-  [[ "$months" =~ ^[1-9][0-9]*$ ]] || die "续期月数必须是正整数"
+  [[ "$months" =~ ^-?[1-9][0-9]*$ ]] || die "有效期调整月数必须是非零整数"
   user_exists "$name" || die "用户不存在：$name"
   user="$(get_user_json "$name")" || return 1
   expires="$(jq -r '.expires_at // empty' <<<"$user")" || return 1
-  [[ -n "$expires" ]] || die "自用用户没有有效期，不能续期"
+  [[ -n "$expires" ]] || die "自用用户没有有效期，不能调整"
   status="$(jq -er '.status | select(. == "active" or . == "disabled")' <<<"$user")" ||
-    die "用户状态无效，不能续期：$name"
+    die "用户状态无效，不能调整有效期：$name"
   now_epoch="$(date +%s)" || return 1
-  expires_epoch="$(date -d "$expires" +%s)" || die "用户有效期格式无效，不能续期：$name"
-  if ((expires_epoch > now_epoch)); then base_epoch="$expires_epoch"; else base_epoch="$now_epoch"; fi
+  expires_epoch="$(date -d "$expires" +%s)" || die "用户有效期格式无效，不能调整：$name"
+  if ((months > 0 && expires_epoch <= now_epoch)); then
+    base_epoch="$now_epoch"
+  else
+    base_epoch="$expires_epoch"
+  fi
   if ! new_expiry="$(calculate_renewal_expiry "$base_epoch" "$months")"; then
-    echo "错误：无法按 ${months} 个月计算用户的新到期时间，续期未执行：$name" >&2
+    echo "错误：无法按 ${months} 个月计算用户的新到期时间，有效期调整未执行：$name" >&2
     return 1
   fi
-  if [[ "$status" == disabled ]]; then
+  if ((months < 0)); then
+    new_expiry_epoch="$(date -d "$new_expiry" +%s)" || {
+      echo "错误：无法验证调整后的到期时间，有效期调整未执行：$name" >&2
+      return 1
+    }
+    if ((new_expiry_epoch <= now_epoch)); then
+      echo "错误：调整后的到期时间不能早于或等于当前时间；如需立即停止使用，请执行「停用用户」：$name" >&2
+      return 1
+    fi
+  fi
+  if [[ "$status" == disabled ]] && ((months > 0)); then
     prepare_user_enable "$name" || return 1
   fi
-  start_managed_operation "renew-user:$name" || return 1
+  start_managed_operation "adjust-user-expiry:$name" || return 1
   run_managed_step state_set_expiry "$name" "$new_expiry" || return 1
-  if [[ "$status" == disabled ]]; then
+  if [[ "$status" == disabled ]] && ((months > 0)); then
     if ! run_managed_step enable_user_without_transaction "$name"; then
       log "续期和自动启用失败，已恢复到续期前状态"
       return 1
     fi
   fi
   finish_managed_operation || return 1
-  log "用户续期成功：${name}，新到期时间：${new_expiry}"
+  if ((months > 0)); then
+    log "用户续期成功：${name}，新到期时间：${new_expiry}"
+  else
+    log "用户有效期已提前：${name}，新到期时间：${new_expiry}"
+  fi
 }
 
 cmd_adjust_traffic() {

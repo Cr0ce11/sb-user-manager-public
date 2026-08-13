@@ -576,7 +576,7 @@ EOF
 
 prompt_renew_user() {
   local -a rows
-  local line i name expires status choice months
+  local line i name expires status choice months expires_epoch new_expiry answer
   prepare_core
   rows=()
   while IFS= read -r line; do rows[${#rows[@]}]="$line"; done < <(jq -r '
@@ -586,7 +586,7 @@ prompt_renew_user() {
      (if .status == "active" then "启用" elif .status == "disabled" then "停用" else .status end)] |
     @tsv
   ' "$STATE_FILE" | sort -V)
-  if ((${#rows[@]} == 0)); then echo "暂无可续期用户。"; return 0; fi
+  if ((${#rows[@]} == 0)); then echo "暂无可调整有效期的用户。"; return 0; fi
   echo
   echo "有有效期的用户（按用户名排序）："
   for i in "${!rows[@]}"; do
@@ -594,14 +594,31 @@ prompt_renew_user() {
     printf '  %d. %s｜到期 %s｜%s\n' "$((i + 1))" "$name" "${expires/T/ }" "$status"
   done
   echo "  0. 返回用户管理"
-  if ! read_numbered_index '请选择要续期的用户编号：' "${#rows[@]}"; then MENU_RETURNED=true; return 0; fi
+  if ! read_numbered_index '请选择要调整有效期的用户编号：' "${#rows[@]}"; then MENU_RETURNED=true; return 0; fi
   IFS=$'\t' read -r name expires status <<<"${rows[$SELECTED_INDEX]}"
   while true; do
-    read -r -p '请输入续期月数（输入 0 返回）：' months
+    read -r -p '请输入调整月数（正数延长，负数提前，输入 0 返回）：' months
     [[ "$months" != 0 ]] || { MENU_RETURNED=true; return 0; }
-    [[ "$months" =~ ^[1-9][0-9]*$ ]] && break
-    echo '输入无效：续期月数必须是正整数，请重新输入。'
+    [[ "$months" =~ ^-?[1-9][0-9]*$ ]] && break
+    echo '输入无效：调整月数必须是非零整数，请重新输入。'
   done
+  if ((months < 0)); then
+    expires_epoch="$(date -d "$expires" +%s)" || {
+      echo "错误：用户有效期格式无效，不能调整：$name" >&2
+      return 1
+    }
+    new_expiry="$(calculate_renewal_expiry "$expires_epoch" "$months")" || {
+      echo "错误：无法按 ${months} 个月计算用户的新到期时间，有效期调整未执行：$name" >&2
+      return 1
+    }
+    echo
+    echo '提前到期预览：'
+    printf '  用户：%s｜当前状态：%s\n' "$name" "$status"
+    printf '  当前到期：%s\n' "${expires/T/ }"
+    printf '  调整后：%s\n' "${new_expiry/T/ }"
+    read -r -p '确认提前该用户的到期时间？[y/N]：' answer
+    [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消有效期调整。'; return 0; }
+  fi
   cmd_renew "$name" "$months"
 }
 prompt_adjust_traffic() {

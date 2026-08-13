@@ -3739,7 +3739,7 @@ grep -Fq '输入无效：ShadowTLS SNI 必须是有效域名' "$work/add-invalid
 grep -Fxq 'ADD-RETRY:anytls||valid.example.com' "$work/add-invalid-retry"
 ! grep -Fq 'UNEXPECTED-SELF' "$work/add-invalid-retry"
 
-# 续期菜单必须把用户输入的多月值原样交给续期命令。
+# 有效期调整菜单必须把正数和负数月数原样交给命令；负数先预览确认。
 renew_prompt_state="$work/renew-prompt-state.json"
 printf '%s\n' '{"schema_version":7,"users":[{"name":"renew-user","port":20001,"status":"active","metered":true,"limit_gib":2,"billing_anchor":5,"expires_at":"2026-08-15T00:00:00+0800","created_at":"2026-07-15T00:00:00+0800","protocol":"anytls","anytls_password":"secret","tls_sni":"example.com","endpoints":[{"protocol":"anytls","port":20001,"anytls_password":"secret","tls_sni":"example.com"}]}],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$renew_prompt_state"
 (
@@ -3753,6 +3753,44 @@ printf '%s\n' '{"schema_version":7,"users":[{"name":"renew-user","port":20001,"s
 EOF
 ) > "$work/renew-prompt"
 grep -Fxq 'RENEW:renew-user|6' "$work/renew-prompt"
+(
+  STATE_FILE="$renew_prompt_state"
+  MENU_RETURNED=false
+  prepare_core() { :; }
+  date() {
+    if [[ "${1:-}" == -d && "${3:-}" == +%s ]]; then printf '2000\n'; else command date "$@"; fi
+  }
+  calculate_renewal_expiry() {
+    [[ "$1" == 2000 && "$2" == -1 ]]
+    printf '2026-07-15T00:00:00+0800\n'
+  }
+  cmd_renew() { printf 'RENEW:%s|%s\n' "$1" "$2"; }
+  prompt_renew_user <<'EOF'
+1
+-1
+y
+EOF
+) > "$work/renew-prompt-negative"
+grep -Fq '提前到期预览：' "$work/renew-prompt-negative"
+grep -Fq '当前到期：2026-08-15 00:00:00+0800' "$work/renew-prompt-negative"
+grep -Fq '调整后：2026-07-15 00:00:00+0800' "$work/renew-prompt-negative"
+grep -Fxq 'RENEW:renew-user|-1' "$work/renew-prompt-negative"
+(
+  STATE_FILE="$renew_prompt_state"
+  MENU_RETURNED=false
+  prepare_core() { :; }
+  date() { printf '2000\n'; }
+  calculate_renewal_expiry() { printf '2026-07-15T00:00:00+0800\n'; }
+  cmd_renew() { printf 'UNEXPECTED-RENEW\n'; }
+  prompt_renew_user <<'EOF'
+1
+-1
+n
+EOF
+) > "$work/renew-prompt-cancel"
+grep -Fq '已取消有效期调整。' "$work/renew-prompt-cancel"
+! grep -Fq 'UNEXPECTED-RENEW' "$work/renew-prompt-cancel"
+grep -Fq "renew '调整用户有效期'" src/80-menus-main.sh
 
 edit_prompt_state="$work/edit-prompt-state.json"
 printf '%s\n' '{"schema_version":3,"users":[{"name":"alice","port":20001,"status":"active","metered":true,"limit_gib":2,"billing_anchor":5,"expires_at":"2026-08-15T00:00:00+0800","created_at":"2026-07-15T00:00:00+0800","shadowtls_password":"st","ss2022_password":"ss","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"old.example.com"}],"splits":[]}' > "$edit_prompt_state"
@@ -4990,8 +5028,9 @@ grep -Fq 'run_managed_step enable_user_without_transaction' <<<"$renew_body"
 renew_expiry_body="$(declare -f calculate_renewal_expiry)"
 grep -Fq 'date -d "$base_time ${months} months"' <<<"$renew_expiry_body"
 ! grep -Fq '+${months} month' <<<"$renew_expiry_body"
+grep -Fq '^-?[1-9][0-9]*$' <<<"$renew_expiry_body"
 
-# GNU date 必须按输入增加对应月份，并保持时分秒；旧表达式会把 +N 当成时区。
+# GNU date 必须按输入增加或减少对应月份，并保持时分秒；旧表达式会把 +N 当成时区。
 if date -d '2026-08-15 10:20:30 UTC' +%s >/dev/null 2>&1; then
   (
     export TZ=UTC0
@@ -5006,6 +5045,10 @@ if date -d '2026-08-15 10:20:30 UTC' +%s >/dev/null 2>&1; then
       renewal_expected="${renewal_case#*|}"
       [[ "$(calculate_renewal_expiry "$renewal_base" "$renewal_months")" == "$renewal_expected" ]]
     done
+    renewal_october_base="$(date -d '2026-10-12 10:20:30 UTC' +%s)"
+    [[ "$(calculate_renewal_expiry "$renewal_october_base" -1)" == 2026-09-12T10:20:30+0000 ]]
+    [[ "$(calculate_renewal_expiry "$renewal_october_base" -2)" == 2026-08-12T10:20:30+0000 ]]
+    ! calculate_renewal_expiry "$renewal_october_base" 0 >/dev/null 2>&1
   )
 else
   printf '%s\n' 'renewal date matrix skipped: GNU date is unavailable' >&2
@@ -5015,22 +5058,30 @@ fi
 (
   renewal_expires_epoch=2000
   renewal_now_epoch=1000
+  renewal_new_expiry_epoch=3000
+  renewal_status=active
   renewal_calls="$work/renewal-date-calls"
   : > "$renewal_calls"
   renewal_expiry_written=""
   renewal_transaction_started=false
   renewal_state_write_calls=0
+  renewal_prepare_enable_calls=0
+  renewal_enable_calls=0
   validate_name() { :; }
   user_exists() { :; }
   get_user_json() {
-    jq -cn --arg expires "$renewal_expires_epoch" \
-      '{name:"renew-user",expires_at:$expires,status:"active"}'
+    jq -cn --arg expires "$renewal_expires_epoch" --arg status "$renewal_status" \
+      '{name:"renew-user",expires_at:$expires,status:$status}'
   }
   date() {
     if [[ "$*" == '+%s' ]]; then
       printf '%s\n' "$renewal_now_epoch"
     elif [[ "${1:-}" == -d && "${3:-}" == +%s ]]; then
-      printf '%s\n' "$renewal_expires_epoch"
+      if [[ "$2" == 2027-* ]]; then
+        printf '%s\n' "$renewal_new_expiry_epoch"
+      else
+        printf '%s\n' "$renewal_expires_epoch"
+      fi
     else
       return 1
     fi
@@ -5041,6 +5092,8 @@ fi
   }
   start_managed_operation() { renewal_transaction_started=true; }
   run_managed_step() { "$@"; }
+  prepare_user_enable() { renewal_prepare_enable_calls=$((renewal_prepare_enable_calls + 1)); }
+  enable_user_without_transaction() { renewal_enable_calls=$((renewal_enable_calls + 1)); }
   state_set_expiry() {
     renewal_state_write_calls=$((renewal_state_write_calls + 1))
     renewal_expiry_written="$2"
@@ -5061,6 +5114,39 @@ fi
   [[ "$renewal_transaction_started" == true ]]
   [[ "$renewal_state_write_calls" == 2 ]]
 
+  renewal_expires_epoch=2000
+  renewal_status=active
+  renewal_transaction_started=false
+  cmd_renew renew-user -1
+  [[ "$(tail -n 1 "$renewal_calls")" == '2000|-1' ]]
+  [[ "$renewal_transaction_started" == true ]]
+  [[ "$renewal_state_write_calls" == 3 ]]
+  [[ "$renewal_prepare_enable_calls" == 0 ]]
+  [[ "$renewal_enable_calls" == 0 ]]
+
+  renewal_status=disabled
+  renewal_transaction_started=false
+  cmd_renew renew-user -1
+  [[ "$renewal_transaction_started" == true ]]
+  [[ "$renewal_state_write_calls" == 4 ]]
+  [[ "$renewal_prepare_enable_calls" == 0 ]]
+  [[ "$renewal_enable_calls" == 0 ]]
+
+  renewal_status=active
+  renewal_new_expiry_epoch=900
+  renewal_transaction_started=false
+  renewal_expiry_before_failure="$renewal_expiry_written"
+  renewal_write_calls_before_failure="$renewal_state_write_calls"
+  if cmd_renew renew-user -2 >"$work/renew-past-failure.out" 2>&1; then
+    echo 'expiry reduction into the past should stop before the transaction' >&2
+    exit 1
+  fi
+  [[ "$renewal_transaction_started" == false ]]
+  [[ "$renewal_state_write_calls" == "$renewal_write_calls_before_failure" ]]
+  [[ "$renewal_expiry_written" == "$renewal_expiry_before_failure" ]]
+  grep -Fq '请执行「停用用户」' "$work/renew-past-failure.out"
+
+  renewal_new_expiry_epoch=3000
   renewal_transaction_started=false
   renewal_expiry_before_failure="$renewal_expiry_written"
   renewal_write_calls_before_failure="$renewal_state_write_calls"
@@ -5072,7 +5158,7 @@ fi
   [[ "$renewal_transaction_started" == false ]]
   [[ "$renewal_state_write_calls" == "$renewal_write_calls_before_failure" ]]
   [[ "$renewal_expiry_written" == "$renewal_expiry_before_failure" ]]
-  grep -Fq '续期未执行' "$work/renew-date-failure.out"
+  grep -Fq '有效期调整未执行' "$work/renew-date-failure.out"
 )
 (
   STATE_FILE="$work/unsafe-enable-state.json"
