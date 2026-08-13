@@ -134,7 +134,7 @@ openai_key_regex='sk-[A-Za-z0-9_-]{20,}'
 credential_url_regex='https?://[^/@[:space:]]+:[^/@[:space:]]+@'
 credential_regex="(${github_token_regex}|${aws_key_regex}|${google_key_regex}|${slack_token_regex}|${stripe_key_regex}|${openai_key_regex}|${credential_url_regex})"
 
-scan_regex private-key "$private_key_regex" '^tests/test-landing-agent\.sh$'
+scan_regex private-key "$private_key_regex"
 scan_regex credential-signatures "$credential_regex"
 
 path_result="$WORK/sensitive-paths.matches"

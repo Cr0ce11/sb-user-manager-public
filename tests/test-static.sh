@@ -6,8 +6,29 @@ cd "$(dirname "$0")/.."
 [[ -x tools/build-manager.sh ]]
 [[ -f src/modules.list && ! -L src/modules.list ]]
 source_module_count="$(find src -maxdepth 1 -type f -name '[0-9][0-9]-*.sh' | wc -l | tr -d ' ')"
-if [[ "$source_module_count" != 26 ]]; then
-  printf 'expected 26 source modules, found %s\n' "$source_module_count" >&2
+if [[ "$source_module_count" != 10 ]]; then
+  printf 'expected 10 source modules, found %s\n' "$source_module_count" >&2
+  exit 1
+fi
+expected_modules='00-bootstrap.sh
+10-state-transactions.sh
+20-migration-backup.sh
+30-user-runtime.sh
+40-split-runtime.sh
+50-install-update.sh
+60-operations-diagnostics.sh
+70-split-prompts.sh
+79-standalone-startup.sh
+80-menus-main.sh'
+[[ "$(<src/modules.list)" == "$expected_modules" ]]
+if find src tests -maxdepth 1 -type f \
+    \( -name '*controller*' -o -name '*landing*' -o -name '*manager-role*' \) | grep -q .; then
+  echo 'retired v5 source or dedicated test files remain' >&2
+  exit 1
+fi
+decision_count="$(find docs/DECISIONS -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9]-*.md' | wc -l | tr -d ' ')"
+if [[ "$decision_count" != 6 || -e docs/V5-ENTRY-CONTROLLER-POC.md ]]; then
+  echo 'retired v5 ADR or POC documents remain' >&2
   exit 1
 fi
 bash tools/build-manager.sh --check >/dev/null
@@ -61,13 +82,6 @@ grep -Fq 'MANAGER_REPOSITORY="DTB201/sb-user-manager-public"' sb-user-manager.sh
 grep -Fq 'SINGBOX_REPOSITORY="SagerNet/sing-box"' sb-user-manager.sh
 grep -Fq 'validate_runtime_config_file()' sb-user-manager.sh
 grep -Fq 'parse_runtime_config()' sb-user-manager.sh
-grep -Fq 'validate_controller_state_file()' sb-user-manager.sh
-grep -Fq 'atomic_controller_state_update()' sb-user-manager.sh
-grep -Fq 'CONTROLLER_STATE_SCHEMA_VERSION=1' sb-user-manager.sh
-grep -Fq 'controller_role_preflight()' sb-user-manager.sh
-grep -Fq 'initialize_entry_controller_role()' sb-user-manager.sh
-grep -Fq 'repair_entry_controller_dependencies()' sb-user-manager.sh
-grep -Fq 'provision_entry_controller_role()' sb-user-manager.sh
 grep -Fq 'run_standalone_interactive_startup()' sb-user-manager.sh
 grep -Fq 'run_standalone_internal_expire()' sb-user-manager.sh
 grep -Fq '"") run_standalone_interactive_startup "${@:2}" ;;' sb-user-manager.sh
@@ -78,138 +92,11 @@ grep -Fq 'recover_manager_handoff || die' sb-user-manager.sh
 grep -Fq 'exec "$recovered_installed" "$@"' sb-user-manager.sh
 [[ "$(grep -Fc '# >>> manager_channel_handoff' src/50-install-update.sh)" == 1 ]]
 [[ "$(grep -Fc '# <<< manager_channel_handoff' src/50-install-update.sh)" == 1 ]]
-grep -Fq 'printf '\''%s\n'\'' coreutils gawk grep jq openssh-client openssl python3 util-linux' sb-user-manager.sh
-grep -Fq 'CONTROLLER_ROLE_LAST_STATUS=not_checked' sb-user-manager.sh
-grep -Fq 'controller_apply_landing()' sb-user-manager.sh
-grep -Fq 'controller_landing_prepare_known_hosts()' sb-user-manager.sh
-grep -Fq 'controller_landing_response_file_is_safe()' sb-user-manager.sh
-grep -Fq 'controller_landing_discover_fingerprint()' sb-user-manager.sh
-grep -Fq 'controller_test_landing_registration_channel()' sb-user-manager.sh
-grep -Fq 'controller_register_landing()' sb-user-manager.sh
-grep -Fq 'controller_register_and_apply_landing()' sb-user-manager.sh
-grep -Fq 'controller_initialize_landing_credentials()' sb-user-manager.sh
-grep -Fq 'controller_remove_unregistered_landing_credentials()' sb-user-manager.sh
-grep -Fq 'CONTROLLER_LANDING_CREDENTIAL_PASSWORD_BYTES=32' sb-user-manager.sh
-grep -Fq 'controller_onboard_landing()' sb-user-manager.sh
-grep -Fq 'controller_recover_landing_onboarding()' sb-user-manager.sh
-grep -Fq 'CONTROLLER_LANDING_ONBOARDING_JOURNAL_SCHEMA_VERSION=1' sb-user-manager.sh
-grep -Fq '/var/lib/sb-user-manager/controller-onboarding.json' sb-user-manager.sh
-grep -Fq 'credentials_pending|bootstrap_pending|registration_pending|apply_pending|local_aborted|remote_rolled_back|completed' sb-user-manager.sh
-grep -Fq 'CONTROLLER_LANDING_ONBOARDING_LAST_STAGE=not_started' sb-user-manager.sh
-grep -Fq 'registration_state_unknown' sb-user-manager.sh
-grep -Fq 'CONTROLLER_LANDING_PROBE_ERROR_CODE=invalid_input' sb-user-manager.sh
-grep -Fq 'StrictHostKeyChecking=yes' sb-user-manager.sh
-grep -Fq 'HostKeyAlgorithms=ssh-ed25519' sb-user-manager.sh
-grep -Fq 'ClearAllForwardings=yes' sb-user-manager.sh
-grep -Fq 'validate_landing_credential_manifest()' sb-user-manager.sh
-grep -Fq 'landing_apply_package_json_is_valid()' sb-user-manager.sh
-grep -Fq 'validate_landing_apply_package()' sb-user-manager.sh
-grep -Fq 'build_landing_apply_package()' sb-user-manager.sh
-grep -Fq 'landing_apply_replay_decision()' sb-user-manager.sh
-grep -Fq 'commit_landing_apply_receipt()' sb-user-manager.sh
-grep -Fq 'LANDING_APPLY_SCHEMA_VERSION=1' sb-user-manager.sh
-grep -Fq 'LANDING_APPLY_MAX_TTL=600' sb-user-manager.sh
-grep -Fq 'os.O_TMPFILE' sb-user-manager.sh
-grep -Fq 'AT_EMPTY_PATH = 0x1000' sb-user-manager.sh
-grep -Fq 'AT_SYMLINK_FOLLOW = 0x400' sb-user-manager.sh
-grep -Fq 'PR_SET_PDEATHSIG = 1' sb-user-manager.sh
-grep -Fq 'PR_SET_DUMPABLE = 4' sb-user-manager.sh
-grep -Fq 'resource.setrlimit(resource.RLIMIT_CORE, (0, 0))' sb-user-manager.sh
-grep -Fq '/proc/self/coredump_filter' sb-user-manager.sh
-grep -Fq 'validate_tls_snapshot(' sb-user-manager.sh
-grep -Fq 'os.memfd_create' sb-user-manager.sh
-grep -Fq 'safe_fsync(anonymous_fd)' sb-user-manager.sh
-grep -Fq 'safe_fsync(directory_fd)' sb-user-manager.sh
-grep -Fq '不支持安全的匿名 apply package 发布，已拒绝生成' sb-user-manager.sh
-builder_static_body="$(sed -n '/^build_landing_apply_package() {$/,/^}$/p' sb-user-manager.sh)"
-if grep -Eq 'gateway_tmp|package_tmp|\.landing-apply\.(gateway|package)|mktemp |register_temp_path|validate_landing_apply_package' \
-    <<<"$builder_static_body"; then
-  echo 'landing apply builder must not use named plaintext staging or the extracting validator' >&2
-  exit 1
-fi
-grep -Fq 'landing_agent_main()' sb-user-manager.sh
-grep -Fq 'landing_apply_helper_main()' sb-user-manager.sh
-grep -Fq 'landing_apply_signal_rollback()' sb-user-manager.sh
-grep -Fq 'landing_restore_receipt_snapshot()' sb-user-manager.sh
-grep -Fq 'landing_apply_runtime_directories_match_applied()' sb-user-manager.sh
-grep -Fq 'landing_apply_cleanup_marker_without_journal_is_valid()' sb-user-manager.sh
-grep -Fq 'landing_validate_nft_rollback_batch()' sb-user-manager.sh
-grep -Fq 'cleanup.started' sb-user-manager.sh
-grep -Fq 'nft -nn list table' sb-user-manager.sh
-grep -Fq 'LANDING_AGENT_HELPER_PATH=/usr/local/libexec/sb-user-manager-landing-apply' sb-user-manager.sh
-grep -Fq 'response="$(/usr/bin/sudo -n -- /usr/local/libexec/sb-user-manager-landing-apply 2>/dev/null)"' sb-user-manager.sh
 grep -Fq 'sb-user-manager-landing-agent|sb-user-manager-landing-apply)' sb-user-manager.sh
 grep -Fq 'v5 入口与落地能力已经退役，拒绝运行遗留 helper 入口' sb-user-manager.sh
-[[ "$(grep -Fc 'install_landing_apply_runtime_traps' sb-user-manager.sh)" == 4 ]]
-grep -Fq 'install_landing_restricted_channel()' sb-user-manager.sh
-grep -Fq 'landing_restricted_channel_is_valid()' sb-user-manager.sh
-grep -Fq 'uninstall_landing_restricted_channel()' sb-user-manager.sh
-grep -Fq 'landing_channel_identity_allows_package()' sb-user-manager.sh
-grep -Fq 'LANDING_CHANNEL_ACCOUNT=sb-landing-agent' sb-user-manager.sh
-grep -Fq 'LANDING_CHANNEL_PASSWORD_VALUE='\''*NP*'\''' sb-user-manager.sh
-grep -Fq 'LANDING_CHANNEL_LOCK_PATH=/var/lib/sb-user-manager/landing-channel.lock' sb-user-manager.sh
-grep -Fq 'LANDING_CHANNEL_INPUT_LOCK_PATH=/var/lib/sb-user-manager/landing-channel-input.lock' sb-user-manager.sh
-grep -Fq 'LANDING_CHANNEL_ACTIVE_TRANSACTION_ID=' sb-user-manager.sh
-grep -Fq 'landing_channel_finish_rollback_transaction()' sb-user-manager.sh
-grep -Fq 'landing_channel_candidates_match_installed()' sb-user-manager.sh
-grep -Fq '.landing-channel.${transaction_id}.XXXXXX' sb-user-manager.sh
-grep -Fq 'LANDING_AGENT_READ_TIMEOUT=15' sb-user-manager.sh
-grep -Fq 'with_landing_channel_input_lock landing_apply_helper_request' sb-user-manager.sh
-grep -Fq 'with_landing_channel_shared_lock landing_apply_process_request' sb-user-manager.sh
-grep -Fq '"$callback" "$@" 4>&-' sb-user-manager.sh
-grep -Fq '"$callback" "$@" 5>&-' sb-user-manager.sh
-grep -Fq '"$callback" "$@" 6>&-' sb-user-manager.sh
-grep -Fq 'landing_channel_file_matches "$source" 700 "$root_uid" "$root_gid"' sb-user-manager.sh
-grep -Fq 'restrict,from="%s",command="%s %s" ssh-ed25519' sb-user-manager.sh
-grep -Fq 'LANDING_CHANNEL_GENERATION_PATH=/var/lib/sb-user-manager-landing/.channel-generation' sb-user-manager.sh
-grep -Fq 'NOPASSWD:NOSETENV:NOLOG_INPUT:NOLOG_OUTPUT: ${LANDING_AGENT_HELPER_PATH} ${generation}' sb-user-manager.sh
-grep -Fq 'landing_channel_generation_allows_request "$LANDING_REQUESTED_GENERATION"' sb-user-manager.sh
-grep -Fq '#!/usr/bin/python3 -I' sb-user-manager.sh
-grep -Fq '! landing_channel_identity_allows_package "$package"' sb-user-manager.sh
-grep -Fq 'LANDING_STARTUP_RECOVERY_UNIT_NAME=sb-user-manager-landing-recovery.service' sb-user-manager.sh
-grep -Fq 'LANDING_STARTUP_RECOVERY_MODE_ARGUMENT=--recover-startup' sb-user-manager.sh
-grep -Fq 'landing_startup_render_recovery_unit()' sb-user-manager.sh
-grep -Fq 'landing_startup_render_singbox_dropin()' sb-user-manager.sh
-grep -Fq 'landing_startup_recovery_ensure_active()' sb-user-manager.sh
-grep -Fq 'landing_startup_recovery_main()' sb-user-manager.sh
-if grep -Fq 'ConditionPathExists=' sb-user-manager.sh; then
-  echo 'landing startup recovery must fail closed instead of conditionally skipping' >&2
-  exit 1
-fi
-if grep -Fxq 'Wants=nftables.service' sb-user-manager.sh ||
-   grep -Fxq 'Requires=nftables.service' sb-user-manager.sh; then
-  echo 'landing startup recovery may order after nftables but must not require it' >&2
-  exit 1
-fi
-grep -Fq 'landing-channel.lock' docs/DECISIONS/0009-restricted-landing-channel-installation.md
-if grep -Fq 'install_landing_restricted_channel' src/80-menus-main.sh ||
-   grep -Fq 'initialize_entry_controller_role' src/80-menus-main.sh ||
-   grep -Fq 'initialize_entry_controller_role' src/50-install-update.sh ||
-   grep -Fq 'controller_role_preflight' src/80-menus-main.sh ||
-   grep -Fq 'controller_role_preflight' src/50-install-update.sh ||
-   grep -Fq 'repair_entry_controller_dependencies' src/80-menus-main.sh ||
-   grep -Fq 'repair_entry_controller_dependencies' src/50-install-update.sh ||
-   grep -Fq 'provision_entry_controller_role' src/80-menus-main.sh ||
-   grep -Fq 'provision_entry_controller_role' src/50-install-update.sh ||
-   grep -Fq 'detect_manager_role' src/80-menus-main.sh ||
-   grep -Fq 'detect_manager_role' src/50-install-update.sh ||
-   grep -Fq 'controller_apply_landing' src/80-menus-main.sh ||
-   grep -Fq 'controller_register_landing' src/80-menus-main.sh ||
-   grep -Fq 'uninstall_landing_restricted_channel' src/50-install-update.sh ||
-   grep -Fq 'controller_apply_landing' src/50-install-update.sh ||
-   grep -Fq 'controller_register_landing' src/50-install-update.sh ||
-   grep -Fq 'controller_onboard_landing' src/80-menus-main.sh ||
-   grep -Fq 'controller_onboard_landing' src/50-install-update.sh ||
-   grep -Fq 'controller_recover_landing_onboarding' src/80-menus-main.sh ||
-   grep -Fq 'controller_recover_landing_onboarding' src/50-install-update.sh ||
-   grep -Fq 'landing_startup_recovery' src/80-menus-main.sh ||
-   grep -Fq 'landing_startup_recovery' src/50-install-update.sh; then
-  echo 'v5 landing mutation functions must not be connected to standalone menus or updater' >&2
-  exit 1
-fi
-if grep -Eq 'detect_manager_role|entry_controller|landing_managed|provision_entry|controller_(onboard|apply|register)_landing|install_landing_restricted_channel' \
-    src/79-standalone-startup.sh; then
-  echo 'standalone startup must not route into a retired v5 role' >&2
+if grep -Eq 'CONTROLLER_STATE_SCHEMA_VERSION|CONTROLLER_ROLE_LAST_STATUS|controller_role_preflight|detect_manager_role|controller_(apply|register|onboard)_landing|LANDING_APPLY_SCHEMA_VERSION|landing_(agent|apply_helper)_main|install_landing_restricted_channel|LANDING_STARTUP_RECOVERY_UNIT_NAME' \
+    sb-user-manager.sh src/*.sh; then
+  echo 'retired v5 executable implementation remains in the manager' >&2
   exit 1
 fi
 grep -Fq 'harden_existing_environment_backups()' sb-user-manager.sh
@@ -238,65 +125,15 @@ if grep -Eq 'runs-on: ubuntu-latest|uses: actions/checkout@v[0-9]+|container: de
   echo 'release workflow contains a floating runner, action or Debian image reference' >&2
   exit 1
 fi
-grep -Eq 'container: debian:bookworm-[0-9]+-slim@sha256:[0-9a-f]{64}$' .github/workflows/ci-release.yml
-grep -Eq '^[[:space:]]+image: debian:bookworm-[0-9]+-slim@sha256:[0-9a-f]{64}$' .github/workflows/ci-release.yml
+[[ "$(grep -Ec '^[[:space:]]+container: debian:bookworm-[0-9]+-slim@sha256:[0-9a-f]{64}$' .github/workflows/ci-release.yml)" == 2 ]]
 grep -Fq 'bash tests/test-release-workflow.sh' .github/workflows/ci-release.yml
-grep -Fq 'bash tests/test-landing-channel-install.sh' .github/workflows/ci-release.yml
-grep -Fq 'bash tests/test-controller-landing-transport.sh' .github/workflows/ci-release.yml
-grep -Fq 'bash tests/test-controller-landing-registration.sh' .github/workflows/ci-release.yml
-grep -Fq 'bash tests/test-controller-landing-credentials.sh' .github/workflows/ci-release.yml
-grep -Fq 'bash tests/test-controller-landing-onboarding.sh' .github/workflows/ci-release.yml
-grep -Fq 'bash tests/test-controller-landing-onboarding-journal.sh' .github/workflows/ci-release.yml
-grep -Fq 'bash tests/test-controller-role.sh' .github/workflows/ci-release.yml
-grep -Fq 'bash tests/test-controller-role-repair.sh' .github/workflows/ci-release.yml
-grep -Fq 'bash tests/test-controller-role-provision.sh' .github/workflows/ci-release.yml
-grep -Fq 'bash tests/test-manager-role-detection.sh' .github/workflows/ci-release.yml
 grep -Fq 'bash tests/test-manager-handoff.sh' .github/workflows/ci-release.yml
-grep -Fq 'bash tests/test-landing-bootstrap.sh' .github/workflows/ci-release.yml
-grep -Fq 'bash tests/test-landing-dependency-prep.sh' .github/workflows/ci-release.yml
-grep -Fq 'SB_REQUIRE_LANDING_DEPENDENCY_PREP_PRODUCTION=true bash tests/test-landing-dependency-prep.sh' .github/workflows/ci-release.yml
-grep -Fq 'bash tests/test-landing-singbox-runtime-prep.sh' .github/workflows/ci-release.yml
-grep -Fq 'bash tests/test-landing-readiness-gate.sh' .github/workflows/ci-release.yml
-grep -Fq 'landing-bootstrap.json' src/18-landing-bootstrap.sh
-grep -Fq 'bootstrap_id' docs/DECISIONS/0015-entry-initiated-landing-root-bootstrap.md
-grep -Fq 'controller_prepare_landing_dependencies()' sb-user-manager.sh
-grep -Fq 'apt_update_failed' src/18-landing-dependency-prep.sh
-grep -Fq 'Issue #236' docs/DECISIONS/0024-entry-initiated-landing-dependency-preparation.md
-grep -Fq 'controller_prepare_landing_singbox_runtime()' sb-user-manager.sh
-grep -Fq 'existing_conflict' src/18-landing-singbox-runtime-prep.sh
-grep -Fq 'Issue #238' docs/DECISIONS/0025-entry-initiated-landing-singbox-runtime-preparation.md
-grep -Fq 'controller_prepare_landing_readiness()' sb-user-manager.sh
-grep -Fq 'CONTROLLER_LANDING_READINESS_LAST_STAGE=not_started' sb-user-manager.sh
-grep -Fq 'Issue #240' docs/DECISIONS/0026-unified-pre-secret-landing-readiness-gate.md
-if grep -Eq 'controller_prepare_landing_dependencies|controller_landing_prepare_dependencies_in_work' \
-    src/79-standalone-startup.sh src/80-menus-main.sh; then
-  echo 'landing dependency preparation must remain dormant' >&2
-  exit 1
-fi
-if grep -Eq 'controller_prepare_landing_singbox_runtime|controller_landing_prepare_singbox_runtime_in_work' \
-    src/79-standalone-startup.sh src/80-menus-main.sh; then
-  echo 'landing sing-box runtime preparation must remain dormant' >&2
-  exit 1
-fi
-grep -Fq 'controller_prepare_and_onboard_landing()' sb-user-manager.sh
-grep -Fq 'controller_prepare_landing_readiness "$address" "$ssh_port" "$landing_id"' \
-  src/19-controller-landing-onboarding.sh
-if grep -Eq 'controller_prepare_and_onboard_landing|controller_prepare_landing_readiness' \
-    src/79-standalone-startup.sh src/80-menus-main.sh src/50-install-update.sh; then
-  echo 'prepared landing onboarding must remain detached from runtime entry points' >&2
-  exit 1
-fi
-grep -Fq 'Issue #245' docs/DECISIONS/0027-readiness-gated-landing-onboarding.md
-grep -Fq 'SB_LANDING_APPLY_TEST_FORCE_LINK_METHOD=proc SB_LANDING_APPLY_TEST_EXPECT_LINK_METHOD=proc bash tests/test-landing-apply-protocol.sh' .github/workflows/ci-release.yml
-grep -Fq 'SB_LANDING_APPLY_TEST_EXPECT_LINK_METHOD=direct /bin/bash tests/test-landing-apply-protocol.sh' .github/workflows/ci-release.yml
-grep -Fq 'SB_REQUIRE_LANDING_STARTUP_SYSTEMD_VERIFY=true bash tests/test-landing-startup-gate.sh' .github/workflows/ci-release.yml
-grep -Fq '/usr/bin/sudo /usr/bin/env PATH=/usr/sbin:/usr/bin:/sbin:/bin SB_REQUIRE_LANDING_STARTUP_SYSTEMD_VERIFY=true SB_REQUIRE_LANDING_STARTUP_SYSTEMD_RUNTIME=true /bin/bash tests/test-landing-startup-gate.sh' .github/workflows/ci-release.yml
-grep -Fq '/usr/bin/sudo /usr/bin/env PATH=/usr/sbin:/usr/bin:/sbin:/bin SB_REQUIRE_LANDING_CHANNEL_E2E=true SB_LANDING_CHANNEL_E2E_NORMALIZE_LOCAL_BIN=true /bin/bash tests/test-landing-channel-e2e.sh' .github/workflows/ci-release.yml
-grep -Fq '/usr/bin/env PATH=/usr/sbin:/usr/bin:/sbin:/bin SB_REQUIRE_LANDING_CHANNEL_E2E=true /bin/bash tests/test-landing-channel-e2e.sh' .github/workflows/ci-release.yml
+grep -Fq 'bash tests/test-standalone-startup.sh' .github/workflows/ci-release.yml
+grep -Fq 'bash tests/test-public-readiness.sh' .github/workflows/ci-release.yml
 grep -Fq 'debian-landing-e2e:' .github/workflows/ci-release.yml
-grep -Fq 'options: --cap-add=NET_ADMIN' .github/workflows/ci-release.yml
-if grep -Fq -- '--privileged' .github/workflows/ci-release.yml; then
-  echo 'landing-channel CI must not use a fully privileged container' >&2
+if grep -Eq 'tests/test-(controller|landing|manager-role-detection)|SB_LANDING|openssh-server|NET_ADMIN|--privileged' \
+    .github/workflows/ci-release.yml; then
+  echo 'retired v5 tests or elevated container capabilities remain in CI' >&2
   exit 1
 fi
 grep -Fq 'fetch_singbox_channel_releases()' sb-user-manager.sh
@@ -528,18 +365,11 @@ if [[ "$signal_rollback_count" != 7 ]]; then
   echo "expected 7 signal rollback registrations, found $signal_rollback_count" >&2
   exit 1
 fi
-if [[ "$clear_rollback_count" != 19 ]]; then
-  echo "expected 19 signal rollback clears, found $clear_rollback_count" >&2
+if [[ "$clear_rollback_count" != 12 ]]; then
+  echo "expected 12 signal rollback clears, found $clear_rollback_count" >&2
   exit 1
 fi
 grep -Fq 'set_signal_rollback rollback_manager_handoff' sb-user-manager.sh
-grep -Fq 'set_signal_rollback landing_apply_signal_rollback' sb-user-manager.sh
-grep -Fq 'set_signal_rollback landing_channel_signal_rollback' sb-user-manager.sh
-grep -Fq 'LANDING_APPLY_TRANSACTION_SCHEMA_VERSION=1' sb-user-manager.sh
-grep -Fq 'landing_apply_recover_pending_transaction' sb-user-manager.sh
-grep -Fq 'landing_apply_write_transaction_journal active' sb-user-manager.sh
-grep -Fq 'landing_apply_write_transaction_journal committed' sb-user-manager.sh
-grep -Fq 'landing_apply_write_transaction_journal rolled_back' sb-user-manager.sh
 grep -Fq 'MIGRATION_FORMAT_VERSION=1' sb-user-manager.sh
 grep -Fq 'MIGRATION_BUNDLE_VERSION=1' sb-user-manager.sh
 if perl -ne '$found=1 if /\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]/; END { exit($found ? 0 : 1) }' sb-user-manager.sh; then

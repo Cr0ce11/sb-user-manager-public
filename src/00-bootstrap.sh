@@ -295,12 +295,6 @@ is_managed_temp_path() {
     [[ "$name" =~ ^\.(nfuse-snapshot|transaction)\. ]] ||
     [[ "$name" =~ ^\.singbox-channel\. ]] ||
     [[ "$name" =~ ^\.shared-preset-runtime\. ]] ||
-    [[ "$name" =~ ^\.controller-state\. ]] ||
-    [[ "$name" =~ ^\.controller-landing\. ]] ||
-    [[ "$name" =~ ^\.landing-(credentials|manifest)\. ]] ||
-    [[ "$name" =~ ^\.landing-bootstrap\. ]] ||
-    [[ "$name" =~ ^\.(landing-apply|landing-receipt)\. ]] ||
-    [[ "$name" =~ ^\.landing-channel\. ]] ||
     [[ -n "${STATE_FILE:-}" && "$path" == "${STATE_FILE}.tmp" ]] ||
     [[ "$name" == sb-user-data-*.sbm.tmp ]]
 }

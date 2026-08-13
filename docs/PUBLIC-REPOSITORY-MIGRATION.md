@@ -10,7 +10,7 @@
 - 原私有版和分享版停止发布，原私有仓库永久退役；公开仓库保持现名，避免破坏现有公开客户端更新地址。
 - 旧私有版配置中的 `GITHUB_TOKEN` 只为迁移兼容而接受并立即丢弃，不载入进程、不发送到网络、不写回配置。
 - 仍运行旧私有版的服务器可以使用同版本或更高版本的公开 Release 执行 `--take-over-installed-manager`。接管只替换管理脚本与版本记录，不修改用户、流量、配额、有效期、证书、分流、sing-box 或 Nfuse，也不会启停服务。
-- 原 v5 方向永久终止；自 v4.25.2 起进入公开版本的休眠基础由 [公开 Issue #17](https://github.com/DTB201/sb-user-manager-public/issues/17) 独立清理。
+- 原 v5 方向永久终止；自 v4.25.2 起进入公开版本的休眠基础已由 [公开 Issue #17](https://github.com/DTB201/sb-user-manager-public/issues/17) 独立清理，只保留遗留 helper 文件名的失败关闭保护。
 
 ## 初次公开审计基线
 
@@ -34,7 +34,7 @@
 
 1. 公开 Issues 与 Private Vulnerability Reporting 已启用。
 2. 原私有仓库唯一仍有产品价值的 Mihomo 候选需求已迁为 [公开 Issue #16](https://github.com/DTB201/sb-user-manager-public/issues/16)。
-3. 私有双版本与 v5 开放事项不迁移；休眠 v5 代码清理由公开 Issue 独立跟踪。
+3. 私有双版本与 v5 开放事项不迁移；休眠 v5 代码清理由公开 Issue 独立完成。
 4. 已用真实旧私有 v4.18.1、v4.22.1、v4.23.0 脚本在隔离目录接管到公开 v4.25.2，三组数据摘要均保持不变。
 5. 公开仓库完整本地门禁、Pull Request CI 与合并后 `main` CI 必须通过。
 6. 删除前保存最终只读恢复材料、SHA-256、引用清单和仓库设置记录；不得把服务器秘密或访问凭据写入归档。

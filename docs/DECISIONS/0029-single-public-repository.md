@@ -17,7 +17,7 @@
 3. 公开 Release 继续只发布 `sb-user-manager.sh` 及其 SHA-256，管理脚本匿名查询公开 Release。
 4. 继续保留旧私有版到同版本或更高公开版的受控接管、旧脚本元数据识别，以及对旧 `GITHUB_TOKEN` 配置的兼容丢弃。这些是现存低版本服务器的迁移安全网，不代表继续支持私有发布。
 5. 公开版不再承诺切回私有渠道。已经接管成功的服务器后续只从公开仓库更新。
-6. 原 v5 产品方向永久终止。已经进入已发布脚本的休眠基础另由 [公开 Issue #17](https://github.com/DTB201/sb-user-manager-public/issues/17) 分阶段移除，不与仓库退役混做；第一阶段先断开角色选择、入口/落地菜单和 helper 执行入口，再删除已经不可达的低层模块。
+6. 原 v5 产品方向永久终止。已经进入已发布脚本的休眠基础由 [公开 Issue #17](https://github.com/DTB201/sb-user-manager-public/issues/17) 分阶段移除，不与仓库退役混做；最终只保留两个遗留 helper 文件名的失败关闭保护，避免旧符号链接误入普通菜单。
 7. 原私有仓库中的 Mihomo 候选需求以 [公开 Issue #16](https://github.com/DTB201/sb-user-manager-public/issues/16) 重新记录；其余私有双版本和 v5 开放事项不迁移。
 8. 保持公开仓库名称不变，避免破坏已经安装的公开版更新地址。
 
