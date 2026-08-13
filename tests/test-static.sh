@@ -125,13 +125,17 @@ if grep -Eq 'runs-on: ubuntu-latest|uses: actions/checkout@v[0-9]+|container: de
   echo 'release workflow contains a floating runner, action or Debian image reference' >&2
   exit 1
 fi
-[[ "$(grep -Ec '^[[:space:]]+container: debian:bookworm-[0-9]+-slim@sha256:[0-9a-f]{64}$' .github/workflows/ci-release.yml)" == 3 ]]
+[[ "$(grep -Ec '^[[:space:]]+container: debian:bookworm-[0-9]+-slim@sha256:[0-9a-f]{64}$' .github/workflows/ci-release.yml)" == 2 ]]
 grep -Fq 'bash tests/test-release-workflow.sh' .github/workflows/ci-release.yml
 grep -Fq 'bash tests/test-manager-handoff.sh' .github/workflows/ci-release.yml
 grep -Fq 'bash tests/test-standalone-startup.sh' .github/workflows/ci-release.yml
 grep -Fq 'bash tests/test-public-readiness.sh' .github/workflows/ci-release.yml
 grep -Fq 'debian-standalone-e2e:' .github/workflows/ci-release.yml
 grep -Fq 'needs: [validate, jq16-compat, debian-standalone-e2e]' .github/workflows/ci-release.yml
+if grep -Fq 'debian-landing-e2e' .github/workflows/ci-release.yml; then
+  echo 'retired Debian landing check name remains in the release workflow' >&2
+  exit 1
+fi
 if grep -Eq 'tests/test-(controller|landing|manager-role-detection)|SB_LANDING|openssh-server|NET_ADMIN|--privileged' \
     .github/workflows/ci-release.yml; then
   echo 'retired v5 tests or elevated container capabilities remain in CI' >&2
