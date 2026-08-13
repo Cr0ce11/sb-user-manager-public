@@ -130,7 +130,12 @@ grep -Fq 'bash tests/test-release-workflow.sh' .github/workflows/ci-release.yml
 grep -Fq 'bash tests/test-manager-handoff.sh' .github/workflows/ci-release.yml
 grep -Fq 'bash tests/test-standalone-startup.sh' .github/workflows/ci-release.yml
 grep -Fq 'bash tests/test-public-readiness.sh' .github/workflows/ci-release.yml
-grep -Fq 'debian-landing-e2e:' .github/workflows/ci-release.yml
+grep -Fq 'debian-standalone-e2e:' .github/workflows/ci-release.yml
+grep -Fq 'needs: [validate, jq16-compat, debian-standalone-e2e]' .github/workflows/ci-release.yml
+if grep -Fq 'debian-landing-e2e' .github/workflows/ci-release.yml; then
+  echo 'retired Debian landing check name remains in the release workflow' >&2
+  exit 1
+fi
 if grep -Eq 'tests/test-(controller|landing|manager-role-detection)|SB_LANDING|openssh-server|NET_ADMIN|--privileged' \
     .github/workflows/ci-release.yml; then
   echo 'retired v5 tests or elevated container capabilities remain in CI' >&2

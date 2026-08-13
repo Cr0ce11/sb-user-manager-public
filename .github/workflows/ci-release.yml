@@ -77,8 +77,7 @@ jobs:
           bash tests/test-manager-handoff.sh
           bash tests/test-release-workflow.sh
 
-  # Required check context retained until branch protection is updated separately.
-  debian-landing-e2e:
+  debian-standalone-e2e:
     runs-on: ubuntu-24.04
     container: debian:bookworm-20260713-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
     env:
@@ -103,7 +102,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [validate, jq16-compat, debian-landing-e2e]
+    needs: [validate, jq16-compat, debian-standalone-e2e]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
