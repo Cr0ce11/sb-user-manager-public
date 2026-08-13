@@ -42,7 +42,7 @@ bash tests/test-release-workflow.sh
 
 `tools/export-public-snapshot.sh` 只允许从干净、已提交并通过公开策略审计的工作区导出新目录；它拒绝覆盖已有目录和包含符号链接的源码树。公开仓库的初始提交必须来自这个导出结果，不能复制 `.git` 或手工挑文件。
 
-GitHub 分支保护仍要求历史检查名称 `debian-landing-e2e`。在单独调整仓库 Ruleset 前，该 job ID 不改名，但内部已经只运行固定 Debian 12 容器中的 standalone 启动、旧私有版接管和公开就绪检查，不再申请 `NET_ADMIN`、创建 SSH 账户或运行任何 v5 落地测试。
+GitHub 分支保护要求 `validate`、`jq16-compat` 和 `debian-standalone-e2e`。Debian 检查只运行固定 Debian 12 容器中的 standalone 启动、旧私有版接管和公开就绪验证，不申请 `NET_ADMIN`、创建 SSH 账户或运行任何已退役的 v5 落地测试。
 
 安装了 ShellCheck 时还应运行 CI 中的对应检查。测试失败时不得通过修改测试期望来掩盖行为回归。
 

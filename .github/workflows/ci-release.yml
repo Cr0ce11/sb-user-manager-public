@@ -77,7 +77,31 @@ jobs:
           bash tests/test-manager-handoff.sh
           bash tests/test-release-workflow.sh
 
-  # Required check context retained until branch protection is updated separately.
+  debian-standalone-e2e:
+    runs-on: ubuntu-24.04
+    container: debian:bookworm-20260713-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+    env:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+    steps:
+      - name: Install Debian 12 standalone validation tools
+        run: apt-get update && apt-get install -y bash bsdextrautils ca-certificates coreutils diffutils findutils gawk git grep jq openssl python3 sed tar util-linux
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Verify generated manager
+        shell: bash
+        run: bash tools/build-manager.sh --check
+      - name: Standalone startup checks on Debian 12
+        shell: bash
+        run: bash tests/test-standalone-startup.sh
+      - name: Manager handoff checks on Debian 12
+        shell: bash
+        run: bash tests/test-manager-handoff.sh
+      - name: Public readiness checks on Debian 12
+        shell: bash
+        run: bash tests/test-public-readiness.sh
+
+  # Temporary compatibility context. Remove after branch protection requires
+  # debian-standalone-e2e instead of the historical landing check name.
   debian-landing-e2e:
     runs-on: ubuntu-24.04
     container: debian:bookworm-20260713-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
@@ -103,7 +127,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [validate, jq16-compat, debian-landing-e2e]
+    needs: [validate, jq16-compat, debian-standalone-e2e]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
