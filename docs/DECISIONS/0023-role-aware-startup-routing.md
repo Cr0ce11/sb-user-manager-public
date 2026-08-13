@@ -1,8 +1,10 @@
 # ADR 0023：角色感知启动分发与首次入口安装
 
-- 状态：已接受，专用服务器验收通过
+- 状态：已废弃（2026-08-13，由 ADR 0029 与公开 Issue #17 取代；历史验收记录保留）
 - 日期：2026-08-08
-- 关联：[ADR 0005](0005-entry-authenticated-multi-egress-controller.md)、[ADR 0021](0021-entry-controller-role-provisioning.md)、[ADR 0022](0022-read-only-manager-role-detection.md)、[Issue #234](https://github.com/DTB201/sb-user-manager/issues/234)
+- 关联：[ADR 0005](0005-entry-authenticated-multi-egress-controller.md)、[ADR 0021](0021-entry-controller-role-provisioning.md)、[ADR 0022](0022-read-only-manager-role-detection.md)、[ADR 0029](0029-single-public-repository.md)、[公开 Issue #17](https://github.com/DTB201/sb-user-manager-public/issues/17)、[历史 Issue #234](https://github.com/DTB201/sb-user-manager/issues/234)
+
+> 退役说明：项目所有者已永久终止 v5 入口控制器与多落地方向。Issue #17 第一阶段移除本 ADR 的角色选择、角色分发和 helper 执行入口，普通启动恢复为唯一的 standalone 编排；以下内容仅作为曾经实现和验收过的历史决策记录，不再代表当前或未来产品行为。
 
 ## 背景
 

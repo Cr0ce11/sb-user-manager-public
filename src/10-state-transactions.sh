@@ -991,9 +991,25 @@ clear_environment_transaction() {
   return "$rc"
 }
 
+environment_transaction_journal_is_trusted() {
+  local owner mode expected_owner
+  [[ -f "$ENVIRONMENT_TRANSACTION_JOURNAL" &&
+     ! -L "$ENVIRONMENT_TRANSACTION_JOURNAL" ]] || return 1
+  owner="$(manager_file_uid "$ENVIRONMENT_TRANSACTION_JOURNAL")" || return 1
+  mode="$(manager_file_mode "$ENVIRONMENT_TRANSACTION_JOURNAL")" || return 1
+  expected_owner="$(runtime_config_expected_uid)" || return 1
+  [[ "$owner" == "$expected_owner" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+  (( (8#$mode & 0077) == 0 ))
+}
+
 recover_environment_transaction() {
   local snapshot operation path
-  [[ -e "$ENVIRONMENT_TRANSACTION_JOURNAL" ]] || return 0
+  if [[ ! -e "$ENVIRONMENT_TRANSACTION_JOURNAL" &&
+        ! -L "$ENVIRONMENT_TRANSACTION_JOURNAL" ]]; then
+    return 0
+  fi
+  environment_transaction_journal_is_trusted ||
+    die "环境恢复日志权限或类型不安全，拒绝继续：$ENVIRONMENT_TRANSACTION_JOURNAL"
   install -d -m 755 "$(dirname "$ENVIRONMENT_LOCK_FILE")" || die "无法创建环境恢复锁目录"
   exec 8>"$ENVIRONMENT_LOCK_FILE"
   flock -n 8 || die "另一个环境恢复或部署操作正在执行"

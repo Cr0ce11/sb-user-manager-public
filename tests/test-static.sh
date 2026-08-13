@@ -68,13 +68,9 @@ grep -Fq 'controller_role_preflight()' sb-user-manager.sh
 grep -Fq 'initialize_entry_controller_role()' sb-user-manager.sh
 grep -Fq 'repair_entry_controller_dependencies()' sb-user-manager.sh
 grep -Fq 'provision_entry_controller_role()' sb-user-manager.sh
-grep -Fq 'detect_manager_role()' sb-user-manager.sh
-grep -Fq 'detect_manager_role_with_legacy_recovery()' sb-user-manager.sh
-grep -Fq 'dispatch_interactive_startup()' sb-user-manager.sh
-grep -Fq 'undeployed_role_selection_menu()' sb-user-manager.sh
-grep -Fq 'entry_controller_main()' sb-user-manager.sh
-grep -Fq 'landing_managed_main()' sb-user-manager.sh
-grep -Fq '"") dispatch_interactive_startup "$@" ;;' sb-user-manager.sh
+grep -Fq 'run_standalone_interactive_startup()' sb-user-manager.sh
+grep -Fq 'run_standalone_internal_expire()' sb-user-manager.sh
+grep -Fq '"") run_standalone_interactive_startup "${@:2}" ;;' sb-user-manager.sh
 grep -Fq -- '--internal-expire) run_standalone_internal_expire "${@:2}" ;;' sb-user-manager.sh
 grep -Fq -- '--take-over-installed-manager) take_over_installed_manager "${@:2}" ;;' sb-user-manager.sh
 grep -Fq 'MIN_SUPPORTED_STATE_SCHEMA_VERSION=0' sb-user-manager.sh
@@ -142,9 +138,9 @@ grep -Fq 'cleanup.started' sb-user-manager.sh
 grep -Fq 'nft -nn list table' sb-user-manager.sh
 grep -Fq 'LANDING_AGENT_HELPER_PATH=/usr/local/libexec/sb-user-manager-landing-apply' sb-user-manager.sh
 grep -Fq 'response="$(/usr/bin/sudo -n -- /usr/local/libexec/sb-user-manager-landing-apply 2>/dev/null)"' sb-user-manager.sh
-grep -Fq 'sb-user-manager-landing-agent)' sb-user-manager.sh
-grep -Fq 'sb-user-manager-landing-apply)' sb-user-manager.sh
-[[ "$(grep -Fc 'install_landing_apply_runtime_traps' sb-user-manager.sh)" == 6 ]]
+grep -Fq 'sb-user-manager-landing-agent|sb-user-manager-landing-apply)' sb-user-manager.sh
+grep -Fq 'v5 入口与落地能力已经退役，拒绝运行遗留 helper 入口' sb-user-manager.sh
+[[ "$(grep -Fc 'install_landing_apply_runtime_traps' sb-user-manager.sh)" == 4 ]]
 grep -Fq 'install_landing_restricted_channel()' sb-user-manager.sh
 grep -Fq 'landing_restricted_channel_is_valid()' sb-user-manager.sh
 grep -Fq 'uninstall_landing_restricted_channel()' sb-user-manager.sh
@@ -211,11 +207,9 @@ if grep -Fq 'install_landing_restricted_channel' src/80-menus-main.sh ||
   echo 'v5 landing mutation functions must not be connected to standalone menus or updater' >&2
   exit 1
 fi
-grep -Fq 'provision_entry_controller_role' src/79-manager-role-routing.sh
-grep -Fq 'detect_manager_role_with_legacy_recovery' src/79-manager-role-routing.sh
-if grep -Eq 'controller_(onboard|apply|register)_landing|install_landing_restricted_channel' \
-    src/79-manager-role-routing.sh; then
-  echo 'role router must not enable landing mutation flows' >&2
+if grep -Eq 'detect_manager_role|entry_controller|landing_managed|provision_entry|controller_(onboard|apply|register)_landing|install_landing_restricted_channel' \
+    src/79-standalone-startup.sh; then
+  echo 'standalone startup must not route into a retired v5 role' >&2
   exit 1
 fi
 grep -Fq 'harden_existing_environment_backups()' sb-user-manager.sh
@@ -275,12 +269,12 @@ grep -Fq 'controller_prepare_landing_readiness()' sb-user-manager.sh
 grep -Fq 'CONTROLLER_LANDING_READINESS_LAST_STAGE=not_started' sb-user-manager.sh
 grep -Fq 'Issue #240' docs/DECISIONS/0026-unified-pre-secret-landing-readiness-gate.md
 if grep -Eq 'controller_prepare_landing_dependencies|controller_landing_prepare_dependencies_in_work' \
-    src/79-manager-role-routing.sh src/80-menus-main.sh; then
+    src/79-standalone-startup.sh src/80-menus-main.sh; then
   echo 'landing dependency preparation must remain dormant' >&2
   exit 1
 fi
 if grep -Eq 'controller_prepare_landing_singbox_runtime|controller_landing_prepare_singbox_runtime_in_work' \
-    src/79-manager-role-routing.sh src/80-menus-main.sh; then
+    src/79-standalone-startup.sh src/80-menus-main.sh; then
   echo 'landing sing-box runtime preparation must remain dormant' >&2
   exit 1
 fi
@@ -288,7 +282,7 @@ grep -Fq 'controller_prepare_and_onboard_landing()' sb-user-manager.sh
 grep -Fq 'controller_prepare_landing_readiness "$address" "$ssh_port" "$landing_id"' \
   src/19-controller-landing-onboarding.sh
 if grep -Eq 'controller_prepare_and_onboard_landing|controller_prepare_landing_readiness' \
-    src/79-manager-role-routing.sh src/80-menus-main.sh src/50-install-update.sh; then
+    src/79-standalone-startup.sh src/80-menus-main.sh src/50-install-update.sh; then
   echo 'prepared landing onboarding must remain detached from runtime entry points' >&2
   exit 1
 fi

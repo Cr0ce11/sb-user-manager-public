@@ -273,16 +273,14 @@ agent_entry="$work/sb-user-manager-landing-agent"
 helper_entry="$work/sb-user-manager-landing-apply"
 ln -s "$PWD/sb-user-manager.sh" "$agent_entry"
 ln -s "$PWD/sb-user-manager.sh" "$helper_entry"
-if SB_USER_MANAGER_LIBRARY=false "$agent_entry" > "$work/agent-dispatch.json" 2>/dev/null; then
-  fail 'agent dispatch accepted a non-SSH call'
+if SB_USER_MANAGER_LIBRARY=false "$agent_entry" > "$work/agent-dispatch.json" 2>&1; then
+  fail 'retired agent basename was accepted'
 fi
-jq -e '.status == "error" and .code == "restricted_channel_rejected"' \
-  "$work/agent-dispatch.json" >/dev/null
-if SB_USER_MANAGER_LIBRARY=false "$helper_entry" unexpected > "$work/helper-dispatch.json" 2>/dev/null; then
-  fail 'helper dispatch accepted an argument'
+grep -Fq 'v5 入口与落地能力已经退役' "$work/agent-dispatch.json"
+if SB_USER_MANAGER_LIBRARY=false "$helper_entry" unexpected > "$work/helper-dispatch.json" 2>&1; then
+  fail 'retired helper basename was accepted'
 fi
-jq -e '.status == "error" and .code == "arguments_rejected"' \
-  "$work/helper-dispatch.json" >/dev/null
+grep -Fq 'v5 入口与落地能力已经退役' "$work/helper-dispatch.json"
 
 snapshot_probe="$(mktemp -d /tmp/sb-landing-agent.probe.XXXXXX)"
 register_temp_path "$snapshot_probe"

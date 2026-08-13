@@ -22,5 +22,5 @@
 50-install-update.sh
 60-operations-diagnostics.sh
 70-split-prompts.sh
-79-manager-role-routing.sh
+79-standalone-startup.sh
 80-menus-main.sh

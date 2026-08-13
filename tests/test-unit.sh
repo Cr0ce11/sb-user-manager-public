@@ -3030,6 +3030,51 @@ fi
   jq -e '.marker == "before"' "$SB_SYSTEM_ROOT/etc/sing-box/config.json" >/dev/null
   grep -Fxq old-sing-box "$SB_SYSTEM_ROOT/usr/local/bin/sing-box"
   [[ "$(manager_file_mode "$snapshot/root/usr/local/bin/sing-box")" == 700 ]]
+
+  # 自动恢复日志必须是当前运行身份拥有且组/其他用户不可访问的普通文件。
+  unsafe_journal_target="$work/unsafe-environment-recovery-target.json"
+  jq -n --argjson format "$TRANSACTION_FORMAT_VERSION" \
+    --arg operation unsafe-journal-unit --arg snapshot "$snapshot" \
+    '{format_version:$format,status:"active",kind:"environment",operation:$operation,snapshot:$snapshot,cleanup_paths:["/usr/local/bin/nfuse"]}' \
+    > "$unsafe_journal_target"
+  chmod 600 "$unsafe_journal_target"
+  printf 'keep-symlink-target\n' > "$SB_SYSTEM_ROOT/usr/local/bin/nfuse"
+  ln -s "$unsafe_journal_target" "$ENVIRONMENT_TRANSACTION_JOURNAL"
+  if (recover_environment_transaction) >"$work/unsafe-symlink-recovery.out" 2>&1; then
+    echo 'symlink environment recovery journal should be rejected' >&2
+    exit 1
+  fi
+  grep -Fq '权限或类型不安全' "$work/unsafe-symlink-recovery.out"
+  grep -Fxq keep-symlink-target "$SB_SYSTEM_ROOT/usr/local/bin/nfuse"
+  [[ -L "$ENVIRONMENT_TRANSACTION_JOURNAL" ]]
+  rm -f -- "$ENVIRONMENT_TRANSACTION_JOURNAL"
+
+  cp "$unsafe_journal_target" "$ENVIRONMENT_TRANSACTION_JOURNAL"
+  chmod 644 "$ENVIRONMENT_TRANSACTION_JOURNAL"
+  printf 'keep-open-mode-target\n' > "$SB_SYSTEM_ROOT/usr/local/bin/nfuse"
+  if (recover_environment_transaction) >"$work/unsafe-mode-recovery.out" 2>&1; then
+    echo 'group-readable environment recovery journal should be rejected' >&2
+    exit 1
+  fi
+  grep -Fq '权限或类型不安全' "$work/unsafe-mode-recovery.out"
+  grep -Fxq keep-open-mode-target "$SB_SYSTEM_ROOT/usr/local/bin/nfuse"
+  [[ -f "$ENVIRONMENT_TRANSACTION_JOURNAL" ]]
+  rm -f -- "$ENVIRONMENT_TRANSACTION_JOURNAL"
+
+  cp "$unsafe_journal_target" "$ENVIRONMENT_TRANSACTION_JOURNAL"
+  chmod 600 "$ENVIRONMENT_TRANSACTION_JOURNAL"
+  printf 'keep-wrong-owner-target\n' > "$SB_SYSTEM_ROOT/usr/local/bin/nfuse"
+  if (
+    manager_file_uid() { printf '999999999\n'; }
+    recover_environment_transaction
+  ) >"$work/unsafe-owner-recovery.out" 2>&1; then
+    echo 'wrong-owner environment recovery journal should be rejected' >&2
+    exit 1
+  fi
+  grep -Fq '权限或类型不安全' "$work/unsafe-owner-recovery.out"
+  grep -Fxq keep-wrong-owner-target "$SB_SYSTEM_ROOT/usr/local/bin/nfuse"
+  [[ -f "$ENVIRONMENT_TRANSACTION_JOURNAL" ]]
+  rm -f -- "$ENVIRONMENT_TRANSACTION_JOURNAL"
 )
 
 (
@@ -4544,7 +4589,7 @@ unset SB_SYSTEM_ROOT ENVIRONMENT_BACKUP_BASE
 is_environment_recovery_path /usr/local/bin/sbm
 
 main_body="$(declare -f main)"
-[[ "$(grep -Fc 'dispatch_interactive_startup' <<<"$main_body")" == 1 ]]
+[[ "$(grep -Fc 'run_standalone_interactive_startup' <<<"$main_body")" == 1 ]]
 [[ "$(grep -Fc 'run_standalone_internal_expire' <<<"$main_body")" == 1 ]]
 [[ "$(grep -Fc 'ensure_manager_shortcut_for_interactive_startup' <<<"$main_body")" == 0 ]]
 standalone_startup_body="$(declare -f run_standalone_interactive_startup)"
