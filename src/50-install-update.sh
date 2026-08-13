@@ -810,13 +810,20 @@ update_deployed_manager_version() {
 }
 
 acquire_manager_handoff_lock() {
-  install -d -m 755 "$(dirname "$ENVIRONMENT_LOCK_FILE")" || return 1
-  exec 8>"$ENVIRONMENT_LOCK_FILE" || return 1
-  flock -n 8 || { release_environment_lock; return 1; }
+  acquire_operation_lock || return 1
+  install -d -m 755 "$(dirname "$ENVIRONMENT_LOCK_FILE")" || { release_operation_lock; return 1; }
+  exec 8>"$ENVIRONMENT_LOCK_FILE" || { release_operation_lock; return 1; }
+  flock -n 8 || { release_environment_lock; release_operation_lock; return 1; }
   [[ ! -e "$ENVIRONMENT_TRANSACTION_JOURNAL" && ! -L "$ENVIRONMENT_TRANSACTION_JOURNAL" ]] || {
     release_environment_lock
+    release_operation_lock
     return 1
   }
+}
+
+release_manager_handoff_locks() {
+  release_environment_lock
+  release_operation_lock
 }
 
 prepare_manager_handoff_directory() {
@@ -928,7 +935,7 @@ rollback_manager_handoff() {
   MANAGER_HANDOFF_ROLLBACK_ACTIVE=false
   MANAGER_HANDOFF_ROLLBACK_OLD_SHA256=""
   MANAGER_HANDOFF_ROLLBACK_OLD_VERSION=""
-  release_environment_lock
+  release_manager_handoff_locks
   return "$rc"
 }
 
@@ -940,12 +947,12 @@ recover_manager_handoff() {
     return 1
   }
   if restore_manager_handoff_locked && clear_manager_handoff_journal; then
-    release_environment_lock
+    release_manager_handoff_locks
     MANAGER_HANDOFF_RECOVERED=true
     log '已恢复上次未完成接管前的管理脚本和版本记录'
     return 0
   fi
-  release_environment_lock
+  release_manager_handoff_locks
   echo "错误：未完成的管理脚本接管无法自动恢复。请保留恢复目录并停止继续操作：$MANAGER_HANDOFF_DIRECTORY" >&2
   return 1
 }
@@ -1042,19 +1049,19 @@ take_over_installed_manager() {
     return 1
   }
   if [[ -e "$MANAGER_HANDOFF_JOURNAL" || -L "$MANAGER_HANDOFF_JOURNAL" ]]; then
-    release_environment_lock
+    release_manager_handoff_locks
     echo '错误：发现尚未恢复的管理脚本接管记录；请重新运行脚本先完成自动恢复。' >&2
     return 1
   fi
   if [[ "$(manager_handoff_sha256 "$candidate")" != "$candidate_sha256" ||
         "$(manager_handoff_sha256 "$installed")" != "$current_sha256" ]] ||
      ! manager_handoff_versions_file_is_safe "$versions" "$current_version"; then
-    release_environment_lock
+    release_manager_handoff_locks
     echo '错误：接管准备期间脚本或版本记录发生变化，已取消本次操作。' >&2
     return 1
   fi
   if ! prepare_manager_handoff_directory; then
-    release_environment_lock
+    release_manager_handoff_locks
     echo "错误：无法创建安全的管理脚本恢复目录：$MANAGER_HANDOFF_DIRECTORY" >&2
     return 1
   fi
@@ -1067,7 +1074,7 @@ take_over_installed_manager() {
      ! write_manager_handoff_journal \
        "$current_version" "$current_edition" "$current_schema" "$current_sha256" \
        "$target_version" "$target_edition" "$target_schema"; then
-    release_environment_lock
+    release_manager_handoff_locks
     echo '错误：无法建立完整的接管回退点，当前安装脚本没有改变。' >&2
     return 1
   fi
@@ -1090,7 +1097,7 @@ take_over_installed_manager() {
   MANAGER_HANDOFF_ROLLBACK_OLD_VERSION=""
   trap - ERR
   clear_signal_rollback
-  release_environment_lock
+  release_manager_handoff_locks
   sync_manager_handoff_root_copy "$installed" "$current_sha256"
   printf '管理脚本接管完成：%s %s → %s %s\n' \
     "$current_version" "$current_edition" "$target_version" "$target_edition"
@@ -1329,6 +1336,7 @@ restore_failed_environment_change() {
   else
     log "严重错误：环境快照自动恢复失败，请保留 $backup 并人工检查"
   fi
+  release_environment_lock
   rm -rf -- "$work"
 }
 
@@ -2301,6 +2309,7 @@ uninstall_managed_environment() {
       log "严重错误：自动恢复失败，请保留完整备份并停止继续操作：$backup"
     fi
     rm -rf -- "$work"
+    release_environment_lock
     release_operation_lock
     return "$rollback_rc"
   }
@@ -2481,9 +2490,12 @@ check_updates() {
     release_operation_lock
     return 0
   fi
-  # deploy_environment 会重新取锁；先释放，避免重开 fd 9 时短暂丢失原有 flock。
+  # deploy_environment 识别当前进程已持锁，不会重开 fd 9；查询、确认与部署保持同一互斥区间。
+  if ! deploy_environment false "$update_manager"; then
+    release_operation_lock
+    return 1
+  fi
   release_operation_lock
-  deploy_environment false "$update_manager" || return 1
   if [[ "$update_manager" == true ]]; then
     printf '\n管理脚本已更新到 %s，正在切换到新进程。\n' "$LATEST_MANAGER_VERSION"
     exec /usr/local/sbin/sb-user-manager

@@ -791,8 +791,14 @@ grep -Fxq 'stderr-preserved' "$stderr_probe"
 # 轻量操作锁必须能在全新环境创建父目录，并在释放后关闭 fd 9。
 (
   LOCK_FILE="$work/fresh-operation-lock/run/lock/sb-user-manager.lock"
-  flock() { return 0; }
+  operation_flock_calls=0
+  flock() {
+    [[ "${1:-}" == -u ]] || operation_flock_calls=$((operation_flock_calls + 1))
+    return 0
+  }
   acquire_operation_lock
+  acquire_operation_lock
+  [[ "$operation_flock_calls" == 1 && "$OPERATION_LOCK_HELD" == true ]]
   [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]]
   release_operation_lock
   if { printf x >&9; } 2>/dev/null; then
@@ -1378,10 +1384,15 @@ grep -Fxq 'external executable' "$atomic_install_external"
   ENVIRONMENT_TRANSACTION_JOURNAL="$failed_journal"
   restore_environment_backup() { return 78; }
   clear_environment_transaction() { printf 'unexpected-clear\n' >> "$failed_log"; }
+  exec 8>"$work/shared-restore-failed.lock"
   restore_failed_environment_change unit-action /unit/broken-snapshot "$failed_work" > "$failed_log"
   grep -Fq '环境快照自动恢复失败' "$failed_log"
   ! grep -Fq 'unexpected-clear' "$failed_log"
   [[ ! -e "$failed_work" && -e "$failed_journal" ]]
+  if { printf x >&8; } 2>/dev/null; then
+    echo 'failed environment snapshot restore should release fd 8' >&2
+    exit 1
+  fi
 )
 
 (
@@ -1637,8 +1648,8 @@ set +e
   installed_nfuse_version() { printf '4.5.6\n'; }
   installed_manager_version() { printf '%s\n' "$SCRIPT_VERSION"; }
   deploy_environment() {
-    if { printf x >&9; } 2>/dev/null; then
-      echo 'update check must release fd 9 before deployment reacquires it' >&2
+    if ! { printf x >&9; } 2>/dev/null; then
+      echo 'update check must keep fd 9 while entering deployment' >&2
       return 74
     fi
     printf 'UPDATE:deploy-called\n'
@@ -3306,6 +3317,20 @@ fi
   printf 'interrupted\n' > "$SB_SYSTEM_ROOT/etc/sb-user-manager.conf"
   printf '%s\n' '{"marker":"interrupted"}' > "$SB_SYSTEM_ROOT/etc/sing-box/config.json"
   printf 'new-binary\n' > "$SB_SYSTEM_ROOT/usr/local/bin/nfuse"
+  if (
+    acquire_operation_lock() {
+      OPERATION_LOCK_ERROR='另一个管理操作正在进行，请等待完成后再试'
+      return 1
+    }
+    recover_environment_transaction
+  ) > "$work/environment-recovery-operation-lock.out" 2>&1; then
+    echo 'environment recovery should reject an active user operation lock' >&2
+    exit 1
+  fi
+  grep -Fq '另一个管理操作正在进行' "$work/environment-recovery-operation-lock.out"
+  grep -Fxq interrupted "$SB_SYSTEM_ROOT/etc/sb-user-manager.conf"
+  grep -Fxq new-binary "$SB_SYSTEM_ROOT/usr/local/bin/nfuse"
+  [[ -f "$ENVIRONMENT_TRANSACTION_JOURNAL" ]]
   if (
     chmod() { return 99; }
     recover_environment_transaction

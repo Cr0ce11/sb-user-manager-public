@@ -1,9 +1,11 @@
 
 OPERATION_LOCK_ERROR=""
+OPERATION_LOCK_HELD=false
 
 acquire_operation_lock() {
   local lock_file lock_directory
   OPERATION_LOCK_ERROR=""
+  [[ "$OPERATION_LOCK_HELD" != true ]] || return 0
   if [[ -n "${LOCK_FILE:-}" ]]; then
     lock_file="$LOCK_FILE"
   else
@@ -38,6 +40,7 @@ acquire_operation_lock() {
     OPERATION_LOCK_ERROR="另一个管理操作正在进行，请等待完成后再试"
     return 1
   fi
+  OPERATION_LOCK_HELD=true
 }
 
 prepare_core() {
@@ -64,6 +67,7 @@ recover_transaction_before_menu() {
 }
 
 release_operation_lock() {
+  OPERATION_LOCK_HELD=false
   flock -u 9 2>/dev/null || true
   { exec 9>&-; } 2>/dev/null || true
 }
