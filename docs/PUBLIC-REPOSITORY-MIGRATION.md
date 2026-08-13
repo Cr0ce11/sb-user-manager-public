@@ -1,19 +1,20 @@
-# 公开仓库迁移准备
+# 单一公开仓库迁移记录
 
-本文是公开版与原私有双版本仓库并行发布的操作边界和回退清单。项目所有者已批准执行；公开仓库已由干净快照建立并通过公开 PR 与 `main` CI，两个仓库均保留现名。长期决定见 [ADR 0028](DECISIONS/0028-clean-public-repository-transition.md)。
+本文记录 `sb-user-manager` 从原私有双版本仓库收敛到单一公开仓库的边界。长期决定见 [ADR 0028](DECISIONS/0028-clean-public-repository-transition.md) 与取代它的 [ADR 0029](DECISIONS/0029-single-public-repository.md)。
 
-## 当前结果（2026-08-13）
+## 最终结果（2026-08-13）
 
-- `DTB201/sb-user-manager-public` 已由干净历史建立，采用 MIT License；v4.23.1 完成首个匿名公开 Release，当前最新正式版为 v4.25.2。
-- 公开仓库的确定性构建、完整 CI、匿名更新和不可变 Release 保护已经投入使用，公开源码是后续 v4 开发与完整验收的正式来源。
-- 原私有仓库继续保留完整历史和私有版、分享版双版本。由于私有 Actions 额度及专用发布凭据尚未恢复，下一次同步只由 [Issue #255](https://github.com/DTB201/sb-user-manager/issues/255) 跟踪，并应同步届时最新公开版本。
-- 下方门禁与切换步骤保留为迁移审计记录，以及未来重建或回退时的复用清单；不再表示尚未完成的公开仓库创建任务。
+- `DTB201/sb-user-manager-public` 由经过审计的干净历史建立，采用 MIT License；当前正式版为不可变 [v4.25.2 Release](https://github.com/DTB201/sb-user-manager-public/releases/tag/v4.25.2)。
+- 公开仓库独立承担源码、Issue、Pull Request、确定性构建、完整 CI、匿名在线更新、私密安全报告和不可变 Release。
+- `main` 要求 Pull Request、`validate`、`jq16-compat`、`debian-landing-e2e`、对话解决和线性历史，禁止强推、删除及管理员绕过。
+- 原私有版和分享版停止发布，原私有仓库永久退役；公开仓库保持现名，避免破坏现有公开客户端更新地址。
+- 旧私有版配置中的 `GITHUB_TOKEN` 只为迁移兼容而接受并立即丢弃，不载入进程、不发送到网络、不写回配置。
+- 仍运行旧私有版的服务器可以使用同版本或更高版本的公开 Release 执行 `--take-over-installed-manager`。接管只替换管理脚本与版本记录，不修改用户、流量、配额、有效期、证书、分流、sing-box 或 Nfuse，也不会启停服务。
+- 原 v5 方向永久终止；已经进入公开 v4.25.2 的休眠基础由 [公开 Issue #17](https://github.com/DTB201/sb-user-manager-public/issues/17) 独立清理。
 
-## 当前审计基线
+## 初次公开审计基线
 
-审计日期：2026-08-10。基线提交：`020031ad3939b35eb06a30f6153af3e9f1c149a4`。
-
-已完成的只读检查：
+原私有仓库在 2026-08-10 的基线提交为 `020031ad3939b35eb06a30f6153af3e9f1c149a4`。当时完成了以下只读检查：
 
 - 扫描全部本地可达引用，共 393 个提交和 2,330 个 Git 对象。
 - 未发现常见私钥头、GitHub、AWS、Google、Slack、Stripe、OpenAI 令牌格式或带账号密码的 URL。
@@ -21,63 +22,36 @@
 - 单独核对已知测试服务器地址和曾用于测试的凭据，当前树与可达历史均未命中。
 - 提交作者邮箱均为 GitHub `noreply` 地址。
 
-这些结果只能证明已检查的特征没有命中，不能证明代码绝对不存在任何业务秘密。初次公开前已用 `tools/audit-public-readiness.sh` 重新扫描最终快照；以后重建公开仓库时，仍必须通过 `--extra-pattern-file` 从仓库外输入项目所有者掌握的服务器地址、令牌和历史凭据做精确复核。该文件不得提交、不得使用符号链接，审计结束后立即删除。
+这些结果只能证明已检查的特征没有命中，不能证明代码绝对不存在业务秘密。最终公开树另由 `tools/audit-public-readiness.sh --check-public-tree` 执行历史与策略审计。
 
-## 为什么当时不能直接把原私有仓库改为 Public
+## 为什么使用干净公开历史
 
-基线审计发现过以下阻塞项；[Issue #252](https://github.com/DTB201/sb-user-manager/issues/252) 的公开源码快照已经在代码层处理前三项，初次创建公开仓库前也已按最终提交重新验收：
+原私有仓库曾包含 GitHub Token 更新路径、私有/分享双版本生成器、未发布 v5 分支，以及大量未经逐项公开审计的协作记录。直接改变其可见性会一次性公开全部可达历史，并允许外部永久保存副本。
 
-- `src/` 和私有生成物仍包含 GitHub Token 输入、保存和私有 Release 下载路径。
-- 公开仓库只发布匿名更新版；原私有仓库继续发布私有版与分享版，私有 Token 路径不得进入公开历史。
-- 仓库原先没有 `LICENSE`；项目所有者现已选择标准 MIT License。
-- 当前私有套餐没有 `main` 保护；公开仓库必须先完成初始提交，再立即设置保护规则。
-- 当前仓库有大量 v5 分支以及旧 Issue、PR、Actions 日志；这些协作记录没有完成逐项公开审计。
-- 私有仓库改为公开会公开完整历史，并且外部已经取得的 Fork 或副本不能通过再次转私有收回。
+因此公开仓库只包含审计后的正式源码树和后续公开提交，不包含私有 Token 更新分支、双版本构建器、服务器验收数据、旧聊天材料、内部快照或未发布实验分支。旧标签、Issue、PR、Actions 日志和私有 Release 没有复制；公开不可变 Release 历史从 v4.23.1 开始。
 
-## 已采用的目标仓库内容
+## 删除私有仓库前的门禁
 
-公开仓库采用全新历史，只包含最终审计通过的一个源码快照及后续公开提交：
+1. 公开 Issues 与 Private Vulnerability Reporting 已启用。
+2. 原私有仓库唯一仍有产品价值的 Mihomo 候选需求已迁为 [公开 Issue #16](https://github.com/DTB201/sb-user-manager-public/issues/16)。
+3. 私有双版本与 v5 开放事项不迁移；休眠 v5 代码清理由公开 Issue 独立跟踪。
+4. 已用真实旧私有 v4.18.1、v4.22.1、v4.23.0 脚本在隔离目录接管到公开 v4.25.2，三组数据摘要均保持不变。
+5. 公开仓库完整本地门禁、Pull Request CI 与合并后 `main` CI 必须通过。
+6. 删除前保存最终只读恢复材料、SHA-256、引用清单和仓库设置记录；不得把服务器秘密或访问凭据写入归档。
+7. 删除后重新核对公开仓库可访问、Issue 可创建、`main` 保护有效、最新 Release 可匿名下载且更新源只指向公开仓库。
 
-- `src/`、确定性构建工具、测试、公开文档和单一生成脚本。
-- 不包含私有 Token 更新分支、私有版标识、双版本构建器、服务器验收数据、旧聊天材料或内部快照。
-- v5 休眠运行代码如果仍属于已发布单脚本的一部分，可以保留；未发布的实验分支、内部交接材料和旧协作记录不迁移。
-- 旧标签、Issue、PR、Actions 日志和 Release 不复制；公开仓库从迁移版本开始建立新的不可变 Release 历史。
+## 旧私有版接管
 
-## 首次公开门禁（公开部分已完成）
+从公开不可变 Release 下载脚本和 SHA-256，独立校验后，以 root 执行：
 
-1. 项目所有者确定许可证；当前决定为标准 MIT License。
-2. 使用 `tools/export-public-snapshot.sh` 从干净、已提交且审计通过的版本导出目标树，并用 `--check` 证明没有漂移。
-3. 移除运行时 `GITHUB_TOKEN` 依赖和私有/分享双版本分支；现有配置中的旧 Token 不再读取、显示或写入。
-4. 发布工作流只生成公开管理脚本及其 SHA-256，并保持草稿上传、digest 核对、禁止覆盖同版本和不可变 Release。
-5. `bash tools/audit-public-readiness.sh --check-public-tree` 对最终新仓库历史通过。
-6. 本地完整门禁通过；在公开仓库中用标准托管运行器完成 PR 和 `main` CI。
-7. 设置 `main` 保护：必须 PR、必须通过 `validate`、`jq16-compat`、`debian-landing-e2e`、必须解决对话、禁止强推和删除、禁止绕过。
-8. Actions 默认令牌保持只读；外部贡献者工作流全部需要维护者批准，不向外部 PR 提供秘密。
-9. Issue 和 Pull Request 设为仅协作者，或在迁移初期关闭；Wiki、Projects、Discussions 按无需求默认关闭。
-10. 准备首个公开 Release、同版本私有双版本同步、旧客户端更新和失败回退的逐步操作清单，并再次取得明确授权；私有同步条件不足时停止私有发布并由 Issue #255 延后跟踪。
+```bash
+chmod 700 sb-user-manager.sh
+./sb-user-manager.sh --take-over-installed-manager
+```
 
-## 已批准的切换顺序（私有同步延后）
+目标版本必须等于或高于已安装版本，并支持当前数据 schema。接管事务会保留原脚本与版本记录，写入或最终核验失败立即恢复；中途断电时，下次目标脚本启动会先恢复再进入其他功能。项目不再提供从公开版切回私有版的发布渠道。
 
-以下步骤是首次公开时批准的顺序。公开仓库相关步骤已完成，涉及私有同步和私有 Release 的部分等待 Issue #255；未来重建或重新切换时仍须取得项目所有者明确授权：
-
-1. 冻结当前私有仓库的 v4 变更，记录仓库 ID、默认分支、最新提交、Release 和设置；制作只读镜像备份。
-2. 以临时名称创建空的公开仓库，先提交审计后的最小初始树。
-3. 立即配置分支保护、Actions 权限、外部工作流审批和交互限制。
-4. 通过公开 PR CI 和 `main` CI，准备高于现有正式版的首个公开 Release 候选并核对脚本、摘要和版本。
-5. 把同版本公共变更单向同步到原私有仓库，完成私有版、分享版双版本构建和针对性测试；同步失败时停止发布。
-6. 分别创建公开单版本 Release 与私有双版本 Release，并核对版本、附件数量、摘要和对应提交。
-7. 验证公开版只通过匿名 HTTPS 查询 `DTB201/sb-user-manager-public`，私有版继续使用原私有仓库；两个仓库不改名。
-8. 观察两个更新入口和 Release 下载；没有异常后更新 README、PROJECT 和正式来源记录。
-
-## 回退方法
-
-- 第 4 步之前：停止操作即可；当前私有仓库和现有服务器不受影响。
-- 首个公开 Release 发布前：保留公开仓库但停止推广，修复后重新验收；不要删除后复用版本号。
-- 私有同步或双版本构建失败：停止私有发布，保持上一个私有 Release，不影响已通过的公开候选。
-- 客户端开始使用公开更新源后：保持两个仓库 URL 稳定，通过更高版本修复。
-- 任何阶段都不删除、重写或公开旧私有仓库的历史。
-
-## 本地审计命令
+## 公开仓库持续门禁
 
 常规完整历史扫描：
 
@@ -85,23 +59,14 @@
 bash tools/audit-public-readiness.sh
 ```
 
-对最终公开源码树执行强制策略检查：
+公开源码树策略检查：
 
 ```bash
 bash tools/audit-public-readiness.sh --check-public-tree
 ```
 
-从已经提交且无本地改动的版本导出全新历史所需的目录：
+额外精确值必须放在仓库外的临时普通文件中，通过 `--extra-pattern-file` 输入；审计后立即删除。审计输出只报告命中文件路径，不回显秘密。
 
-```bash
-bash tools/export-public-snapshot.sh --output /安全的空白父目录/sb-user-manager-public-source
-bash tools/export-public-snapshot.sh --check /安全的空白父目录/sb-user-manager-public-source
-```
+## 回退
 
-额外精确值应放在仓库外的临时普通文件中，每行一个值：
-
-```bash
-bash tools/audit-public-readiness.sh --extra-pattern-file /安全的临时路径/known-values.txt
-```
-
-审计输出只报告命中的文件路径，不回显匹配内容，避免把秘密再次写入日志。
+公开仓库、名称和 Release 不因私有仓库退役而回退。删除后若发现遗漏，只在 GitHub 允许的恢复期限内恢复原私有仓库；恢复不重新启动双版本或 v5 开发。旧服务器接管失败时使用接管事务保存的原脚本和版本记录恢复，业务数据保持不变。

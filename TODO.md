@@ -23,14 +23,15 @@
 | SUP-001 | P2 | 完成 | [Issue #126](https://github.com/DTB201/sb-user-manager/issues/126)、[PR #127](https://github.com/DTB201/sb-user-manager/pull/127) | 启用不可变 Release 并禁止覆盖同版本附件 | 草稿上传、四附件摘要校验、失败清理和正式发布顺序受自动检查保护；仓库设置已读回确认为启用，下一正式版继续执行端到端发布验收 |
 | GOV-002 | P1 | 完成 | [Issue #250](https://github.com/DTB201/sb-user-manager/issues/250) | 建立受保护公开仓库的审计与迁移门禁 | 历史审计、公开树策略、许可证、Actions 安全、迁移与回退记录均已建立；受保护公开仓库已由干净快照创建并通过公开 CI |
 | GOV-003 | P1 | 完成 | [Issue #252](https://github.com/DTB201/sb-user-manager/issues/252) | 生成单一公开版源码快照并验证匿名更新 | v4.23.1 已完成首个公开快照和匿名 Release，旧 Token 只兼容解析后丢弃；后续公开版本已按同一模型发布到 v4.25.2 |
-| GOV-004 | P1 | 进行中 | [Issue #264](https://github.com/DTB201/sb-user-manager/issues/264) | 对齐公开 v4.25.2 项目状态与双仓库治理记录 | 长期状态文档反映实际公开版本、迁移完成状态、v5 暂停和私有同步边界；本地门禁与公开 CI 通过，不改变运行代码或服务器 |
-| GOV-005 | P1 | 阻塞 | [Issue #255](https://github.com/DTB201/sb-user-manager/issues/255) | 恢复私有仓库双版本同步 | 等待私有 Actions 额度和专用只读不可变 Release 凭据恢复；恢复后同步届时最新公开版本并重新通过私有双版本门禁，不按过期的 v4.23.5 候选继续发布 |
+| GOV-004 | P1 | 完成 | [公开 PR #14](https://github.com/DTB201/sb-user-manager-public/pull/14) | 对齐公开 v4.25.2 项目状态 | 长期状态文档与 v4.25.2、公开 CI 和 Release 事实一致，不改变运行代码或服务器 |
+| GOV-005 | P1 | 进行中 | [公开 Issue #15](https://github.com/DTB201/sb-user-manager-public/issues/15) | 收敛为单一公开仓库并退役私有仓库 | 公开 Issues、安全报告、治理记录、CI、Release、旧私有版单向接管和删除后验证全部通过 |
 | MAINT-001 | — | 完成 | [Issue #110](https://github.com/DTB201/sb-user-manager/issues/110)、[PR #111](https://github.com/DTB201/sb-user-manager/pull/111) | 机械模块化源码并确定性生成单脚本 | 模块源码、固定清单、确定性构建和 CI 校验通过；生成的 v4.20.1 与改造前逐字节相同，Debian 实机只读验收通过 |
 | MAINT-002 | P2 | 完成 | [Issue #113](https://github.com/DTB201/sb-user-manager/issues/113)、[PR #114](https://github.com/DTB201/sb-user-manager/pull/114) | 合并两种协议新增用户的共用执行流程 | 菜单、文案、事务顺序和服务器行为不变；计量与自用 Nfuse 登记共用实现并有确定性测试，本地与 CI 门禁通过 |
 | MAINT-003 | P2 | 完成 | [Issue #115](https://github.com/DTB201/sb-user-manager/issues/115)、[PR #116](https://github.com/DTB201/sb-user-manager/pull/116) | 统一两种协议新增用户的前置冲突检查 | 两种协议共用用户名、端口、标签、证书和 Nfuse 冲突检查；原检查顺序、错误提示和服务器行为不变，本地、CI 与 Debian 实机验收通过 |
 | MAINT-004 | P2 | 完成 | [Issue #117](https://github.com/DTB201/sb-user-manager/issues/117)、[PR #118](https://github.com/DTB201/sb-user-manager/pull/118) | 统一用户状态变化后的专属分流重建判断 | 停用、启用和到期处理共用同一判断；原事务顺序、错误传播和服务器行为不变，本地、CI 与 Debian 实机验收通过 |
 | MAINT-005 | P2 | 完成 | [Issue #119](https://github.com/DTB201/sb-user-manager/issues/119)、[PR #120](https://github.com/DTB201/sb-user-manager/pull/120) | 统一分流事务的配置重建与提交收尾 | 相关分流操作共用重建、检查重启和提交顺序；原校验、状态修改、锁处理和服务器行为不变，本地、CI 与 Debian 实机验收通过 |
 | MAINT-006 | P2 | 完成 | [Issue #121](https://github.com/DTB201/sb-user-manager/issues/121)、[PR #122](https://github.com/DTB201/sb-user-manager/pull/122) | 统一迁移预览与恢复的数据准备流程 | 预览与真实恢复共用解密、旧格式升级、完整校验和恢复计划准备链；原加密、格式、取消、清理和回滚行为不变，本地、CI 与 Debian 实机验收通过 |
+| MAINT-007 | P2 | 待办 | [公开 Issue #17](https://github.com/DTB201/sb-user-manager-public/issues/17) | 移除从未开放的休眠 v5 基础 | 分批删除专用代码、测试和文档，保持 standalone 菜单、状态、迁移、更新和服务器可见行为不变 |
 | REL-002 | P1 | 完成 | [Issue #123](https://github.com/DTB201/sb-user-manager/issues/123)、[PR #124](https://github.com/DTB201/sb-user-manager/pull/124) | 发布 v4.20.2 模块化维护版本 | 版本、迭代记录和标签一致；本地门禁、GitHub CI、四个 Release 附件、nube2 真实菜单更新及发布后 `release` 验收全部通过 |
 | REL-003 | P1 | 完成 | [Issue #194](https://github.com/DTB201/sb-user-manager/issues/194)、[PR #195](https://github.com/DTB201/sb-user-manager/pull/195) | 准备并发布 v4.22.9 数据安全与可靠性修复版本 | 版本、迭代记录和长期状态文档一致；本地门禁、GitHub CI、标签 CI、四个 Release 附件独立复核和不可变保护全部通过；未登录或修改服务器 |
 | REL-004 | P1 | 完成 | [Issue #242](https://github.com/DTB201/sb-user-manager/issues/242)、[PR #243](https://github.com/DTB201/sb-user-manager/pull/243) | 准备并发布 v4.23.0 休眠态 v5 安全基础版本 | 版本、迭代记录和长期状态文档一致；本地门禁、PR、main 与标签 CI、四个 Release 附件摘要和不可变保护全部通过；未登录或修改服务器 |
@@ -45,12 +46,12 @@
 | BUG-003 | P1 | 完成 | [Issue #101](https://github.com/DTB201/sb-user-manager/issues/101) | 修复查看预置列表时报错并退出脚本 | v4.19.1 四个 Release 附件与标签源码一致；克隆机真实菜单更新及 release 只读验收全部通过，Issue 已关闭 |
 | ROUTE-001 | P1 | 完成 | [Issue #103](https://github.com/DTB201/sb-user-manager/issues/103)、[PR #105](https://github.com/DTB201/sb-user-manager/pull/105) | 共享预置在运行配置中只生成一份 | v4.20.0 已正式发布；自动化、双版本兼容、克隆机真实菜单更新、共享生命周期和发布后 `release` 验收全部通过 |
 | BUG-004 | P1 | 完成 | [Issue #107](https://github.com/DTB201/sb-user-manager/issues/107)、[PR #108](https://github.com/DTB201/sb-user-manager/pull/108) | 清理抢先命中的旧版分流残留 | v4.20.1 已正式发布；本地门禁、克隆机一次性整理与回滚、真实菜单更新和发布后 `release` 验收均已通过 |
-| UX-003 | P2 | 暂缓 | [Issue #88](https://github.com/DTB201/sb-user-manager/issues/88) | 增加 Mihomo 格式的用户配置导出 | 项目所有者尚未确认实际必要性；不进入目标版本，待使用场景和维护价值明确后重新评估 |
+| UX-003 | P2 | 暂缓 | [公开 Issue #16](https://github.com/DTB201/sb-user-manager-public/issues/16) | 增加 Mihomo 格式的用户配置导出 | 项目所有者尚未确认实际必要性；不进入目标版本，待使用场景和维护价值明确后重新评估 |
 
 ## 当前最值得继续的顺序
 
-1. 完成 [Issue #264](https://github.com/DTB201/sb-user-manager/issues/264) 的长期状态收敛；不改变运行代码，不登录或修改服务器。
+1. 完成 [公开 Issue #15](https://github.com/DTB201/sb-user-manager-public/issues/15) 的单一公开仓库收敛；不改变运行代码，不登录或修改服务器。
 2. 继续以真实使用中发现的 v4 缺陷驱动维护；当前公开仓库没有已知未解决的 P0/P1 运行缺陷。
-3. 私有 Actions 额度和发布凭据恢复后执行 [Issue #255](https://github.com/DTB201/sb-user-manager/issues/255)，同步届时最新公开版本；v5 继续暂停，[Issue #88](https://github.com/DTB201/sb-user-manager/issues/88) 和 SEC-001 维持现有状态。
+3. 独立推进 [公开 Issue #17](https://github.com/DTB201/sb-user-manager-public/issues/17) 的休眠 v5 清理；[公开 Issue #16](https://github.com/DTB201/sb-user-manager-public/issues/16) 和 SEC-001 维持现有状态。
 
 任何需要登录服务器、修改 SSH、恢复数据或操作正式环境的事项必须独立执行，先记录回滚方式并取得明确授权。
