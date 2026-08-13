@@ -138,6 +138,151 @@ make_ss2022_inbound() {
     }]'
 }
 
+build_user_inbound_payload() {
+  local mode="$1" protocol="$2" input_path="$3"
+  jq -ce --arg mode "$mode" --arg protocol "$protocol" \
+    --argjson handshake_port "$HANDSHAKE_PORT" --argjson strict_mode "$SHADOWTLS_STRICT_MODE" '
+    def required_string: if type == "string" and length > 0 then . else error("required string is missing") end;
+    def required_number: if type == "number" then . else error("required number is missing") end;
+    def normalized_user_endpoints($user):
+      if ($user.endpoints | type) == "array" then $user.endpoints
+      elif ($user.protocol // "ss2022") == "anytls" then
+        [{protocol:"anytls",port:$user.port,anytls_password:$user.anytls_password,tls_sni:$user.tls_sni}]
+      else
+        [{protocol:"ss2022",transport:($user.transport // "shadowtls"),port:$user.port,
+          shadowtls_password:$user.shadowtls_password,ss2022_password:$user.ss2022_password,
+          method:$user.method,shadowtls_sni:$user.shadowtls_sni}]
+      end;
+    def normalized_rebuild_endpoints($user):
+      if ($user.endpoints | type) == "array" then $user.endpoints
+      elif ($user.protocol // "ss2022") == "anytls" then
+        [{protocol:"anytls",port:$user.port,anytls_password:$user.anytls_password,tls_sni:$user.tls_sni}]
+      else
+        [{protocol:"ss2022",transport:"shadowtls",port:$user.port,
+          shadowtls_password:$user.shadowtls_password,ss2022_password:$user.ss2022_password,
+          method:$user.method,shadowtls_sni:$user.shadowtls_sni}]
+      end;
+    def endpoint_inbounds($name; $has_legacy; $handshake_port; $strict_mode):
+      . as $endpoint |
+      ($endpoint.port | required_number) as $port |
+      ($endpoint.protocol | required_string) as $protocol |
+      if $protocol == "anytls" then
+        ($endpoint.anytls_password | required_string) as $password |
+        [{"type":"anytls","tag":("anytls-" + $name),"listen":"::","listen_port":$port,
+          "users":[{"name":$name,"password":$password}],
+          "tls":{"enabled":true,"certificate_path":"/etc/sing-box/cert/anytls.crt","key_path":"/etc/sing-box/cert/anytls.key"}}]
+      elif $protocol == "ss2022" then
+        ($endpoint.transport // "shadowtls") as $transport |
+        if ($transport == "direct" or $transport == "shadowtls") then . else error("unsupported SS2022 transport") end |
+        ($endpoint.ss2022_password | required_string) as $ss_password |
+        ($endpoint.method | required_string) as $method |
+        if $transport == "direct" then
+          [{"type":"shadowsocks","tag":((if $has_legacy then "ss-direct-" else "ss-" end) + $name),
+            "listen":"::","listen_port":$port,"method":$method,"password":$ss_password}]
+        else
+          ($endpoint.shadowtls_password | required_string) as $st_password |
+          ($endpoint.shadowtls_sni | required_string) as $shadowtls_sni |
+          [{"type":"shadowtls","tag":("st-" + $name),"listen":"::","listen_port":$port,"version":3,
+            "users":[{"name":$name,"password":$st_password}],
+            "handshake":{"server":$shadowtls_sni,"server_port":$handshake_port},
+            "strict_mode":$strict_mode,"detour":("ss-" + $name)},
+           {"type":"shadowsocks","tag":("ss-" + $name),"network":"tcp","method":$method,"password":$ss_password},
+           {"type":"shadowsocks","tag":("ss-udp-" + $name),"listen":"::","listen_port":$port,
+            "network":"udp","method":$method,"password":$ss_password}]
+        end
+      else error("unsupported endpoint protocol") end;
+    def user_inbounds($user; $handshake_port; $strict_mode):
+      ($user.name | required_string) as $name |
+      normalized_user_endpoints($user) as $endpoints |
+      select(($endpoints | length) > 0) |
+      any($endpoints[]; .protocol == "ss2022" and .transport == "shadowtls") as $has_legacy |
+      [$endpoints[] | endpoint_inbounds($name; $has_legacy; $handshake_port; $strict_mode)[]];
+    if $mode == "user" then
+      user_inbounds(.; $handshake_port; $strict_mode)
+    elif $mode == "rebuild" then
+      if (.users | type) != "array" then {legacy_fallback:true}
+      else
+        [
+          .users[] as $user |
+          normalized_rebuild_endpoints($user) as $endpoints |
+          $endpoints[] | select(.protocol == $protocol) as $endpoint |
+          {user:$user,endpoint:$endpoint,
+           has_legacy:(any($user.endpoints[]?; .protocol == "ss2022" and .transport == "shadowtls"))}
+        ] as $candidates |
+        if any($candidates[];
+          (.user.name == null or .user.name == false or
+           (.user.name | type) == "object" or (.user.name | type) == "array") or
+          (.user.status == null or .user.status == false or
+           (.user.status | type) == "object" or (.user.status | type) == "array"))
+        then {legacy_fallback:true}
+        else
+          [$candidates[] |
+            (.user.name | tostring) as $name |
+            (.user.status | tostring) as $status |
+            {name:$name,status:$status,endpoint:.endpoint,has_legacy:.has_legacy}
+          ] as $rows |
+          {
+            managed_tags:([
+              $rows[] |
+              if $protocol == "anytls" then "anytls-" + .name
+              else "st-" + .name, "ss-" + .name, "ss-direct-" + .name, "ss-udp-" + .name, "snell-" + .name end
+            ]),
+            inbounds:([
+              $rows[] | select(.status == "active") | . as $row |
+              $row.endpoint | endpoint_inbounds($row.name; $row.has_legacy; $handshake_port; $strict_mode)[]
+            ])
+          }
+        end
+      end
+    else
+      error("unsupported inbound payload mode")
+    end
+  ' "$input_path"
+}
+
+rebuild_protocol_inbounds_with_shell_tools() {
+  local protocol="$1" row name status endpoint fragment direct_tag fragments='[]' managed_tags_json='[]'
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    name="$(jq -er '.name' <<<"$row")" || return 1
+    status="$(jq -er '.status' <<<"$row")" || return 1
+    endpoint="$(jq -ec '.endpoint' <<<"$row")" || return 1
+    if [[ "$protocol" == anytls ]]; then
+      managed_tags_json="$(jq -c --arg tag "anytls-$name" '. + [$tag]' <<<"$managed_tags_json")" || return 1
+    else
+      managed_tags_json="$(jq -c --arg st "st-$name" --arg ss "ss-$name" --arg ss_direct "ss-direct-$name" \
+        --arg ss_udp "ss-udp-$name" --arg sn "snell-$name" '. + [$st,$ss,$ss_direct,$ss_udp,$sn]' <<<"$managed_tags_json")" || return 1
+    fi
+    if [[ "$status" == active ]]; then
+      direct_tag=""
+      if [[ "$(jq -r '.has_legacy_ss2022 // false' <<<"$row")" == true &&
+            "$(jq -r '.protocol == "ss2022" and .transport == "direct"' <<<"$endpoint")" == true ]]; then
+        direct_tag="ss-direct-$name"
+      fi
+      fragment="$(make_endpoint_inbounds_from_state "$name" "$endpoint" "$direct_tag")" || return 1
+      fragments="$(SB_JQ_CURRENT="$fragments" SB_JQ_ADDED="$fragment" jq -cn \
+        '($ENV.SB_JQ_CURRENT | fromjson) as $current | ($ENV.SB_JQ_ADDED | fromjson) as $added | $current + $added')" || return 1
+    fi
+  done < <(jq -c --arg protocol "$protocol" '
+    .users[] as $user |
+    (if ($user.endpoints | type) == "array" then $user.endpoints[]
+     elif ($user.protocol // "ss2022") == "anytls" then
+       {protocol:"anytls",port:$user.port,anytls_password:$user.anytls_password,tls_sni:$user.tls_sni}
+     else
+       {protocol:"ss2022",transport:"shadowtls",port:$user.port,shadowtls_password:$user.shadowtls_password,
+        ss2022_password:$user.ss2022_password,method:$user.method,shadowtls_sni:$user.shadowtls_sni}
+     end) |
+    select(.protocol == $protocol) |
+    {name:$user.name,status:$user.status,endpoint:.,
+     has_legacy_ss2022:(any($user.endpoints[]?; .protocol == "ss2022" and .transport == "shadowtls"))}
+  ' "$STATE_FILE")
+  SB_JQ_NEW_INBOUNDS="$fragments" rewrite_singbox_config '
+    ($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_inbounds |
+    .inbounds = ([((.inbounds // [])[]) |
+      .tag as $tag | select(($managed_tags | index($tag)) == null)] + $new_inbounds)
+  ' --argjson managed_tags "$managed_tags_json"
+}
+
 rewrite_singbox_config() {
   local filter="$1" config_dir tmp normalized
   shift
@@ -247,45 +392,17 @@ replace_user_inbounds() {
 }
 
 rebuild_protocol_inbounds() {
-  local protocol="$1" row name status endpoint fragment direct_tag fragments='[]' managed_tags_json='[]'
-  while IFS= read -r row; do
-    [[ -n "$row" ]] || continue
-    name="$(jq -er '.name' <<<"$row")" || return 1
-    status="$(jq -er '.status' <<<"$row")" || return 1
-    endpoint="$(jq -ec '.endpoint' <<<"$row")" || return 1
-    if [[ "$protocol" == anytls ]]; then
-      managed_tags_json="$(jq -c --arg tag "anytls-$name" '. + [$tag]' <<<"$managed_tags_json")" || return 1
-    else
-      managed_tags_json="$(jq -c --arg st "st-$name" --arg ss "ss-$name" --arg ss_direct "ss-direct-$name" \
-        --arg ss_udp "ss-udp-$name" --arg sn "snell-$name" '. + [$st,$ss,$ss_direct,$ss_udp,$sn]' <<<"$managed_tags_json")" || return 1
-    fi
-    if [[ "$status" == active ]]; then
-      direct_tag=""
-      if [[ "$(jq -r '.has_legacy_ss2022 // false' <<<"$row")" == true &&
-            "$(jq -r '.protocol == "ss2022" and .transport == "direct"' <<<"$endpoint")" == true ]]; then
-        direct_tag="ss-direct-$name"
-      fi
-      fragment="$(make_endpoint_inbounds_from_state "$name" "$endpoint" "$direct_tag")" || return 1
-      fragments="$(SB_JQ_CURRENT="$fragments" SB_JQ_ADDED="$fragment" jq -cn '($ENV.SB_JQ_CURRENT | fromjson) as $current | ($ENV.SB_JQ_ADDED | fromjson) as $added | $current + $added')" || return 1
-    fi
-  done < <(jq -c --arg protocol "$protocol" '
-    .users[] as $user |
-    (if ($user.endpoints | type) == "array" then $user.endpoints[]
-     elif ($user.protocol // "ss2022") == "anytls" then
-       {protocol:"anytls",port:$user.port,anytls_password:$user.anytls_password,tls_sni:$user.tls_sni}
-     else
-       {protocol:"ss2022",transport:"shadowtls",port:$user.port,shadowtls_password:$user.shadowtls_password,
-        ss2022_password:$user.ss2022_password,method:$user.method,shadowtls_sni:$user.shadowtls_sni}
-     end) |
-    select(.protocol == $protocol) |
-    {name:$user.name,status:$user.status,endpoint:.,
-     has_legacy_ss2022:(any($user.endpoints[]?; .protocol == "ss2022" and .transport == "shadowtls"))}
-  ' "$STATE_FILE")
-  SB_JQ_NEW_INBOUNDS="$fragments" rewrite_singbox_config '
-    ($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_inbounds |
+  local protocol="$1" rebuild_payload
+  rebuild_payload="$(build_user_inbound_payload rebuild "$protocol" "$STATE_FILE")" || return 1
+  if [[ "$rebuild_payload" == '{"legacy_fallback":true}' ]]; then
+    rebuild_protocol_inbounds_with_shell_tools "$protocol"
+    return
+  fi
+  SB_JQ_PROTOCOL_REBUILD="$rebuild_payload" rewrite_singbox_config '
+    ($ENV.SB_JQ_PROTOCOL_REBUILD | fromjson) as $payload |
     .inbounds = ([((.inbounds // [])[]) |
-      .tag as $tag | select(($managed_tags | index($tag)) == null)] + $new_inbounds)
-  ' --argjson managed_tags "$managed_tags_json"
+      .tag as $tag | select(($payload.managed_tags | index($tag)) == null)] + $payload.inbounds)
+  '
 }
 
 ss2022_udp_inbounds_are_current() {
@@ -403,33 +520,8 @@ make_endpoint_inbounds_from_state() {
 }
 
 make_user_inbounds_from_state() {
-  local user="$1" name endpoint fragment direct_tag has_legacy=false fragments='[]' count=0
-  name="$(jq -er '.name | select(type == "string" and length > 0)' <<<"$user")" || return 1
-  if jq -e 'any(.endpoints[]?; .protocol == "ss2022" and .transport == "shadowtls")' <<<"$user" >/dev/null; then
-    has_legacy=true
-  fi
-  while IFS= read -r endpoint; do
-    [[ -n "$endpoint" ]] || continue
-    direct_tag=""
-    if [[ "$has_legacy" == true &&
-          "$(jq -r '.protocol == "ss2022" and .transport == "direct"' <<<"$endpoint")" == true ]]; then
-      direct_tag="ss-direct-$name"
-    fi
-    fragment="$(make_endpoint_inbounds_from_state "$name" "$endpoint" "$direct_tag")" || return 1
-    fragments="$(SB_JQ_CURRENT="$fragments" SB_JQ_ADDED="$fragment" jq -cn \
-      '($ENV.SB_JQ_CURRENT | fromjson) + ($ENV.SB_JQ_ADDED | fromjson)')" || return 1
-    count=$((count + 1))
-  done < <(jq -c 'if (.endpoints | type) == "array" then .endpoints[] else
-    if (.protocol // "ss2022") == "anytls" then
-      {protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}
-    else
-      {protocol:"ss2022",transport:(.transport // "shadowtls"),port:.port,shadowtls_password:.shadowtls_password,
-       ss2022_password:.ss2022_password,method:.method,shadowtls_sni:.shadowtls_sni}
-    end end' <<<"$user")
-  if ((count == 0)); then
-    return 1
-  fi
-  printf '%s\n' "$fragments"
+  local user="$1"
+  build_user_inbound_payload user "" - <<<"$user"
 }
 
 state_add_user() {

@@ -2407,13 +2407,139 @@ jq -e '
   any(.[]; .tag == "ss-udp-stored-multi" and .listen_port == 20009)
 ' <<<"$stored_multi_fragment" >/dev/null
 
+# 多入口批量生成必须保持旧实现的 endpoint 顺序、对象字段顺序和逐字节输出。
+batch_inbound_user='{"name":"equiv","status":"active","metered":false,"endpoints":[
+  {"protocol":"anytls","port":22001,"anytls_password":"any-secret","tls_sni":"any.example.com"},
+  {"protocol":"ss2022","transport":"shadowtls","port":22002,"shadowtls_password":"st-secret","ss2022_password":"ss-secret","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"ss.example.com"},
+  {"protocol":"ss2022","transport":"direct","port":22003,"ss2022_password":"direct-secret","method":"2022-blake3-aes-256-gcm"}
+]}'
+batch_inbound_expected='[{"type":"anytls","tag":"anytls-equiv","listen":"::","listen_port":22001,"users":[{"name":"equiv","password":"any-secret"}],"tls":{"enabled":true,"certificate_path":"/etc/sing-box/cert/anytls.crt","key_path":"/etc/sing-box/cert/anytls.key"}},{"type":"shadowtls","tag":"st-equiv","listen":"::","listen_port":22002,"version":3,"users":[{"name":"equiv","password":"st-secret"}],"handshake":{"server":"ss.example.com","server_port":443},"strict_mode":true,"detour":"ss-equiv"},{"type":"shadowsocks","tag":"ss-equiv","network":"tcp","method":"2022-blake3-aes-128-gcm","password":"ss-secret"},{"type":"shadowsocks","tag":"ss-udp-equiv","listen":"::","listen_port":22002,"network":"udp","method":"2022-blake3-aes-128-gcm","password":"ss-secret"},{"type":"shadowsocks","tag":"ss-direct-equiv","listen":"::","listen_port":22003,"method":"2022-blake3-aes-256-gcm","password":"direct-secret"}]'
+[[ "$(make_user_inbounds_from_state "$batch_inbound_user")" == "$batch_inbound_expected" ]]
+for invalid_user in \
+  '{"name":"empty","status":"active","endpoints":[]}' \
+  '{"name":"bad-port","status":"active","endpoints":[{"protocol":"anytls","port":"22001","anytls_password":"secret"}]}' \
+  '{"name":"bad-protocol","status":"active","endpoints":[{"protocol":"unknown","port":22001}]}' \
+  '{"name":"bad-transport","status":"active","endpoints":[{"protocol":"ss2022","transport":"invalid","port":22001,"ss2022_password":"secret","method":"2022-blake3-aes-128-gcm"}]}' \
+  '{"name":"missing-password","status":"active","endpoints":[{"protocol":"anytls","port":22001}]}'
+do
+  if make_user_inbounds_from_state "$invalid_user" >/dev/null 2>&1; then
+    echo 'invalid endpoint state must be rejected by batch inbound generation' >&2
+    exit 1
+  fi
+done
+
+# 三入口片段生成固定一次 jq；秘密只经 stdin，不进入 jq argv。
+(
+  inbound_jq_calls="$work/batch-inbound-jq.calls"
+  inbound_jq_args="$work/batch-inbound-jq.args"
+  : > "$inbound_jq_calls"
+  : > "$inbound_jq_args"
+  jq() {
+    printf 'jq\n' >> "$inbound_jq_calls"
+    printf '%s\0' "$@" >> "$inbound_jq_args"
+    command jq "$@"
+  }
+  [[ "$(make_user_inbounds_from_state "$batch_inbound_user")" == "$batch_inbound_expected" ]]
+  [[ "$(wc -l < "$inbound_jq_calls" | tr -d ' ')" == 1 ]]
+  ! tr '\0' '\n' < "$inbound_jq_args" | grep -Fq 'any-secret'
+  ! tr '\0' '\n' < "$inbound_jq_args" | grep -Fq 'direct-secret'
+)
+
+# 50 个三入口用户协议重建固定为一次批量生成和一次配置改写，并保留外部入口与 endpoint 顺序。
+(
+  STATE_FILE="$work/batch-rebuild-state.json"
+  SINGBOX_CONFIG="$work/batch-rebuild-config.json"
+  SINGBOX_BIN=batch_rebuild_singbox
+  batch_rebuild_singbox() {
+    [[ "$1" == format && "$2" == -c ]]
+    command jq . "$3"
+  }
+  command jq -n '{
+    schema_version:7,
+    users:[range(0; 50) as $index | {
+      name:("user" + ($index | tostring)),status:(if $index == 49 then "disabled" else "active" end),metered:false,
+      endpoints:[
+        {protocol:"ss2022",transport:"shadowtls",port:(20000 + $index),shadowtls_password:"st-secret",ss2022_password:"ss-secret",method:"2022-blake3-aes-128-gcm",shadowtls_sni:"example.com"},
+        {protocol:"ss2022",transport:"direct",port:(21000 + $index),ss2022_password:"direct-secret",method:"2022-blake3-aes-128-gcm"},
+        {protocol:"anytls",port:(22000 + $index),anytls_password:"any-secret",tls_sni:"any.example.com"}
+      ]
+    }],splits:[],outbound_presets:[],rule_presets:[]
+  }' > "$STATE_FILE"
+  command jq '(.users[49].endpoints[]) |= del(.shadowtls_password,.ss2022_password,.method,.shadowtls_sni,.anytls_password)' \
+    "$STATE_FILE" > "$STATE_FILE.tmp"
+  mv -- "$STATE_FILE.tmp" "$STATE_FILE"
+  printf '%s\n' '{"inbounds":[{"type":"direct","tag":"external-a"},{"type":"direct","tag":"st-user0"},{"type":"direct","tag":"external-b"}],"outbounds":[],"route":{"rules":[],"rule_set":[]}}' > "$SINGBOX_CONFIG"
+  rebuild_jq_calls="$work/batch-rebuild-jq.calls"
+  rebuild_jq_args="$work/batch-rebuild-jq.args"
+  : > "$rebuild_jq_calls"
+  : > "$rebuild_jq_args"
+  jq() {
+    printf 'jq\n' >> "$rebuild_jq_calls"
+    printf '%s\0' "$@" >> "$rebuild_jq_args"
+    command jq "$@"
+  }
+  rebuild_protocol_inbounds ss2022
+  [[ "$(wc -l < "$rebuild_jq_calls" | tr -d ' ')" == 2 ]]
+  ! tr '\0' '\n' < "$rebuild_jq_args" | grep -Fq 'st-secret'
+  ! tr '\0' '\n' < "$rebuild_jq_args" | grep -Fq 'direct-secret'
+  ! tr '\0' '\n' < "$rebuild_jq_args" | grep -Fq 'any-secret'
+  command jq -e '
+    (.inbounds | length) == 198 and
+    .inbounds[0].tag == "external-a" and .inbounds[1].tag == "external-b" and
+    .inbounds[2].tag == "st-user0" and .inbounds[3].tag == "ss-user0" and
+    .inbounds[4].tag == "ss-udp-user0" and .inbounds[5].tag == "ss-direct-user0" and
+    (all(.inbounds[]; .tag != "st-user49" and .tag != "ss-user49" and .tag != "ss-udp-user49" and .tag != "ss-direct-user49"))
+  ' "$SINGBOX_CONFIG" >/dev/null
+  printf '%s\n' '{"inbounds":[{"type":"direct","tag":"external-a"},{"type":"direct","tag":"anytls-user0"},{"type":"direct","tag":"external-b"}],"outbounds":[],"route":{"rules":[],"rule_set":[]}}' > "$SINGBOX_CONFIG"
+  : > "$rebuild_jq_calls"
+  rebuild_protocol_inbounds anytls
+  [[ "$(wc -l < "$rebuild_jq_calls" | tr -d ' ')" == 2 ]]
+  command jq -e '
+    (.inbounds | length) == 51 and
+    .inbounds[0].tag == "external-a" and .inbounds[1].tag == "external-b" and
+    .inbounds[2].tag == "anytls-user0" and
+    (all(.inbounds[]; .tag != "anytls-user49"))
+  ' "$SINGBOX_CONFIG" >/dev/null
+  cp -- "$SINGBOX_CONFIG" "$SINGBOX_CONFIG.before-invalid-state"
+  command jq '.users[0].status = null' "$STATE_FILE" > "$STATE_FILE.tmp"
+  mv -- "$STATE_FILE.tmp" "$STATE_FILE"
+  if rebuild_protocol_inbounds ss2022 >/dev/null 2>&1; then
+    echo 'invalid active user state must stop protocol rebuild' >&2
+    exit 1
+  fi
+  cmp -s "$SINGBOX_CONFIG.before-invalid-state" "$SINGBOX_CONFIG"
+  printf '%s\n' '{"users":[{"name":null,"status":null,"endpoints":[{"protocol":"anytls","port":22001,"anytls_password":"secret"}]}]}' > "$STATE_FILE"
+  [[ "$(build_user_inbound_payload rebuild ss2022 "$STATE_FILE")" == '{"managed_tags":[],"inbounds":[]}' ]]
+  printf '%s\n' '{"users":[{"name":null,"status":null,"endpoints":[{"protocol":"ss2022","transport":"direct","port":22001,"ss2022_password":"secret","method":"2022-blake3-aes-128-gcm"}]}]}' > "$STATE_FILE"
+  [[ "$(build_user_inbound_payload rebuild anytls "$STATE_FILE")" == '{"managed_tags":[],"inbounds":[]}' ]]
+  printf '%s\n' '{"users":[{"name":123,"status":true,"endpoints":[{"protocol":"anytls","port":22001,"anytls_password":"secret"}]}]}' > "$STATE_FILE"
+  [[ "$(build_user_inbound_payload rebuild anytls "$STATE_FILE")" == '{"managed_tags":["anytls-123"],"inbounds":[]}' ]]
+)
+
+# 异常旧状态继续走原实现，保留对象用户名的 pretty JSON tag 与顶层 users 损坏时的失败语义。
+(
+  STATE_FILE="$work/batch-rebuild-legacy-fallback-state.json"
+  SINGBOX_CONFIG="$work/batch-rebuild-legacy-fallback-config.json"
+  SINGBOX_BIN=mock_singbox
+  printf '%s\n' '{"users":[{"name":{"x":1},"status":"active","endpoints":[{"protocol":"ss2022","transport":"direct","port":22001,"ss2022_password":"secret","method":"2022-blake3-aes-128-gcm"}]}]}' > "$STATE_FILE"
+  printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rules":[],"rule_set":[]}}' > "$SINGBOX_CONFIG"
+  rebuild_protocol_inbounds ss2022
+  legacy_object_name="$(command jq -r '.' <<<'{"x":1}')"
+  command jq -e --arg tag "ss-$legacy_object_name" 'any(.inbounds[]; .tag == $tag)' "$SINGBOX_CONFIG" >/dev/null
+  printf '%s\n' '{"users":null}' > "$STATE_FILE"
+  printf '%s\n' '{"inbounds":[{"type":"direct","tag":"external"}],"outbounds":[],"route":{"rules":[],"rule_set":[]}}' > "$SINGBOX_CONFIG"
+  rebuild_protocol_inbounds ss2022 2>/dev/null
+  command jq -e '(.inbounds | length) == 1 and .inbounds[0].tag == "external"' "$SINGBOX_CONFIG" >/dev/null
+)
+
 (
   STATE_FILE="$work/udp-upgrade-state.json"
   SINGBOX_CONFIG="$work/udp-upgrade-config.json"
   SINGBOX_BIN=mock_singbox
   HANDSHAKE_PORT=443
   SHADOWTLS_STRICT_MODE=true
-  printf '%s\n' '{"schema_version":3,"users":[{"name":"legacy-active","port":20031,"status":"active","metered":false,"shadowtls_password":"legacy-st","ss2022_password":"legacy-ss","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"legacy.example.com"},{"name":"legacy-disabled","port":20032,"status":"disabled","metered":false,"shadowtls_password":"disabled-st","ss2022_password":"disabled-ss","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"disabled.example.com"}],"splits":[]}' > "$STATE_FILE"
+  # 历史扁平状态的重建始终按 ShadowTLS 解释，即使残留了 transport=direct 字段。
+  printf '%s\n' '{"schema_version":3,"users":[{"name":"legacy-active","port":20031,"transport":"direct","status":"active","metered":false,"shadowtls_password":"legacy-st","ss2022_password":"legacy-ss","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"legacy.example.com"},{"name":"legacy-disabled","port":20032,"status":"disabled","metered":false,"shadowtls_password":"disabled-st","ss2022_password":"disabled-ss","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"disabled.example.com"}],"splits":[]}' > "$STATE_FILE"
   printf '%s\n' '{"inbounds":[{"type":"direct","tag":"external-in"},{"type":"shadowtls","tag":"st-legacy-active","listen":"::","listen_port":20031},{"type":"shadowsocks","tag":"ss-legacy-active","network":"tcp","method":"2022-blake3-aes-128-gcm","password":"legacy-ss"}],"outbounds":[],"route":{"rules":[],"rule_set":[]}}' > "$SINGBOX_CONFIG"
   if ss2022_udp_inbounds_are_current; then
     echo 'legacy SS2022 config without UDP inbound should require migration' >&2
