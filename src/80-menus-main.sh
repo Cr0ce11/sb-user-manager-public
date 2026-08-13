@@ -93,7 +93,7 @@ user_management_menu() {
     ui_section '状态与计费'
     ui_menu_items \
       disable '停用用户' enable '启用用户' \
-      renew '续期用户' traffic '调整用户流量'
+      renew '调整用户有效期' traffic '调整用户流量'
     printf '\n'
     ui_section '危险操作'
     printf '%s' "$UI_RED"

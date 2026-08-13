@@ -386,6 +386,7 @@ remove_full_test_users() {
 run_lifecycle() {
   local suffix ss_port anytls_port sni edited_expiry old_secret new_secret limit_bytes list_output expires usage
   local renew_started renew_finished renewed_expiry renewed_epoch renew_lower_bound renew_upper_bound
+  local reduced_expiry expected_reduced_expiry config_before_reduction config_after_reduction
   [[ "$CONFIRM" == YES ]] || { fail '写入型验收授权' '必须设置 SB_ACCEPTANCE_CONFIRM=YES'; return 1; }
   if ((FAILURES > 0)); then fail '写入型验收前置检查' '只读验收存在失败项'; return 1; fi
   prepare_core
@@ -536,6 +537,33 @@ run_lifecycle() {
   fi
   usage="$(nfuse list --json | jq -r --arg name "$ANYTLS_USER" '.[] | select(.name == $name) | .used_bytes')"
   if [[ "$usage" == 0 ]]; then pass '续期启用后已用流量清零'; else fail '续期启用后已用流量清零' "实际 $usage"; return 1; fi
+
+  expected_reduced_expiry="$(calculate_renewal_expiry "$renewed_epoch" -1)"
+  config_before_reduction="$(sha256sum "$SINGBOX_CONFIG" | awk '{print $1}')"
+  if nfuse set-usage "$ANYTLS_USER" 12345 >/dev/null && nfuse persist >/dev/null; then
+    pass '写入提前到期前的流量基线'
+  else
+    fail '写入提前到期前的流量基线'
+    return 1
+  fi
+  run_mutation '将用户到期时间提前 1 个月' cmd_renew "$ANYTLS_USER" -1
+  verify_state_value '提前到期后用户仍为启用' ".users[] | select(.name == \"$ANYTLS_USER\") | .status" active || return 1
+  reduced_expiry="$(jq -r --arg name "$ANYTLS_USER" '.users[] | select(.name == $name) | .expires_at' "$STATE_FILE")"
+  if [[ "$reduced_expiry" == "$expected_reduced_expiry" ]]; then
+    pass '有效期按输入提前 1 个月'
+  else
+    fail '有效期按输入提前 1 个月' "预期 ${expected_reduced_expiry}，实际 ${reduced_expiry}"
+    return 1
+  fi
+  usage="$(nfuse list --json | jq -r --arg name "$ANYTLS_USER" '.[] | select(.name == $name) | .used_bytes')"
+  if [[ "$usage" == 12345 ]]; then pass '提前到期不清零已用流量'; else fail '提前到期不清零已用流量' "实际 $usage"; return 1; fi
+  config_after_reduction="$(sha256sum "$SINGBOX_CONFIG" | awk '{print $1}')"
+  if [[ "$config_after_reduction" == "$config_before_reduction" ]]; then
+    pass '提前到期不改写 sing-box 配置'
+  else
+    fail '提前到期不改写 sing-box 配置'
+    return 1
+  fi
 
   run_split_lifecycle
 }
