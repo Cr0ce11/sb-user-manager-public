@@ -14,7 +14,9 @@ fail() {
   exit 1
 }
 
+REAL_FLOCK_AVAILABLE=true
 if ! command -v flock >/dev/null 2>&1; then
+  REAL_FLOCK_AVAILABLE=false
   flock() { return 0; }
 fi
 if ! sync -f "$ROOT/sb-user-manager.sh" 2>/dev/null; then
@@ -56,6 +58,7 @@ setup_case() {
     "$CASE_ROOT/root"
   MANAGER_INSTALLED_PATH="$CASE_ROOT/usr/local/sbin/sb-user-manager"
   DEPLOYED_VERSIONS_FILE="$CASE_ROOT/var/lib/sb-user-manager/versions"
+  LOCK_FILE="$CASE_ROOT/run/lock/operation.lock"
   ENVIRONMENT_LOCK_FILE="$CASE_ROOT/run/lock/environment.lock"
   ENVIRONMENT_TRANSACTION_JOURNAL="$CASE_ROOT/var/lib/sb-user-manager.recovery.json"
   MANAGER_HANDOFF_DIRECTORY="$CASE_ROOT/var/lib/sb-user-manager/manager-handoff"
@@ -107,6 +110,7 @@ old_installed="$WORK/forward-private-old.sh"
 cp "$MANAGER_INSTALLED_PATH" "$old_installed"
 activate_candidate "$public_current" 4.23.5 公开版 5 0
 take_over_installed_manager >/dev/null || fail 'new public manager could not take over old private manager'
+if { printf x >&9; } 2>/dev/null; then fail 'successful handoff left operation lock descriptor open'; fi
 cmp -s "$public_current" "$MANAGER_INSTALLED_PATH" || fail 'public target was not installed'
 cmp -s "$old_installed" "$MANAGER_HANDOFF_DIRECTORY/previous.sh" || fail 'old private manager rollback copy is wrong'
 cmp -s "$public_current" "$MANAGER_ROOT_LAUNCH_COPY" || fail 'root launch copy was not synchronized'
@@ -121,6 +125,22 @@ activate_candidate "$public_current" 4.23.5 公开版 5 0
 take_over_installed_manager >/dev/null || fail 'same-version public handoff was not idempotent'
 cmp -s "$public_current" "$MANAGER_INSTALLED_PATH" || fail 'same-version public target was not preserved'
 assert_case_data_unchanged
+
+# 活跃用户/分流操作持有 fd 9 时，管理脚本接管也不能并发写入。
+if [[ "$REAL_FLOCK_AVAILABLE" == true ]]; then
+  setup_case reject-live-operation "$private_old" 4.22.9
+  activate_candidate "$public_current" 4.23.5 公开版 5 0
+  exec 7>"$LOCK_FILE"
+  command flock -n 7
+  if take_over_installed_manager >"$CASE_ROOT/output" 2>&1; then
+    fail 'manager handoff ignored an active user operation lock'
+  fi
+  grep -Fq '另一个安装、恢复或接管操作正在执行' "$CASE_ROOT/output" ||
+    fail 'manager handoff lock rejection was unclear'
+  command flock -u 7
+  exec 7>&-
+  assert_case_data_unchanged
+fi
 
 # 同渠道也允许严格向前升级。
 setup_case forward-public-to-public "$public_old" 4.22.9
@@ -234,6 +254,7 @@ write_manager_handoff_journal 4.22.9 私有版 4 "$old_sha256" 4.23.5 公开版 
 atomic_install_file "$public_current" "$MANAGER_INSTALLED_PATH" 700
 update_deployed_manager_version 4.23.5
 recover_manager_handoff >/dev/null || fail 'interrupted handoff was not recovered'
+if { printf x >&9; } 2>/dev/null; then fail 'handoff recovery left operation lock descriptor open'; fi
 [[ "$MANAGER_HANDOFF_RECOVERED" == true ]] || fail 'startup recovery was not exposed to the dispatcher'
 [[ "$(manager_handoff_sha256 "$MANAGER_INSTALLED_PATH")" == "$old_sha256" ]] || fail 'startup recovery did not restore old manager'
 grep -Fxq 'SCRIPT_VERSION=4.22.9' "$DEPLOYED_VERSIONS_FILE" || fail 'startup recovery did not restore old version record'

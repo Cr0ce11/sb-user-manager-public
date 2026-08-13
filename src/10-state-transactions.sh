@@ -748,8 +748,12 @@ begin_operation_transaction() {
     ((ACTIVE_TRANSACTION_DEPTH+=1))
     return 0
   fi
-  if [[ -e "$TRANSACTION_JOURNAL" ]]; then
+  if [[ -e "$TRANSACTION_JOURNAL" || -L "$TRANSACTION_JOURNAL" ]]; then
     printf '错误：发现上次未完成的操作，而且尚未恢复。为保护现有数据，本次操作已停止。恢复记录：%s\n' "$TRANSACTION_JOURNAL" >&2
+    return 1
+  fi
+  if [[ -e "$ENVIRONMENT_TRANSACTION_JOURNAL" || -L "$ENVIRONMENT_TRANSACTION_JOURNAL" ]]; then
+    printf '错误：发现尚未完成的环境操作。为保护现有数据，本次用户或分流操作已停止。恢复记录：%s\n' "$ENVIRONMENT_TRANSACTION_JOURNAL" >&2
     return 1
   fi
   install -d -m 700 "$TRANSACTION_DIR" "$BACKUP_DIR" || return 1
@@ -949,12 +953,21 @@ release_environment_lock() {
 }
 
 begin_environment_transaction() {
-  local operation="$1" snapshot="$2" tmp path
+  local operation="$1" snapshot="$2" tmp path operation_journal
   shift 2
+  operation_journal="${TRANSACTION_JOURNAL:-$(system_path /var/lib/sb-user-manager/transactions/active.json)}" || return 1
   install -d -m 755 "$(dirname "$ENVIRONMENT_LOCK_FILE")" || return 1
   exec 8>"$ENVIRONMENT_LOCK_FILE"
   flock -n 8 || { release_environment_lock; return 1; }
-  [[ ! -e "$ENVIRONMENT_TRANSACTION_JOURNAL" ]] || { release_environment_lock; return 1; }
+  [[ ! -e "$ENVIRONMENT_TRANSACTION_JOURNAL" && ! -L "$ENVIRONMENT_TRANSACTION_JOURNAL" ]] || {
+    release_environment_lock
+    return 1
+  }
+  if [[ -e "$operation_journal" || -L "$operation_journal" ]]; then
+    printf '错误：发现尚未完成的用户或分流操作。为保护现有数据，本次环境操作已停止。恢复记录：%s\n' "$operation_journal" >&2
+    release_environment_lock
+    return 1
+  fi
   verify_environment_backup "$snapshot" || { release_environment_lock; return 1; }
   for path in "$@"; do is_environment_recovery_path "$path" || { release_environment_lock; return 1; }; done
   install -d -m 700 "$(dirname "$ENVIRONMENT_TRANSACTION_JOURNAL")" || { release_environment_lock; return 1; }
@@ -1010,22 +1023,48 @@ recover_environment_transaction() {
   fi
   environment_transaction_journal_is_trusted ||
     die "环境恢复日志权限或类型不安全，拒绝继续：$ENVIRONMENT_TRANSACTION_JOURNAL"
-  install -d -m 755 "$(dirname "$ENVIRONMENT_LOCK_FILE")" || die "无法创建环境恢复锁目录"
-  exec 8>"$ENVIRONMENT_LOCK_FILE"
-  flock -n 8 || die "另一个环境恢复或部署操作正在执行"
-  validate_environment_transaction || die "环境恢复日志无效，拒绝继续：$ENVIRONMENT_TRANSACTION_JOURNAL"
+  acquire_operation_lock || die "$OPERATION_LOCK_ERROR"
+  install -d -m 755 "$(dirname "$ENVIRONMENT_LOCK_FILE")" || {
+    release_operation_lock
+    die "无法创建环境恢复锁目录"
+  }
+  exec 8>"$ENVIRONMENT_LOCK_FILE" || {
+    release_operation_lock
+    die "无法打开环境恢复锁"
+  }
+  flock -n 8 || {
+    release_environment_lock
+    release_operation_lock
+    die "另一个环境恢复或部署操作正在执行"
+  }
+  validate_environment_transaction || {
+    release_environment_lock
+    release_operation_lock
+    die "环境恢复日志无效，拒绝继续：$ENVIRONMENT_TRANSACTION_JOURNAL"
+  }
   snapshot="$(jq -r '.snapshot' "$ENVIRONMENT_TRANSACTION_JOURNAL")"
   operation="$(jq -r '.operation' "$ENVIRONMENT_TRANSACTION_JOURNAL")"
-  prepare_environment_backup_for_restore "$snapshot" ||
+  prepare_environment_backup_for_restore "$snapshot" || {
+    release_environment_lock
+    release_operation_lock
     die "操作前完整备份已经损坏或无法安全整理，为保护现有数据，本次自动恢复已停止：$snapshot"
+  }
   log "检测到上次安装或更新未正常结束，正在恢复原环境：$operation"
   while IFS= read -r path; do
     [[ -n "$path" ]] || continue
     path="$(system_path "$path")"
     if [[ -d "$path" && ! -L "$path" ]]; then rm -rf -- "$path"; else rm -f -- "$path"; fi
   done < <(jq -r '.cleanup_paths[]' "$ENVIRONMENT_TRANSACTION_JOURNAL" | awk '{print length, $0}' | sort -rn | cut -d' ' -f2-)
-  restore_environment_backup "$snapshot" || die "环境自动恢复失败。请停止继续部署，并保留完整备份：$snapshot"
-  clear_environment_transaction || die "环境已经恢复，但无法清除恢复标记：$ENVIRONMENT_TRANSACTION_JOURNAL"
+  restore_environment_backup "$snapshot" || {
+    release_environment_lock
+    release_operation_lock
+    die "环境自动恢复失败。请停止继续部署，并保留完整备份：$snapshot"
+  }
+  if ! clear_environment_transaction; then
+    release_operation_lock
+    die "环境已经恢复，但无法清除恢复标记：$ENVIRONMENT_TRANSACTION_JOURNAL"
+  fi
+  release_operation_lock
   log "服务器已恢复到上次安装或更新前的状态：$operation"
 }
 

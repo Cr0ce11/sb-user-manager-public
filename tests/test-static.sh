@@ -318,12 +318,32 @@ grep -Fq 'run_step_or_rollback()' sb-user-manager.sh
 grep -Fq 'run_managed_step()' sb-user-manager.sh
 grep -Fq 'begin_environment_transaction()' sb-user-manager.sh
 grep -Fq 'recover_environment_transaction()' sb-user-manager.sh
+grep -Fq 'acquire_operation_lock()' sb-user-manager.sh
+[[ "$(grep -Fc 'if ! acquire_operation_lock; then' sb-user-manager.sh)" == 4 ]]
+for serialized_recovery in recover_environment_transaction acquire_manager_handoff_lock; do
+  if ! awk -v function_name="$serialized_recovery" '
+      $0 == function_name "() {" {inside=1}
+      inside && /acquire_operation_lock/ {found=1}
+      inside && /^}/ {exit}
+      END {exit(found ? 0 : 1)}
+    ' sb-user-manager.sh; then
+    echo "$serialized_recovery must acquire the shared operation lock before recovery" >&2
+    exit 1
+  fi
+done
+grep -Fq '发现尚未完成的环境操作。为保护现有数据，本次用户或分流操作已停止' sb-user-manager.sh
+grep -Fq '发现尚未完成的用户或分流操作。为保护现有数据，本次环境操作已停止' sb-user-manager.sh
+if awk '/^cleanup_internal_material_after_uninstall\(\) \{/{inside=1} inside{print} inside && /^}/{exit}' \
+    sb-user-manager.sh | grep -Eq 'rm .*\$(ENVIRONMENT_LOCK_FILE|LOCK_FILE)|operation_lock'; then
+  echo 'complete uninstall must not unlink persistent lock files' >&2
+  exit 1
+fi
 grep -Fq 'migrate_backup_retention_once()' sb-user-manager.sh
 [[ "$(grep -Fc 'migrate_backup_retention_once' sb-user-manager.sh)" == 2 ]]
 grep -Fq 'SB_BACKUP_RETENTION_MIGRATION_MARKER' sb-user-manager.sh
 grep -Fq 'prompt_user_status_action()' sb-user-manager.sh
 grep -Fq 'config_path="$(system_path /etc/sing-box/config.json)"' sb-user-manager.sh
-grep -Fq 'deploy_environment false "$update_manager" || return 1' sb-user-manager.sh
+grep -Fq 'if ! deploy_environment false "$update_manager"; then' sb-user-manager.sh
 if grep -Fq 'prompt_name_action' sb-user-manager.sh; then
   echo 'legacy free-form enable/disable user prompt should not remain' >&2
   exit 1

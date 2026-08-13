@@ -52,6 +52,7 @@
 | BUG-004 | P1 | 完成 | [Issue #107](https://github.com/DTB201/sb-user-manager/issues/107)、[PR #108](https://github.com/DTB201/sb-user-manager/pull/108) | 清理抢先命中的旧版分流残留 | v4.20.1 已正式发布；本地门禁、克隆机一次性整理与回滚、真实菜单更新和发布后 `release` 验收均已通过 |
 | BUG-005 | P0 | 完成 | [公开 Issue #36](https://github.com/DTB201/sb-user-manager-public/issues/36)、[公开 PR #37](https://github.com/DTB201/sb-user-manager-public/pull/37) | 修复首次启动提示调用未定义命令 | 快捷入口冲突和安装失败均调用真实暂停函数、返回成功并继续进入菜单；静态门禁能拒绝未定义裸命令目标，生成物、本地门禁与公开 CI 通过 |
 | BUG-006 | P1 | 完成 | [公开 Issue #38](https://github.com/DTB201/sb-user-manager-public/issues/38)、[公开 PR #39](https://github.com/DTB201/sb-user-manager-public/pull/39) | 修复损坏有效期在自动到期检查中被静默放行 | 坏记录明确告警并跳过，其他到期用户继续停用；一致性检查报告“需要处理”，生成物、本地门禁与公开 CI 通过 |
+| BUG-007 | P1 | 完成 | [公开 Issue #40](https://github.com/DTB201/sb-user-manager-public/issues/40)、[公开 PR #41](https://github.com/DTB201/sb-user-manager-public/pull/41) | 建立环境操作与用户操作的双向互斥 | 四个环境入口、启动恢复和脚本接管与用户/分流共用操作锁，两类事务日志双向排斥；全新环境、冲突、失败、回滚、描述符释放、本地门禁与公开 CI 通过 |
 | UX-003 | P2 | 暂缓 | [公开 Issue #16](https://github.com/DTB201/sb-user-manager-public/issues/16) | 增加 Mihomo 格式的用户配置导出 | 项目所有者尚未确认实际必要性；不进入目标版本，待使用场景和维护价值明确后重新评估 |
 
 ## 当前最值得继续的顺序

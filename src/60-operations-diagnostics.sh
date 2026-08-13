@@ -1,4 +1,48 @@
 
+OPERATION_LOCK_ERROR=""
+OPERATION_LOCK_HELD=false
+
+acquire_operation_lock() {
+  local lock_file lock_directory
+  OPERATION_LOCK_ERROR=""
+  [[ "$OPERATION_LOCK_HELD" != true ]] || return 0
+  if [[ -n "${LOCK_FILE:-}" ]]; then
+    lock_file="$LOCK_FILE"
+  else
+    lock_file="$(system_path /run/lock/sb-user-manager.lock)" || {
+      OPERATION_LOCK_ERROR="无法确定管理操作锁位置"
+      return 1
+    }
+  fi
+  lock_directory="$(dirname "$lock_file")" || {
+    OPERATION_LOCK_ERROR="无法确定管理操作锁目录"
+    return 1
+  }
+  if [[ -e "$lock_directory" || -L "$lock_directory" ]]; then
+    if [[ ! -d "$lock_directory" || -L "$lock_directory" ]]; then
+      OPERATION_LOCK_ERROR="管理操作锁目录类型不安全：$lock_directory"
+      return 1
+    fi
+  elif ! install -d -m 755 -- "$lock_directory"; then
+    OPERATION_LOCK_ERROR="无法创建管理操作锁目录：$lock_directory"
+    return 1
+  fi
+  if [[ ( -e "$lock_file" || -L "$lock_file" ) && ( ! -f "$lock_file" || -L "$lock_file" ) ]]; then
+    OPERATION_LOCK_ERROR="管理操作锁文件类型不安全：$lock_file"
+    return 1
+  fi
+  if ! { exec 9>"$lock_file"; }; then
+    OPERATION_LOCK_ERROR="无法打开管理操作锁：$lock_file"
+    return 1
+  fi
+  if ! flock -n 9; then
+    release_operation_lock
+    OPERATION_LOCK_ERROR="另一个管理操作正在进行，请等待完成后再试"
+    return 1
+  fi
+  OPERATION_LOCK_HELD=true
+}
+
 prepare_core() {
   load_runtime_config
   need_cmd jq
@@ -9,8 +53,7 @@ prepare_core() {
   need_cmd awk
   need_cmd ip
   check_config_vars
-  exec 9>"$LOCK_FILE"
-  flock -n 9 || die "另一个管理操作正在进行，请等待完成后再试"
+  acquire_operation_lock || die "$OPERATION_LOCK_ERROR"
   recover_pending_transaction
   init_state
 }
@@ -24,6 +67,7 @@ recover_transaction_before_menu() {
 }
 
 release_operation_lock() {
+  OPERATION_LOCK_HELD=false
   flock -u 9 2>/dev/null || true
   { exec 9>&-; } 2>/dev/null || true
 }

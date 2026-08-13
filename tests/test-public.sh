@@ -80,6 +80,8 @@ chmod 600 "$legacy_config"
   environment_is_deployed() { return 0; }
   load_runtime_config() { unset GITHUB_TOKEN SB_GITHUB_TOKEN; }
   need_cmd() { return 0; }
+  acquire_operation_lock() { return 0; }
+  release_operation_lock() { return 0; }
   fetch_latest_releases() {
     printf '%s\n' "$1" > "$WORK/fetch-mode"
     LATEST_SINGBOX_VERSION=1.13.14
