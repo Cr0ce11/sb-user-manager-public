@@ -261,6 +261,28 @@ grep -Fxq 'SCRIPT_VERSION=4.22.9' "$DEPLOYED_VERSIONS_FILE" || fail 'startup rec
 [[ ! -e "$MANAGER_HANDOFF_JOURNAL" ]] || fail 'startup recovery left an active journal'
 assert_case_data_unchanged
 
+# 接管锁目录已是符号链接时必须拒绝，不能跟随链接建锁或改写目标目录权限，并要释放操作锁。
+setup_case reject-symlinked-environment-lock-directory "$private_old" 4.22.9
+external_lock_dir="$CASE_ROOT/external-lock"
+install -d -m 700 "$external_lock_dir"
+ln -s "$external_lock_dir" "$CASE_ROOT/run/lock-link"
+ENVIRONMENT_LOCK_FILE="$CASE_ROOT/run/lock-link/environment.lock"
+if acquire_manager_handoff_lock; then
+  release_manager_handoff_locks
+  fail 'symlinked environment lock directory was accepted'
+fi
+if { printf x >&9; } 2>/dev/null; then
+  fail 'rejected handoff lock left the operation lock descriptor open'
+fi
+external_lock_mode="$(manager_file_mode "$external_lock_dir")"
+if [[ "$external_lock_mode" != 700 ]]; then
+  fail "handoff lock followed the symlink and changed the target directory mode to $external_lock_mode"
+fi
+if [[ -e "$external_lock_dir/environment.lock" || -L "$external_lock_dir/environment.lock" ]]; then
+  fail 'handoff lock created the lock file through the symlinked directory'
+fi
+assert_case_data_unchanged
+
 [[ ! -s "$WORK/systemctl.events" ]] || fail 'manager handoff called a service lifecycle command'
 
 echo 'manager channel handoff checks passed'

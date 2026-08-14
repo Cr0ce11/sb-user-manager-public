@@ -810,8 +810,16 @@ update_deployed_manager_version() {
 }
 
 acquire_manager_handoff_lock() {
+  local lock_directory
   acquire_operation_lock || return 1
-  install -d -m 755 "$(dirname "$ENVIRONMENT_LOCK_FILE")" || { release_operation_lock; return 1; }
+  # 锁目录已存在时只接受真实目录；符号链接会被跟随并改写目标目录权限。
+  lock_directory="$(dirname "$ENVIRONMENT_LOCK_FILE")" || { release_operation_lock; return 1; }
+  if [[ -e "$lock_directory" || -L "$lock_directory" ]]; then
+    [[ -d "$lock_directory" && ! -L "$lock_directory" ]] || { release_operation_lock; return 1; }
+  elif ! install -d -m 755 -- "$lock_directory"; then
+    release_operation_lock
+    return 1
+  fi
   exec 8>"$ENVIRONMENT_LOCK_FILE" || { release_operation_lock; return 1; }
   flock -n 8 || { release_environment_lock; release_operation_lock; return 1; }
   [[ ! -e "$ENVIRONMENT_TRANSACTION_JOURNAL" && ! -L "$ENVIRONMENT_TRANSACTION_JOURNAL" ]] || {
@@ -1106,6 +1114,7 @@ take_over_installed_manager() {
 # <<< manager_channel_handoff
 
 installed_singbox_version() { "${SINGBOX_BIN:-/usr/local/bin/sing-box}" version 2>/dev/null | awk 'NR==1 {print $3}' || true; }
+# 已知边界：只挡二进制缺失或丢执行位，文件残缺但仍可执行时版本记录依旧被信任。
 installed_nfuse_version() {
   local bin="${NFUSE_BIN:-/usr/local/bin/nfuse}"
   # 二进制缺失时版本记录不可信；返回空串让部署流程重新下载。
