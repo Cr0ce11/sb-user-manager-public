@@ -2668,7 +2668,7 @@ build_merge_migration_payload() {
   3. 把备份用户作为新用户导入（重新填写名称和端口）
   0. 返回，不执行任何恢复
 EOF
-      prompt_migration_choice '请选择 [1]：' 1 '^[0-3]$' || return 1; choice="$MIGRATION_CHOICE"
+      prompt_migration_choice '请选择 [1]：' 1 '^[0-3]$' || { MIGRATION_MERGE_CANCELLED=true; rm -f -- "$normalized"; return 1; }; choice="$MIGRATION_CHOICE"
       case "$choice" in
         1) user_map="$(jq -c --arg key "$source_name" --arg value "$source_name" '. + {($key):$value}' <<<"$user_map")"; migration_update_json_file "$output" '.merge_summary.users.skipped += 1' || return 1; continue;;
         2) action=replaced; replace_name="$source_name";;
@@ -2683,7 +2683,7 @@ EOF
   2. 不导入这个用户（推荐）
   0. 返回，不执行任何恢复
 EOF
-      prompt_migration_choice '请选择 [2]：' 2 '^[0-2]$' || return 1; choice="$MIGRATION_CHOICE"
+      prompt_migration_choice '请选择 [2]：' 2 '^[0-2]$' || { MIGRATION_MERGE_CANCELLED=true; rm -f -- "$normalized"; return 1; }; choice="$MIGRATION_CHOICE"
       case "$choice" in
         1) action=renamed; replace_name=""; prompt_migration_user_reconfigure "$incoming" "$output" "" "$normalized" || { rm -f -- "$normalized"; return 1; }; candidate="$MIGRATION_CONFIGURED_ENTITY";;
         2) user_map="$(jq -c --arg key "$source_name" --arg value "" '. + {($key):$value}' <<<"$user_map")"; migration_update_json_file "$output" '.merge_summary.users.skipped += 1' || return 1; continue;;
@@ -2744,7 +2744,7 @@ EOF
   3. 把备份分流作为新分流导入（需要重新命名）
   0. 返回，不执行任何恢复
 EOF
-      prompt_migration_choice '请选择 [1]：' 1 '^[0-3]$' || return 1; choice="$MIGRATION_CHOICE"
+      prompt_migration_choice '请选择 [1]：' 1 '^[0-3]$' || { MIGRATION_MERGE_CANCELLED=true; rm -f -- "$normalized"; return 1; }; choice="$MIGRATION_CHOICE"
       case "$choice" in
         1) migration_update_json_file "$output" '.merge_summary.splits.skipped += 1' || return 1; continue;;
         2) action=replaced; replace_name="$split_name";;
@@ -2759,7 +2759,7 @@ EOF
   2. 不导入这个分流（推荐）
   0. 返回，不执行任何恢复
 EOF
-      prompt_migration_choice '请选择 [2]：' 2 '^[0-2]$' || return 1; choice="$MIGRATION_CHOICE"
+      prompt_migration_choice '请选择 [2]：' 2 '^[0-2]$' || { MIGRATION_MERGE_CANCELLED=true; rm -f -- "$normalized"; return 1; }; choice="$MIGRATION_CHOICE"
       case "$choice" in
         1) action=renamed; replace_name=""; prompt_migration_split_reconfigure "$candidate" "$output" "" "$normalized" || { rm -f -- "$normalized"; return 1; }; candidate="$MIGRATION_CONFIGURED_ENTITY";;
         2) migration_update_json_file "$output" '.merge_summary.splits.skipped += 1' || return 1; continue;;

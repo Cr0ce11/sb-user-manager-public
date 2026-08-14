@@ -5371,6 +5371,62 @@ fi
     any(.state.users[]; .name == "dual" and ([.endpoints[].port] | sort) == [20055,20056]) and
     .merge_summary.users.renamed == 1
   ' "$merge_output" >/dev/null
+
+  # 合并中途按 Ctrl-D 与选「0. 返回」语义相同：优雅取消回菜单，不能让 die 打死整个脚本。
+  cancel_log="$work/merge-robust-cancel.txt"
+  if printf '1\n' | (
+      cancel_status=0
+      prepare_migration_effective_payload "$merge_source" "$merge_output" || cancel_status=$?
+      printf 'plan-returned:%s\n' "$cancel_status"
+      exit "$cancel_status"
+    ) > "$cancel_log" 2>&1; then
+    echo 'EOF during merge conflict resolution must not report a usable restore plan' >&2
+    exit 1
+  fi
+  cancel_output="$(cat "$cancel_log")"
+  if ! grep -Fq 'plan-returned:1' <<<"$cancel_output"; then
+    echo 'EOF during merge conflict resolution killed the whole script instead of returning to the caller' >&2
+    exit 1
+  fi
+  if grep -Fq '无法生成恢复方案' <<<"$cancel_output"; then
+    echo 'EOF during merge conflict resolution must not die with the "按上方提示处理后重试" wording; there is no such hint on screen' >&2
+    exit 1
+  fi
+  if ! grep -Fq '已取消合并，未修改服务器。' <<<"$cancel_output"; then
+    echo 'EOF during merge conflict resolution must take the same cancellation path as choosing "0. 返回"' >&2
+    exit 1
+  fi
+
+  # 只读的「预览备份」也走同一条准备链，按一次 Ctrl-D 必须回到菜单而不是退出脚本。
+  preview_log="$work/merge-robust-preview.txt"
+  ensure_migration_crypto_dependencies() { :; }
+  prepare_core() { :; }
+  need_cmd() { :; }
+  select_migration_backup() { SELECTED_MIGRATION_BACKUP="$merge_source"; }
+  decrypt_migration_backup() { cp "$1" "$2"; }
+  print_migration_preview() { echo 'unexpected-preview-output'; }
+  if ! printf '1\n' | (
+      preview_status=0
+      preview_migration_backup || preview_status=$?
+      printf 'preview-returned:%s\n' "$preview_status"
+      exit "$preview_status"
+    ) > "$preview_log" 2>&1; then
+    echo 'previewing a backup and pressing Ctrl-D must return to the menu, not abort the manager' >&2
+    exit 1
+  fi
+  preview_output="$(cat "$preview_log")"
+  if ! grep -Fq 'preview-returned:0' <<<"$preview_output"; then
+    echo 'preview_migration_backup did not return to its caller after EOF at a merge choice prompt' >&2
+    exit 1
+  fi
+  if grep -Fq '无法生成恢复方案' <<<"$preview_output"; then
+    echo 'a read-only preview must never die on EOF' >&2
+    exit 1
+  fi
+  if grep -Fq 'unexpected-preview-output' <<<"$preview_output"; then
+    echo 'a cancelled merge must not reach the preview rendering step' >&2
+    exit 1
+  fi
 )
 preview_state="$work/migration-preview-state.json"
 printf '%s\n' '{"schema_version":3,"users":[{"name":"migrate-ss","port":9999},{"name":"removed-user","port":10000}],"splits":[]}' > "$preview_state"
