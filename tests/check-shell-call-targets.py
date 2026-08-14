@@ -177,6 +177,7 @@ EXTERNAL_TARGETS = {
     "systemctl",
     "tail",
     "tar",
+    "timeout",
     "tee",
     "touch",
     "tr",

@@ -6648,6 +6648,39 @@ EOF
   [[ -z "$(installed_nfuse_version)" ]]
   NFUSE_BIN="$nfuse_present_bin"
   [[ "$(installed_nfuse_version)" == 0.1.13 ]]
+
+  # 文件还在、执行位还在，但内容残缺跑不起来：版本记录同样不可信，必须重新下载。
+  nfuse_broken_bin="$work/nfuse-broken-bin"
+  printf '\177ELF\000\000garbage' > "$nfuse_broken_bin"
+  chmod +x "$nfuse_broken_bin"
+  NFUSE_BIN="$nfuse_broken_bin"
+  if [[ -n "$(installed_nfuse_version)" ]]; then
+    echo 'a corrupted nfuse binary must not be trusted just because the version record exists' >&2
+    exit 1
+  fi
+
+  # 但「跑得起来、只是 version 输出格式变了」不等于损坏：版本号仍以记录为准，
+  # 否则 Nfuse 日后改版就会被误判为损坏并陷入反复重装。
+  nfuse_newfmt_bin="$work/nfuse-newfmt-bin"
+  cat > "$nfuse_newfmt_bin" <<'NFUSENEWFMT'
+#!/usr/bin/env bash
+echo 'nfuse v0.1.13 (build abcdef)'
+NFUSENEWFMT
+  chmod +x "$nfuse_newfmt_bin"
+  NFUSE_BIN="$nfuse_newfmt_bin"
+  if [[ "$(installed_nfuse_version)" != 0.1.13 ]]; then
+    echo 'a working nfuse must keep using the recorded version even if its output format changed' >&2
+    exit 1
+  fi
+
+  # 二进制跑得起来但没有版本记录时，才从输出里解析版本号
+  nfuse_no_record="$work/nfuse-no-record"
+  DEPLOYED_VERSIONS_FILE="$nfuse_no_record"
+  NFUSE_BIN="$nfuse_present_bin"
+  if [[ "$(installed_nfuse_version)" != 0.1.13 ]]; then
+    echo 'without a version record the version must be parsed from the binary output' >&2
+    exit 1
+  fi
 )
 (
   download_work="$work/download-missing-nfuse"
