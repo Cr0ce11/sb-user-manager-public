@@ -609,6 +609,18 @@ for split_operation in \
   ! grep -Fq 'finish_managed_operation' <<<"$split_operation_body"
 done
 
+# 交互输入的编号必须先按十进制归一，否则 03 会带着前导零传给下游 jq。
+(
+  moved="$work/split-move-target"
+  STATE_FILE="$work/split-move-state.json"
+  printf '%s\n' '{"splits":[{"name":"a"},{"name":"b"},{"name":"c"}]}' > "$STATE_FILE"
+  prepare_core() { :; }
+  prompt_select_split() { SELECTED_SPLIT_NAME=a; }
+  cmd_split_move() { printf '%s\n' "$2" > "$moved"; }
+  prompt_move_split <<<$'03\ny' >/dev/null
+  [[ "$(<"$moved")" == 3 ]]
+)
+
 # 迁移预览与真实恢复共用同一条解密、升级、校验和恢复计划准备链。
 (
   trace="$work/migration-payload-preparation-success"

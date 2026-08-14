@@ -45,7 +45,9 @@ managed_step_fixture="$(mktemp "${TMPDIR:-/tmp}/sb-managed-step-negative.XXXXXX"
 managed_step_output="$(mktemp "${TMPDIR:-/tmp}/sb-managed-step-output.XXXXXX")"
 shell_target_fixture="$(mktemp "${TMPDIR:-/tmp}/sb-shell-target-negative.XXXXXX")"
 shell_target_output="$(mktemp "${TMPDIR:-/tmp}/sb-shell-target-output.XXXXXX")"
-trap 'rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fixture" "$shell_target_output"' EXIT
+convention_fixture="$(mktemp "${TMPDIR:-/tmp}/sb-convention-fixture.XXXXXX")"
+convention_output="$(mktemp "${TMPDIR:-/tmp}/sb-convention-output.XXXXXX")"
+trap 'rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fixture" "$shell_target_output" "$convention_fixture" "$convention_output"' EXIT
 sed '/^download_binaries() {/,/^}$/ {
   /LATEST_SINGBOX_URL/ s/ || return 1//
 }' sb-user-manager.sh > "$managed_step_fixture"
@@ -98,7 +100,173 @@ if grep -Fq 'undefined_dynamic_dispatch_probe' "$shell_target_output"; then
   exit 1
 fi
 
+# 调用约定的反向样例：每条约定都要能在故意写错的样例上报出来。
+cat > "$convention_fixture" <<'EOF'
+read_menu_choice() { :; }
+read_numbered_index() { :; }
+run_quietly() { "$@" >/dev/null; }
+
+static_prompt_convention_negative_fixture() {
+  read_numbered_index '请选择编号：' 3
+  read_menu_choice '请选择：' '0,1' '' '请输入 1 或 0'
+}
+
+static_status_convention_negative_fixture() {
+  local probe_rc
+  if run_quietly true; then return 0; fi
+  probe_rc=$?
+  return "$probe_rc"
+}
+
+static_secret_convention_negative_fixture() {
+  qrencode -t ANSIUTF8 -l L -m 1 -- "$1"
+}
+
+static_radix_convention_negative_fixture() {
+  local radix_probe
+  read -r -p '请选择：' radix_probe
+  [[ "$radix_probe" =~ ^[0-9]+$ ]] || return 1
+  ((radix_probe == 0)) && return 1
+  return 0
+}
+EOF
+if python3 tests/check-shell-call-targets.py "$convention_fixture" >"$convention_output" 2>&1; then
+  echo 'shell convention check must reject the negative fixture' >&2
+  exit 1
+fi
+grep -Fq 'unchecked cancellable prompt read_numbered_index' "$convention_output"
+grep -Fq 'unchecked cancellable prompt read_menu_choice' "$convention_output"
+grep -Fq 'exit status read into probe_rc after an if without else' "$convention_output"
+grep -Fq 'payload passed to qrencode as an argument' "$convention_output"
+grep -Fq 'prompt value radix_probe used without 10#' "$convention_output"
+
+# 同一批约定的正向样例：项目里已确立的写法不得被误报。
+cat > "$convention_fixture" <<'EOF'
+read_menu_choice() { :; }
+read_numbered_index() { :; }
+run_quietly() { "$@" >/dev/null; }
+
+static_prompt_convention_positive_fixture() {
+  read_numbered_index '请选择编号：' 3 || return 1
+  if ! read_menu_choice '请选择：' '0,1' '' '请输入 1 或 0'; then return 1; fi
+}
+
+static_status_convention_positive_fixture() {
+  local probe_rc
+  if run_quietly true; then
+    return 0
+  else
+    probe_rc=$?
+  fi
+  return "$probe_rc"
+}
+
+static_secret_convention_positive_fixture() {
+  printf '%s' "$1" | qrencode -t ANSIUTF8 -l L -m 1
+}
+
+static_radix_convention_positive_fixture() {
+  local radix_probe
+  read -r -p '请选择：' radix_probe
+  [[ "$radix_probe" =~ ^[0-9]+$ ]] || return 1
+  radix_probe=$((10#$radix_probe))
+  ((radix_probe == 0)) && return 1
+  return 0
+}
+EOF
+if ! python3 tests/check-shell-call-targets.py "$convention_fixture" >"$convention_output" 2>&1; then
+  cat "$convention_output" >&2
+  echo 'shell convention check must accept the established writing' >&2
+  exit 1
+fi
+
+# 需要已部署环境的入口必须先过 ensure_management_environment_ready 护栏，
+# 否则未部署的服务器会直接撞上 prepare_core 里的 die。
+function_contains_program='
+  $0 == function_name "() {" {inside=1}
+  inside && index($0, needle) {found=1}
+  inside && /^}/ {exit}
+  END {exit(found ? 0 : 1)}
+'
+for guarded_entry in user_management_menu split_management_menu migration_backup_menu \
+  global_sni_menu prompt_consistency; do
+  if ! awk -v function_name="$guarded_entry" -v needle='ensure_management_environment_ready' \
+      "$function_contains_program" sb-user-manager.sh; then
+    echo "$guarded_entry must refuse to run before the management environment is deployed" >&2
+    exit 1
+  fi
+done
+sed '/^user_management_menu() {$/,/^}$/ {
+  /ensure_management_environment_ready || return 0/ d
+}' sb-user-manager.sh > "$convention_fixture"
+if awk -v function_name=user_management_menu -v needle='ensure_management_environment_ready' \
+    "$function_contains_program" "$convention_fixture"; then
+  echo 'management environment guard check must reject an unguarded menu' >&2
+  exit 1
+fi
+
+# 保留现有部署的流程不得把测试通道静默换成正式版；check_updates 已经给出正确写法。
+preview_channel_program='
+  /^[[:alpha:]_][[:alnum:]_]*\(\) \{$/ {
+    current=$0
+    sub(/\(\) \{$/, "", current)
+    start=FNR
+    preserving=0
+    channel=0
+    next
+  }
+  current != "" && /^}$/ {
+    if (preserving && !channel) {
+      printf "%s:%d: %s 保留现有部署时必须先判断 sing-box 通道\n", FILENAME, start, current > "/dev/stderr"
+      failed=1
+    }
+    current=""
+    next
+  }
+  current != "" {
+    if ($0 ~ /deploy_environment[[:space:]]+false([[:space:]]|$)/) preserving=1
+    if ($0 ~ /current_singbox_channel/) channel=1
+  }
+  END {exit failed ? 1 : 0}
+'
+if ! awk "$preview_channel_program" sb-user-manager.sh; then
+  echo 'flows that keep the existing deployment must reuse the check_updates preview-channel guard' >&2
+  exit 1
+fi
+sed '/^check_updates() {$/,/^}$/ {
+  /current_channel="$(current_singbox_channel)"/ d
+}' sb-user-manager.sh > "$convention_fixture"
+if awk "$preview_channel_program" "$convention_fixture" 2>/dev/null; then
+  echo 'preview-channel check must reject a repair flow that ignores the current channel' >&2
+  exit 1
+fi
+
+# 可选文本字段：本项目把「空字符串」和「字段不存在」当成同一件事，
+# 只能用 (.field // "") 判空；(.field // null) 会把已保存的空串判成有值。
+#
+# 唯一例外是结构校验器：它的职责是区分良构与畸形输入，因此有意把空串与缺省
+# 分开对待（空串由启动期清洗负责归一，校验器充当哨兵）。这类行必须带
+# `static-allow: strict-empty-check` 标记显式声明，本检查跳过它们。
+optional_text_null_pattern='\.(outbound_preset|rule_preset|runtime_rule_tag|runtime_outbound_tag|runtime_transport_tag)[[:space:]]*//[[:space:]]*null'
+if grep -En "$optional_text_null_pattern" sb-user-manager.sh | grep -Fv 'static-allow: strict-empty-check'; then
+  echo 'optional text fields must be emptiness-checked with (.field // "") instead of (.field // null)' >&2
+  exit 1
+fi
+printf 'static_optional_text_negative_fixture() {\n  jq -e '\''(.rule_preset // null) == null'\'' "$STATE_FILE"\n}\n' \
+  > "$convention_fixture"
+if ! grep -En "$optional_text_null_pattern" "$convention_fixture" | grep -Fqv 'static-allow: strict-empty-check'; then
+  echo 'optional text emptiness check must reject a (.field // null) probe' >&2
+  exit 1
+fi
+printf 'static_optional_text_allowed_fixture() {\n  jq -e '\''(.rule_preset // null) == null'\'' "$STATE_FILE" # static-allow: strict-empty-check\n}\n' \
+  > "$convention_fixture"
+if grep -En "$optional_text_null_pattern" "$convention_fixture" | grep -Fv 'static-allow: strict-empty-check'; then
+  echo 'optional text emptiness check must honour an explicit strict-empty-check allowance' >&2
+  exit 1
+fi
+
 rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fixture" "$shell_target_output"
+rm -f -- "$convention_fixture" "$convention_output"
 trap - EXIT
 
 version="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)"/\1/p' sb-user-manager.sh | head -n1)"

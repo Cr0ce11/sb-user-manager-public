@@ -2246,8 +2246,8 @@ validate_migration_payload_structure() {
       ((.scope=="all") or ((.user|type=="string") and (.user as $user | ($user_names | index($user)) != null))) and
       (.status=="active" or .status=="disabled") and
       ((.upstream | valid_upstream) or (.status == "disabled" and (.upstream | type == "object"))) and
-      (((.outbound_preset // null) == null) or (.outbound_preset as $preset | ($outbound_preset_names | index($preset)) != null)) and
-      (((.rule_preset // null) == null) or (.rule_preset as $preset | ($rule_preset_names | index($preset)) != null)) and
+      (((.outbound_preset // null) == null) or (.outbound_preset as $preset | ($outbound_preset_names | index($preset)) != null)) and # static-allow: strict-empty-check
+      (((.rule_preset // null) == null) or (.rule_preset as $preset | ($rule_preset_names | index($preset)) != null)) and # static-allow: strict-empty-check
       ((.outbound_tag // ("managed-out-" + .name)) | test("^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$") and . != "direct") and
       ((.rule_set_tag // ("managed-split-" + .name)) | test("^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$") and . != "direct") and
       all([.runtime_rule_tag?,.runtime_outbound_tag?,.runtime_transport_tag?][];
@@ -11353,6 +11353,7 @@ prompt_move_split() {
     read -r -p '移动到第几条（留空保持，输入 0 返回）：' position
     [[ -n "$position" ]] || { echo "顺序未变化。"; return 0; }
     [[ "$position" != 0 ]] || { MENU_RETURNED=true; return 0; }
+    if [[ "$position" =~ ^[0-9]+$ ]]; then position=$((10#$position)); fi
     if [[ "$position" =~ ^[0-9]+$ ]] && ((position >= 1 && position <= count)); then break; fi
     printf '输入无效：请输入 1 到 %s 之间的数字。\n' "$count"
   done
