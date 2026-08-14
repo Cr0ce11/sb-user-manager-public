@@ -566,10 +566,6 @@ def scan_simple_command(tokens: list[Token], start: int) -> tuple[list[Token], i
     return arguments, i
 
 
-def simple_command_arguments(tokens: list[Token], start: int) -> list[Token]:
-    return scan_simple_command(tokens, start)[0]
-
-
 def literal_dispatch_target(token: Token) -> Token | None:
     if token.bare and (COMMAND_NAME.match(token.value) or token.value == "["):
         return token
