@@ -2642,11 +2642,17 @@ assert parsed.query == ""
 assert unquote(parsed.fragment) == "direct-ss"
 PY
 
+qrencode_args="$work/shadowrocket-qr-args"
 (
-  qrencode() { printf 'qr:%s\n' "$*"; }
-  print_shadowrocket_qr 'anytls://dummy.example'
-) > "$work/shadowrocket-qr.txt"
-grep -Fq 'qr:-t ANSIUTF8 -l L -m 1 -- anytls://dummy.example' "$work/shadowrocket-qr.txt"
+  qrencode() {
+    printf '%s\0' "$@" > "$qrencode_args"
+    printf 'qr:%s\n' "$(cat)"
+  }
+  print_shadowrocket_qr 'anytls://dummy-qr-secret@198.51.100.20:24443#sr-at'
+) < /dev/null > "$work/shadowrocket-qr.txt"
+grep -Fq 'qr:anytls://dummy-qr-secret@198.51.100.20:24443#sr-at' "$work/shadowrocket-qr.txt"
+[[ "$(tr '\0' '|' < "$qrencode_args")" == '-t|ANSIUTF8|-l|L|-m|1|' ]]
+! tr '\0' '\n' < "$qrencode_args" | grep -Fq 'dummy-qr-secret'
 
 ipv6_anytls_url="$(PUBLIC_SERVER=2001:db8::1 shadowrocket_anytls_url '{"name":"ipv6-at","port":24444,"anytls_password":"dummy","tls_sni":"ipv6.example.com"}')"
 grep -Fq 'anytls://dummy@[2001:db8::1]:24444?' <<<"$ipv6_anytls_url"
@@ -5141,6 +5147,16 @@ state_remove_user anytls-custom
   grep -Fq '1.5 GiB' <<<"$rendered_self"
 )
 
+(
+  STATE_FILE="$work/expiry-render-state.json"
+  printf '%s\n' '{"schema_version":3,"users":[{"name":"expiry-render","port":20024,"status":"active","metered":false,"usage_offset_bytes":0,"expires_at":"2026-11-14T17:01:23+0800","created_at":"2026-07-15T00:00:00+08:00"}],"splits":[]}' > "$STATE_FILE"
+  rendered_expiry="$(render_user_list '[]')"
+  grep -Fq '2026-11-14 17:01:23' <<<"$rendered_expiry"
+  grep -Fq '2026-07-15 00:00:00' <<<"$rendered_expiry"
+  ! grep -Fq '+0800' <<<"$rendered_expiry"
+  ! grep -Fq '+08:00' <<<"$rendered_expiry"
+)
+
 printf '%s\n' '{"schema_version":3,"users":[{"name":"quota-user","port":20002,"status":"active","metered":true,"limit_gib":1,"billing_anchor":1,"expires_at":null,"created_at":"2026-07-14T00:00:00+00:00","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"quota.example.com"}],"splits":[]}' > "$STATE_FILE"
 exhausted='[{"name":"quota-user","used_bytes":1073741824,"limit_bytes":1073741824,"ports":[{"start":20002,"end":20002}]}]'
 rendered_users="$(render_user_list "$exhausted")"
@@ -6517,6 +6533,11 @@ grep -Fq '$ENV.SB_JQ_PASSWORD' src/30-user-runtime.sh
 if grep -REn -- '--arg (password|ss_password|shadowtls_password|st_password) |--argjson (u|upstream|new_outbounds|user|split|preset|incoming) "\$' \
   src/20-migration-backup.sh src/30-user-runtime.sh src/40-split-runtime.sh src/70-split-prompts.sh; then
   echo 'secrets must not be passed to jq through command-line arguments' >&2
+  exit 1
+fi
+grep -Fq 'printf '"'"'%s'"'"' "$1" | qrencode -t ' src/30-user-runtime.sh
+if grep -En 'qrencode -t [^|]*\$' src/30-user-runtime.sh; then
+  echo 'secrets must not be passed to qrencode through command-line arguments' >&2
   exit 1
 fi
 ! grep -Fq 'Authorization: Bearer' src/50-install-update.sh
