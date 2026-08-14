@@ -3181,10 +3181,69 @@ EOF
   cmp -s "$SINGBOX_CONFIG" "$work/split-maintenance-config.before-read-failure.json"
   mv "$work/split-maintenance-state.valid.json" "$STATE_FILE"
 
-  state_move_split alpha 1
+  state_move_split '["alpha"]' 1
   jq -e '[.splits[].name] == ["alpha","beta","disabled"]' "$STATE_FILE" >/dev/null
   rebuild_all_split_configs
   jq -e '[.route.rules[] | select(.rule_set == "beta-rule" or .rule_set == "alpha-rule") | .rule_set] == ["alpha-rule","beta-rule"]' "$SINGBOX_CONFIG" >/dev/null
+
+  # 共用同一套预置的分流在运行配置里合并成一条，共用一个匹配位置。
+  # 「调整分流顺序」必须整组移动并让成员相邻，否则界面顺序会和真正生效的顺序不一致。
+  (
+    STATE_FILE="$work/split-merge-order-state.json"
+    cat > "$STATE_FILE" <<'MERGEORDER'
+{"schema_version":7,"users":[
+ {"name":"alice","port":20001,"protocol":"anytls","status":"active","metered":false,"expires_at":null,"limit_gib":null,"billing_anchor":null,"usage_offset_bytes":0,"created_at":"2026-01-01T00:00:00+08:00","anytls_password":"a","tls_sni":"a.example.com","endpoints":[{"protocol":"anytls","port":20001,"anytls_password":"a","tls_sni":"a.example.com"}]},
+ {"name":"bob","port":20002,"protocol":"anytls","status":"active","metered":false,"expires_at":null,"limit_gib":null,"billing_anchor":null,"usage_offset_bytes":0,"created_at":"2026-01-01T00:00:00+08:00","anytls_password":"b","tls_sni":"b.example.com","endpoints":[{"protocol":"anytls","port":20002,"anytls_password":"b","tls_sni":"b.example.com"}]}],
+ "splits":[
+ {"name":"s1","url":"https://rules.example.com/ai.srs","scope":"user","user":"alice","status":"active","rule_preset":"AI","outbound_preset":"HK","runtime_rule_tag":"mpr-ai","runtime_outbound_tag":"mpo-hk","runtime_transport_tag":null,"outbound_tag":"managed-out-s1","rule_set_tag":"managed-split-s1","upstream":{"protocol":"anytls","server":"hk.example.com","server_port":443,"password":"p","sni":"hk.example.com","insecure":false},"created_at":"2026-01-01T00:00:00+08:00","updated_at":"2026-01-01T00:00:00+08:00"},
+ {"name":"s2","url":"https://rules.example.com/nf.srs","scope":"all","user":null,"status":"active","rule_preset":"NF","outbound_preset":"JP","runtime_rule_tag":"mpr-nf","runtime_outbound_tag":"mpo-jp","runtime_transport_tag":null,"outbound_tag":"managed-out-s2","rule_set_tag":"managed-split-s2","upstream":{"protocol":"anytls","server":"jp.example.com","server_port":443,"password":"p","sni":"jp.example.com","insecure":false},"created_at":"2026-01-01T00:00:00+08:00","updated_at":"2026-01-01T00:00:00+08:00"},
+ {"name":"s3","url":"https://rules.example.com/ai.srs","scope":"user","user":"bob","status":"active","rule_preset":"AI","outbound_preset":"HK","runtime_rule_tag":"mpr-ai","runtime_outbound_tag":"mpo-hk","runtime_transport_tag":null,"outbound_tag":"managed-out-s3","rule_set_tag":"managed-split-s3","upstream":{"protocol":"anytls","server":"hk.example.com","server_port":443,"password":"p","sni":"hk.example.com","insecure":false},"created_at":"2026-01-01T00:00:00+08:00","updated_at":"2026-01-01T00:00:00+08:00"}],
+ "outbound_presets":[],"rule_presets":[]}
+MERGEORDER
+    if [[ "$(split_merge_group_names s3)" != '["s1","s3"]' ]]; then
+      echo 'splits sharing a preset pair must be reported as one merge group' >&2
+      exit 1
+    fi
+    if [[ "$(split_merge_group_names s2)" != '["s2"]' ]]; then
+      echo 'a split with its own preset pair must form a group of one' >&2
+      exit 1
+    fi
+    ranks="$(split_effective_match_ranks)"
+    if ! jq -e '.s1 == 1 and .s3 == 1 and .s2 == 2' <<<"$ranks" >/dev/null; then
+      echo "merged splits must share one effective match position: $ranks" >&2
+      exit 1
+    fi
+    # 移动组内靠后的一条，整组都要移动，且成员必须相邻
+    state_move_split "$(split_merge_group_names s3)" 1
+    if ! jq -e '[.splits[].name] == ["s1","s3","s2"]' "$STATE_FILE" >/dev/null; then
+      echo "moving one member must move the whole merge group: $(jq -c '[.splits[].name]' "$STATE_FILE")" >&2
+      exit 1
+    fi
+    ranks="$(split_effective_match_ranks)"
+    if ! jq -e '.s1 == 1 and .s3 == 1 and .s2 == 2' <<<"$ranks" >/dev/null; then
+      echo "the merge group must keep one shared position after moving: $ranks" >&2
+      exit 1
+    fi
+    # 把整组移到最后：s2 变成第一位
+    state_move_split "$(split_merge_group_names s1)" 3
+    if ! jq -e '[.splits[].name] == ["s2","s1","s3"]' "$STATE_FILE" >/dev/null; then
+      echo "moving the group to the end must place the other split first" >&2
+      exit 1
+    fi
+    ranks="$(split_effective_match_ranks)"
+    if ! jq -e '.s2 == 1 and .s1 == 2 and .s3 == 2' <<<"$ranks" >/dev/null; then
+      echo "effective positions must follow the new group order: $ranks" >&2
+      exit 1
+    fi
+    # 停用的分流不进入运行配置，没有匹配位置
+    jq '(.splits[] | select(.name == "s3") | .status) = "disabled"' "$STATE_FILE" > "$STATE_FILE.tmp"
+    mv "$STATE_FILE.tmp" "$STATE_FILE"
+    ranks="$(split_effective_match_ranks)"
+    if ! jq -e '.s3 == null' <<<"$ranks" >/dev/null; then
+      echo "a disabled split must not claim an effective match position: $ranks" >&2
+      exit 1
+    fi
+  )
 
   validate_remote_rule_set() { :; }
   start_managed_operation() { :; }
@@ -3194,9 +3253,17 @@ EOF
   cmd_split_edit alpha https://rules.example.com/edited.srs all '' "$edited_upstream" edited-out >/dev/null
   jq -e '.splits[0] | .name == "alpha" and .status == "active" and .created_at == "2026-07-15T00:00:00+08:00" and .url == "https://rules.example.com/edited.srs" and .outbound_tag == "edited-out" and .upstream.password == "alpha-secret" and (.updated_at | length > 0)' "$STATE_FILE" >/dev/null
   details="$(cmd_split_show alpha)"
-  grep -Fq '匹配顺序：第 1 条' <<<"$details"
+  # 旧措辞「匹配顺序：第 N 条」拿列表行号冒充生效顺序，合并成一条路由的分流会被它误导；
+  # 现在拆成「列表顺序」与「匹配位置」两项，后者才是真正生效的先后。
+  grep -Fq '列表顺序：第 1 条' <<<"$details"
+  grep -Fq '匹配位置：第 1 位' <<<"$details"
   grep -Fq '规则集地址：https://rules.example.com/edited.srs' <<<"$details"
-  ! grep -Fq 'alpha-secret' <<<"$details"
+  # 这条否定断言原本写成 `! grep`，仅因恰好位于子壳末尾才生效；改成显式判断，
+  # 以后在它后面加语句也不会让它静默失效
+  if grep -Fq 'alpha-secret' <<<"$details"; then
+    echo 'split details must not print the upstream password' >&2
+    exit 1
+  fi
 )
 
 (

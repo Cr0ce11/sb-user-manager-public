@@ -26,8 +26,11 @@ if find src tests -maxdepth 1 -type f \
   echo 'retired v5 source or dedicated test files remain' >&2
   exit 1
 fi
-decision_count="$(find docs/DECISIONS -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9]-*.md' | wc -l | tr -d ' ')"
-if [[ "$decision_count" != 6 || -e docs/V5-ENTRY-CONTROLLER-POC.md ]]; then
+# 已退役的 v5 决定文档编号为 0005-0027，不得复活；POC 文档同样不得回来。
+# 这里按编号区间判断而不是冻结 ADR 总数 —— 冻结总数会把新增的合法决定一并挡住。
+retired_decisions="$(find docs/DECISIONS -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9]-*.md' \
+  | sed 's|.*/||; s|-.*||' | awk '$1 >= 5 && $1 <= 27')"
+if [[ -n "$retired_decisions" || -e docs/V5-ENTRY-CONTROLLER-POC.md ]]; then
   echo 'retired v5 ADR or POC documents remain' >&2
   exit 1
 fi

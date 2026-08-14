@@ -6171,13 +6171,68 @@ state_replace_split() {
     --arg updated_at "$(date -Iseconds)"
 }
 
+# 相同「预置规则 + 预置出口」的分流在运行配置里合并成一条路由，因而共用同一个匹配位置。
+# 分组键取运行期标签，必须复用 split_runtime_*_from_json —— 它们的回退分支带 sha256，
+# 无法在 jq 里重写一遍，另写一套迟早会和运行配置的分组规则脱节。
+# 输出 {分流名: 匹配位置}，停用的分流不进入运行配置，位置为 null。
+split_effective_match_ranks() {
+  local rows row name status split rule_tag out_tag key existing rank=0 seen='{}' map='{}'
+  rows="$(jq -r '.splits[] | [.name, .status, tojson] | @tsv' "$STATE_FILE")" || return 1
+  while IFS=$'\t' read -r name status split; do
+    [[ -n "$name" ]] || continue
+    if [[ "$status" != active ]]; then
+      map="$(jq -c --arg name "$name" '.[$name] = null' <<<"$map")" || return 1
+      continue
+    fi
+    rule_tag="$(split_runtime_rule_tag_from_json "$split")" || return 1
+    out_tag="$(split_runtime_out_tag_from_json "$split")" || return 1
+    key="$rule_tag/$out_tag"
+    existing="$(jq -r --arg key "$key" '.[$key] // ""' <<<"$seen")" || return 1
+    if [[ -z "$existing" ]]; then
+      rank=$((rank + 1))
+      existing="$rank"
+      seen="$(jq -c --arg key "$key" --argjson rank "$rank" '.[$key] = $rank' <<<"$seen")" || return 1
+    fi
+    map="$(jq -c --arg name "$name" --argjson rank "$existing" '.[$name] = $rank' <<<"$map")" || return 1
+  done <<<"$rows"
+  printf '%s' "$map"
+}
+
+# 与指定分流合并成同一条路由的全部分流名（含自身），按现有先后顺序返回。
+# 停用的分流不进入运行配置，因此只与启用分流分组。
+split_merge_group_names() {
+  local target="$1" rows row name status split rule_tag out_tag target_key='' key group='[]'
+  rows="$(jq -r '.splits[] | [.name, .status, tojson] | @tsv' "$STATE_FILE")" || return 1
+  while IFS=$'\t' read -r name status split; do
+    [[ "$name" == "$target" ]] || continue
+    [[ "$status" == active ]] || { printf '["%s"]' "$target"; return 0; }
+    rule_tag="$(split_runtime_rule_tag_from_json "$split")" || return 1
+    out_tag="$(split_runtime_out_tag_from_json "$split")" || return 1
+    target_key="$rule_tag/$out_tag"
+  done <<<"$rows"
+  [[ -n "$target_key" ]] || { printf '["%s"]' "$target"; return 0; }
+  while IFS=$'\t' read -r name status split; do
+    [[ -n "$name" ]] || continue
+    [[ "$status" == active ]] || continue
+    rule_tag="$(split_runtime_rule_tag_from_json "$split")" || return 1
+    out_tag="$(split_runtime_out_tag_from_json "$split")" || return 1
+    key="$rule_tag/$out_tag"
+    [[ "$key" == "$target_key" ]] || continue
+    group="$(jq -c --arg name "$name" '. += [$name]' <<<"$group")" || return 1
+  done <<<"$rows"
+  printf '%s' "$group"
+}
+
+# 合并成同一条路由的分流共用一个匹配位置，必须整组一起移动并保持彼此相邻，
+# 否则界面顺序会和真正生效的顺序不一致。
 state_move_split() {
-  atomic_state_update '
-    (.splits[] | select(.name == $name)) as $selected |
-    [.splits[] | select(.name != $name)] as $remaining |
-    ($position - 1) as $index |
-    .splits = ($remaining[0:$index] + [$selected] + $remaining[$index:])
-  ' --arg name "$1" --argjson position "$2"
+  SB_JQ_GROUP="$1" atomic_state_update '
+    ($ENV.SB_JQ_GROUP | fromjson) as $group |
+    [.splits[] | select(.name as $n | ($group | index($n)) != null)] as $selected |
+    [.splits[] | select(.name as $n | ($group | index($n)) == null)] as $remaining |
+    ([$position - 1, ($remaining | length)] | min) as $index |
+    .splits = ($remaining[0:$index] + $selected + $remaining[$index:])
+  ' --argjson position "$2"
 }
 
 state_remove_split() {
@@ -6506,33 +6561,63 @@ cmd_split_edit() {
 }
 
 cmd_split_move() {
-  local name="$1" position="$2" count current
+  local name="$1" position="$2" count current group group_size others
   split_exists "$name" || die "分流不存在：$name"
   count="$(jq '.splits | length' "$STATE_FILE")"
   if [[ ! "$position" =~ ^[0-9]+$ ]] || ((position < 1 || position > count)); then
     die "目标优先级超出范围"
   fi
   current="$(jq -r --arg name "$name" '.splits | to_entries[] | select(.value.name == $name) | (.key + 1)' "$STATE_FILE")"
-  if [[ "$current" == "$position" ]]; then echo "优先级未变化。"; return 0; fi
+  group="$(split_merge_group_names "$name")" || return 1
+  group_size="$(jq 'length' <<<"$group")" || return 1
+  if [[ "$current" == "$position" && "$group_size" == 1 ]]; then echo "优先级未变化。"; return 0; fi
   ensure_safe_ssh_for_singbox_restart || return 0
   start_managed_operation "move-split:$name" || return 1
-  run_managed_step state_move_split "$name" "$position" || return 1
+  run_managed_step state_move_split "$group" "$position" || return 1
   rebuild_and_finish_split_operation || return 1
-  log "分流优先级已调整：$name → $position"
+  if ((group_size > 1)); then
+    others="$(jq -r --arg name "$name" '[.[] | select(. != $name)] | join("、")' <<<"$group")" || return 1
+    log "分流优先级已调整：${name} → ${position}（与 ${others} 共用同一套预置，在运行配置中合并为一条，已一并移动）"
+  else
+    log "分流优先级已调整：$name → $position"
+  fi
 }
 
 cmd_split_list() {
-  jq -r 'if (.splits|length)==0 then "暂无分流" else (["顺序","名称","状态","范围","预置规则","预置出口"]|@tsv),(.splits|to_entries[]|[((.key+1)|tostring),.value.name,(if .value.status=="active" then "启用" else "停用" end),(if .value.scope=="all" then "全部用户" else ("用户:"+.value.user) end),(.value.rule_preset // "独立配置"),(.value.outbound_preset // "独立配置")]|@tsv) end' "$STATE_FILE" | column -t -s $'\t'
+  local ranks
+  ranks="$(split_effective_match_ranks)" || return 1
+  # 「匹配位置」是真正生效的先后顺序：合并成同一条路由的分流共用一个位置，
+  # 只显示行号会让人以为它们能各自排序。
+  SB_JQ_RANKS="$ranks" jq -r 'if (.splits|length)==0 then "暂无分流" else
+    ($ENV.SB_JQ_RANKS | fromjson) as $ranks |
+    (["顺序","匹配位置","名称","状态","范围","预置规则","预置出口"]|@tsv),
+    (.splits|to_entries[]|[
+      ((.key+1)|tostring),
+      (($ranks[.value.name] // null) as $rank | if $rank == null then "—" else ("第 " + ($rank|tostring) + " 位") end),
+      .value.name,
+      (if .value.status=="active" then "启用" else "停用" end),
+      (if .value.scope=="all" then "全部用户" else ("用户:"+.value.user) end),
+      (.value.rule_preset // "独立配置"),
+      (.value.outbound_preset // "独立配置")]|@tsv) end' "$STATE_FILE" | column -t -s $'\t'
 }
 
 cmd_split_show() {
-  local name="$1"
+  local name="$1" ranks group
   split_exists "$name" || die "分流不存在：$name"
-  jq -r --arg name "$name" '
+  ranks="$(split_effective_match_ranks)" || return 1
+  group="$(split_merge_group_names "$name")" || return 1
+  # 「匹配位置」必须用真正生效的顺序，不能拿行号充数：合并成同一条路由的分流共用一个位置
+  SB_JQ_RANKS="$ranks" SB_JQ_GROUP="$group" jq -r --arg name "$name" '
+    ($ENV.SB_JQ_RANKS | fromjson) as $ranks |
+    ($ENV.SB_JQ_GROUP | fromjson) as $group |
     .splits | to_entries[] | select(.value.name == $name) |
     .key as $index | .value as $s |
     "分流名称：\($s.name)",
-    "匹配顺序：第 \($index + 1) 条",
+    "列表顺序：第 \($index + 1) 条",
+    "匹配位置：\(($ranks[$s.name] // null) as $rank | if $rank == null then "未生效（分流已停用）" else "第 \($rank) 位" end)",
+    (if ($group | length) > 1 then
+      "合并说明：与 \([$group[] | select(. != $name)] | join("、")) 共用同一套预置，在运行配置中合并为一条，匹配位置和顺序调整都作用于整组"
+     else empty end),
     "状态：\(if $s.status == "active" then "启用" else "停用" end)",
     "作用范围：\(if $s.scope == "all" then "全部用户" else "用户:" + $s.user end)",
     "规则来源：\($s.rule_preset // "独立配置")",
@@ -11371,13 +11456,21 @@ EOF
 }
 
 prompt_move_split() {
-  local name count current position answer
+  local name count current position answer group group_size others
   prepare_core
   prompt_select_split all "调整分流顺序" || return 0
   name="$SELECTED_SPLIT_NAME"
   count="$(jq '.splits | length' "$STATE_FILE")"
   current="$(jq -r --arg name "$name" '.splits | to_entries[] | select(.value.name == $name) | (.key + 1)' "$STATE_FILE")"
   printf '\n当前顺序：第 %s 条；可选 1-%s（越靠前越优先使用）。\n' "$current" "$count"
+  # 共用同一套预置的分流在运行配置里合并成一条，只移动其中一条不会改变匹配顺序，
+  # 必须在用户作出选择之前说清楚这次会连带移动哪些分流
+  group="$(split_merge_group_names "$name")" || return 1
+  group_size="$(jq 'length' <<<"$group")" || return 1
+  if ((group_size > 1)); then
+    others="$(jq -r --arg name "$name" '[.[] | select(. != $name)] | join("、")' <<<"$group")" || return 1
+    printf '注意：本分流与 %s 共用同一套预置，运行时合并为一条，将一并移动到新位置。\n' "$others"
+  fi
   while true; do
     read -r -p '移动到第几条（留空保持，输入 0 返回）：' position
     [[ -n "$position" ]] || { echo "顺序未变化。"; return 0; }
@@ -11386,7 +11479,11 @@ prompt_move_split() {
     if [[ "$position" =~ ^[0-9]+$ ]] && ((position >= 1 && position <= count)); then break; fi
     printf '输入无效：请输入 1 到 %s 之间的数字。\n' "$count"
   done
-  read -r -p "确认将 $name 移动到第 $position 条？[y/N]：" answer
+  if ((group_size > 1)); then
+    read -r -p "确认将 $name 及与其合并的 $((group_size - 1)) 条分流一并移动到第 $position 条？[y/N]：" answer
+  else
+    read -r -p "确认将 $name 移动到第 $position 条？[y/N]：" answer
+  fi
   [[ "$answer" =~ ^[Yy]$ ]] || { echo "已取消调整。"; return 0; }
   cmd_split_move "$name" "$position"
 }
