@@ -699,13 +699,21 @@ EOF
 }
 
 prompt_move_split() {
-  local name count current position answer
+  local name count current position answer group group_size others
   prepare_core
   prompt_select_split all "调整分流顺序" || return 0
   name="$SELECTED_SPLIT_NAME"
   count="$(jq '.splits | length' "$STATE_FILE")"
   current="$(jq -r --arg name "$name" '.splits | to_entries[] | select(.value.name == $name) | (.key + 1)' "$STATE_FILE")"
   printf '\n当前顺序：第 %s 条；可选 1-%s（越靠前越优先使用）。\n' "$current" "$count"
+  # 共用同一套预置的分流在运行配置里合并成一条，只移动其中一条不会改变匹配顺序，
+  # 必须在用户作出选择之前说清楚这次会连带移动哪些分流
+  group="$(split_merge_group_names "$name")" || return 1
+  group_size="$(jq 'length' <<<"$group")" || return 1
+  if ((group_size > 1)); then
+    others="$(jq -r --arg name "$name" '[.[] | select(. != $name)] | join("、")' <<<"$group")" || return 1
+    printf '注意：本分流与 %s 共用同一套预置，运行时合并为一条，将一并移动到新位置。\n' "$others"
+  fi
   while true; do
     read -r -p '移动到第几条（留空保持，输入 0 返回）：' position
     [[ -n "$position" ]] || { echo "顺序未变化。"; return 0; }
@@ -714,7 +722,11 @@ prompt_move_split() {
     if [[ "$position" =~ ^[0-9]+$ ]] && ((position >= 1 && position <= count)); then break; fi
     printf '输入无效：请输入 1 到 %s 之间的数字。\n' "$count"
   done
-  read -r -p "确认将 $name 移动到第 $position 条？[y/N]：" answer
+  if ((group_size > 1)); then
+    read -r -p "确认将 $name 及与其合并的 $((group_size - 1)) 条分流一并移动到第 $position 条？[y/N]：" answer
+  else
+    read -r -p "确认将 $name 移动到第 $position 条？[y/N]：" answer
+  fi
   [[ "$answer" =~ ^[Yy]$ ]] || { echo "已取消调整。"; return 0; }
   cmd_split_move "$name" "$position"
 }
