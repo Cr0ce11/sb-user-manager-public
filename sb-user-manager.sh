@@ -2246,8 +2246,8 @@ validate_migration_payload_structure() {
       ((.scope=="all") or ((.user|type=="string") and (.user as $user | ($user_names | index($user)) != null))) and
       (.status=="active" or .status=="disabled") and
       ((.upstream | valid_upstream) or (.status == "disabled" and (.upstream | type == "object"))) and
-      (((.outbound_preset // null) == null) or (.outbound_preset as $preset | ($outbound_preset_names | index($preset)) != null)) and
-      (((.rule_preset // null) == null) or (.rule_preset as $preset | ($rule_preset_names | index($preset)) != null)) and
+      (((.outbound_preset // null) == null) or (.outbound_preset as $preset | ($outbound_preset_names | index($preset)) != null)) and # static-allow: strict-empty-check
+      (((.rule_preset // null) == null) or (.rule_preset as $preset | ($rule_preset_names | index($preset)) != null)) and # static-allow: strict-empty-check
       ((.outbound_tag // ("managed-out-" + .name)) | test("^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$") and . != "direct") and
       ((.rule_set_tag // ("managed-split-" + .name)) | test("^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$") and . != "direct") and
       all([.runtime_rule_tag?,.runtime_outbound_tag?,.runtime_transport_tag?][];

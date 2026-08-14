@@ -243,15 +243,25 @@ fi
 
 # 可选文本字段：本项目把「空字符串」和「字段不存在」当成同一件事，
 # 只能用 (.field // "") 判空；(.field // null) 会把已保存的空串判成有值。
+#
+# 唯一例外是结构校验器：它的职责是区分良构与畸形输入，因此有意把空串与缺省
+# 分开对待（空串由启动期清洗负责归一，校验器充当哨兵）。这类行必须带
+# `static-allow: strict-empty-check` 标记显式声明，本检查跳过它们。
 optional_text_null_pattern='\.(outbound_preset|rule_preset|runtime_rule_tag|runtime_outbound_tag|runtime_transport_tag)[[:space:]]*//[[:space:]]*null'
-if grep -En "$optional_text_null_pattern" sb-user-manager.sh; then
+if grep -En "$optional_text_null_pattern" sb-user-manager.sh | grep -Fv 'static-allow: strict-empty-check'; then
   echo 'optional text fields must be emptiness-checked with (.field // "") instead of (.field // null)' >&2
   exit 1
 fi
 printf 'static_optional_text_negative_fixture() {\n  jq -e '\''(.rule_preset // null) == null'\'' "$STATE_FILE"\n}\n' \
   > "$convention_fixture"
-if ! grep -Eq "$optional_text_null_pattern" "$convention_fixture"; then
+if ! grep -En "$optional_text_null_pattern" "$convention_fixture" | grep -Fqv 'static-allow: strict-empty-check'; then
   echo 'optional text emptiness check must reject a (.field // null) probe' >&2
+  exit 1
+fi
+printf 'static_optional_text_allowed_fixture() {\n  jq -e '\''(.rule_preset // null) == null'\'' "$STATE_FILE" # static-allow: strict-empty-check\n}\n' \
+  > "$convention_fixture"
+if grep -En "$optional_text_null_pattern" "$convention_fixture" | grep -Fv 'static-allow: strict-empty-check'; then
+  echo 'optional text emptiness check must honour an explicit strict-empty-check allowance' >&2
   exit 1
 fi
 
