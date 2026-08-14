@@ -1749,6 +1749,55 @@ grep -Fxq 'FLOW:deploy:false:' "$work/install-repair"
 exercise_install_flow managed_damaged $'2\ny' > "$work/install-overwrite"
 grep -Fxq 'FLOW:deploy:true:' "$work/install-overwrite"
 
+# 管理配置缺失时运行时变量还没有加载；自动修复必须按系统路径判断用户资料，不能引用未定义变量。
+set +e
+(
+  SB_SYSTEM_ROOT="$install_flow_root"
+  SINGBOX_BIN="$work/install-flow-missing-sing-box"
+  SINGBOX_CHANNEL_STATE="$work/install-flow-missing-channel.json"
+  unset STATE_FILE
+  ENVIRONMENT_CLASS=managed_partial
+  show_environment_diagnostics() { :; }
+  install_prerequisites() { printf 'FLOW:prerequisites\n'; }
+  fetch_latest_releases() { printf 'FLOW:fetch:%s\n' "$1"; }
+  deploy_environment() { printf 'FLOW:deploy:%s:%s\n' "$1" "${2:-}"; }
+  install_environment <<<'1'
+) > "$work/install-repair-without-config" 2>&1
+install_repair_without_config_rc=$?
+set -e
+[[ "$install_repair_without_config_rc" == 0 ]]
+grep -Fxq 'FLOW:deploy:false:' "$work/install-repair-without-config"
+! grep -Fq 'unbound variable' "$work/install-repair-without-config"
+
+# 自动修复必须沿用当前 sing-box 通道；测试版不能被静默换回正式版。
+install_flow_preview_bin="$work/install-flow-preview-sing-box"
+install_flow_stable_bin="$work/install-flow-stable-sing-box"
+cat > "$install_flow_preview_bin" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == version ]]; then echo 'sing-box version 1.14.0-alpha.44'; else exit 0; fi
+EOF
+cat > "$install_flow_stable_bin" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == version ]]; then echo 'sing-box version 1.13.10'; else exit 0; fi
+EOF
+chmod +x "$install_flow_preview_bin" "$install_flow_stable_bin"
+exercise_install_repair_channel() (
+  SB_SYSTEM_ROOT="$install_flow_root"
+  STATE_FILE="$install_flow_state"
+  SINGBOX_BIN="$1"
+  SINGBOX_CHANNEL_STATE="$work/install-flow-missing-channel.json"
+  ENVIRONMENT_CLASS=managed_partial
+  show_environment_diagnostics() { :; }
+  install_prerequisites() { :; }
+  fetch_latest_releases() { LATEST_SINGBOX_VERSION=1.13.14; }
+  deploy_environment() { printf 'FLOW:singbox:%s\n' "$LATEST_SINGBOX_VERSION"; }
+  install_environment <<<'1'
+)
+exercise_install_repair_channel "$install_flow_preview_bin" > "$work/install-repair-preview"
+grep -Fxq 'FLOW:singbox:1.14.0-alpha.44' "$work/install-repair-preview"
+exercise_install_repair_channel "$install_flow_stable_bin" > "$work/install-repair-stable"
+grep -Fxq 'FLOW:singbox:1.13.14' "$work/install-repair-stable"
+
 exercise_install_flow external $'1\ny' > "$work/install-takeover"
 grep -Fxq 'FLOW:prerequisites' "$work/install-takeover"
 grep -Fxq 'FLOW:takeover' "$work/install-takeover"
@@ -6352,6 +6401,52 @@ unset MIGRATION_BACKUP_DIR MIGRATION_REPORT_DIR ENVIRONMENT_BACKUP_BASE
     exit 1
   fi
   [[ -e "$download_work/tar-called" && ! -e "$download_work/install-called" ]]
+)
+
+# 版本记录只有在二进制还在时才可信；nfuse 丢失后必须报告为未安装并重新下载。
+(
+  nfuse_versions="$work/nfuse-version-record"
+  nfuse_missing_bin="$work/nfuse-missing-bin"
+  nfuse_present_bin="$work/nfuse-present-bin"
+  printf '%s\n' 'SCRIPT_VERSION=4.12.0' 'SINGBOX_VERSION=1.13.14' 'NFUSE_VERSION=0.1.13' > "$nfuse_versions"
+  cat > "$nfuse_present_bin" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == version ]]; then echo 'nfuse 0.1.13'; else exit 0; fi
+EOF
+  chmod +x "$nfuse_present_bin"
+  DEPLOYED_VERSIONS_FILE="$nfuse_versions"
+  NFUSE_BIN="$nfuse_missing_bin"
+  [[ -z "$(installed_nfuse_version)" ]]
+  NFUSE_BIN="$nfuse_present_bin"
+  [[ "$(installed_nfuse_version)" == 0.1.13 ]]
+)
+(
+  download_work="$work/download-missing-nfuse"
+  mkdir -p "$download_work"
+  LATEST_SINGBOX_VERSION=1.13.14
+  LATEST_SINGBOX_URL=https://example.com/sing-box.tar.gz
+  LATEST_SINGBOX_SHA256="$(printf 'a%.0s' {1..64})"
+  LATEST_NFUSE_VERSION=0.1.13
+  LATEST_NFUSE_URL=https://example.com/nfuse.tar.gz
+  LATEST_NFUSE_SHA256="$(printf 'a%.0s' {1..64})"
+  DEPLOYED_VERSIONS_FILE="$download_work/versions"
+  printf '%s\n' 'SCRIPT_VERSION=4.12.0' 'SINGBOX_VERSION=1.13.14' 'NFUSE_VERSION=0.1.13' > "$DEPLOYED_VERSIONS_FILE"
+  NFUSE_BIN="$download_work/nfuse-missing"
+  installed_singbox_version() { printf '1.13.14'; }
+  curl() {
+    local output=""
+    while (($#)); do
+      if [[ "$1" == -o ]]; then output="$2"; shift 2; else shift; fi
+    done
+    : > "$output"
+    printf '%s\n' "$output" >> "$download_work/curl-called"
+  }
+  sha256sum() { return 1; }
+  if download_binaries "$download_work"; then
+    echo 'download_binaries must refetch nfuse when the binary is missing' >&2
+    exit 1
+  fi
+  grep -Fq 'nfuse.tar.gz' "$download_work/curl-called"
 )
 
 # 迁移备份与恢复报告必须按真实 mtime 排序，而不是按文件名排序。
