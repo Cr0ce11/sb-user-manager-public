@@ -29,7 +29,7 @@ MANAGER_HANDOFF_JOURNAL="${SB_MANAGER_HANDOFF_JOURNAL:-$MANAGER_HANDOFF_DIRECTOR
 ENVIRONMENT_BACKUP_PERMISSION_MARKER="${SB_ENVIRONMENT_BACKUP_PERMISSION_MARKER:-/var/lib/sb-user-manager/environment-backup-permissions-v1}"
 BACKUP_RETENTION_MIGRATION_MARKER="${SB_BACKUP_RETENTION_MIGRATION_MARKER:-/var/lib/sb-user-manager/backup-retention-v1}"
 SHARED_PRESET_RUNTIME_MARKER="${SB_SHARED_PRESET_RUNTIME_MARKER:-/var/lib/sb-user-manager/shared-preset-runtime-v2}"
-MANAGER_REPOSITORY="DTB201/sb-user-manager-public"
+MANAGER_REPOSITORY="Cr0ce11/sb-user-manager-public"
 MANAGER_ASSET="sb-user-manager.sh"
 # 公开版使用固定仓库和资产名匿名检查自身更新。
 : "$MANAGER_REPOSITORY" "$MANAGER_ASSET"

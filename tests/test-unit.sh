@@ -6171,17 +6171,17 @@ fi
     printf '%s\0' "$@" > "$token_args"
     jq -cn --arg digest "sha256:$(printf 'a%.0s' {1..64})" '{
       tag_name:"v9.9.9",
-      assets:[{name:"sb-user-manager.sh",browser_download_url:"https://github.com/DTB201/sb-user-manager-public/releases/download/v9.9.9/sb-user-manager.sh",digest:$digest}]
+      assets:[{name:"sb-user-manager.sh",browser_download_url:"https://github.com/Cr0ce11/sb-user-manager-public/releases/download/v9.9.9/sb-user-manager.sh",digest:$digest}]
     }'
   }
   GITHUB_TOKEN='github-secret-token'
   fetch_latest_manager_release
   [[ "$LATEST_MANAGER_VERSION" == 9.9.9 ]]
-  [[ "$LATEST_MANAGER_URL" == https://github.com/DTB201/sb-user-manager-public/releases/download/v9.9.9/sb-user-manager.sh ]]
+  [[ "$LATEST_MANAGER_URL" == https://github.com/Cr0ce11/sb-user-manager-public/releases/download/v9.9.9/sb-user-manager.sh ]]
   [[ "$LATEST_MANAGER_SHA256" == "$(printf 'a%.0s' {1..64})" ]]
   ! tr '\0' '\n' < "$token_args" | grep -Fq 'github-secret-token'
   ! tr '\0' '\n' < "$token_args" | grep -Fq 'Authorization:'
-  grep -Fxq 'https://api.github.com/repos/DTB201/sb-user-manager-public/releases/latest' < <(tr '\0' '\n' < "$token_args")
+  grep -Fxq 'https://api.github.com/repos/Cr0ce11/sb-user-manager-public/releases/latest' < <(tr '\0' '\n' < "$token_args")
 )
 ensure_migration_crypto_dependencies
 for migration_entry in create_migration_backup show_migration_backup_details preview_migration_backup restore_migration_backup; do
