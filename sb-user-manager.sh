@@ -5149,7 +5149,7 @@ render_user_list() {
          (if $meter == null then "-" else (((((($meter.used_bytes + ($user.usage_offset_bytes // 0)) / 1073741824) * 100 | round) / 100) | tostring) + " GiB") end),
          (if ($metered | not) or $meter == null then "-" else ((((([$meter.limit_bytes - $meter.used_bytes, 0] | max) / 1073741824) * 100 | round) / 100 | tostring) + " GiB") end),
          (if $metered then (($user.billing_anchor | tostring) + " 日") else "-" end),
-         (if $user.expires_at == null then "-" else ($user.expires_at | sub("T"; " ") | sub("[+-][0-9]{2}:[0-9]{2}$"; "")) end),
+         (if $user.expires_at == null then "-" else ($user.expires_at | sub("T"; " ") | sub("[+-][0-9]{2}:?[0-9]{2}$"; "")) end),
          ($user.created_at | sub("T"; " ") | sub("[+-][0-9]{2}:[0-9]{2}$"; ""))]
         | @tsv)
     end
@@ -5283,7 +5283,8 @@ shadowrocket_ss2022_direct_url() {
 }
 
 print_shadowrocket_qr() {
-  qrencode -t ANSIUTF8 -l L -m 1 -- "$1"
+  # 导入链接含明文密码，改走标准输入，避免出现在进程列表里
+  printf '%s' "$1" | qrencode -t ANSIUTF8 -l L -m 1
 }
 
 render_shadowrocket_export() {

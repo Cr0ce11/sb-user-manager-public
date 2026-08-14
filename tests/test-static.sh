@@ -140,7 +140,7 @@ grep -Fq 'shadow-tls-version=3, udp-relay=true' sb-user-manager.sh
 grep -Fq 'shadowrocket_anytls_url()' sb-user-manager.sh
 grep -Fq 'shadowrocket_ss2022_url()' sb-user-manager.sh
 grep -Fq 'shadowrocket_ss2022_direct_url()' sb-user-manager.sh
-grep -Fq 'qrencode -t ANSIUTF8 -l L -m 1 -- "$1"' sb-user-manager.sh
+grep -Fq 'printf '"'"'%s'"'"' "$1" | qrencode -t ANSIUTF8 -l L -m 1' sb-user-manager.sh
 grep -Fq 'apt-get install -y ca-certificates curl jq nftables iproute2 util-linux bsdextrautils tar openssl python3 qrencode' sb-user-manager.sh
 if grep -Fq "printf '%s=ss,%s,%s,encrypt-method=%s" sb-user-manager.sh || grep -Fq '%s=anytls,%s,%s,password=%s' sb-user-manager.sh; then
   echo 'legacy Shadowrocket text export must not remain in the manager' >&2
