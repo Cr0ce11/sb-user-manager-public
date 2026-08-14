@@ -3321,6 +3321,60 @@ EOF
   ' "$STATE_FILE" >/dev/null
 )
 
+# 独立配置的分流在写入状态时必须删除预置字段，不能留下空串。
+(
+  STATE_FILE="$work/split-preset-field-state.json"
+  printf '%s\n' '{"schema_version":7,"users":[],"outbound_presets":[],"rule_presets":[],"splits":[]}' > "$STATE_FILE"
+  upstream='{"protocol":"shadowsocks","server":"exit.example.com","server_port":443,"method":"aes-128-gcm","password":"secret"}'
+  state_add_split standalone https://rules.example.com/standalone.srs all '' "$upstream" standalone-out standalone-rule '' '' \
+    managed-split-standalone managed-out-standalone managed-transport-standalone
+  state_add_split linked https://rules.example.com/ai.srs all '' "$upstream" linked-out linked-rule AI Exit \
+    shared-rule shared-out shared-transport
+  jq -e '
+    (.splits[] | select(.name == "standalone") | (has("rule_preset") | not) and (has("outbound_preset") | not)) and
+    (.splits[] | select(.name == "linked") | .rule_preset == "AI" and .outbound_preset == "Exit")
+  ' "$STATE_FILE" >/dev/null
+
+  # 「保持不变」的编辑传空串，不能把独立配置写成空白预置。
+  state_replace_split standalone https://rules.example.com/standalone.srs all '' "$upstream" standalone-out '' '' \
+    managed-split-standalone managed-out-standalone managed-transport-standalone
+  state_replace_split linked https://rules.example.com/ai.srs all '' "$upstream" linked-out AI Exit \
+    shared-rule shared-out shared-transport
+  jq -e '
+    (.splits[] | select(.name == "standalone") | (has("rule_preset") | not) and (has("outbound_preset") | not)) and
+    (.splits[] | select(.name == "linked") | .rule_preset == "AI" and .outbound_preset == "Exit")
+  ' "$STATE_FILE" >/dev/null
+
+  # 由预置改回独立配置时字段同样要消失。
+  state_replace_split linked https://rules.example.com/ai.srs all '' "$upstream" linked-out '' '' \
+    shared-rule shared-out shared-transport
+  jq -e '.splits[] | select(.name == "linked") |
+    (has("rule_preset") | not) and (has("outbound_preset") | not) and .runtime_rule_tag == "shared-rule"
+  ' "$STATE_FILE" >/dev/null
+)
+
+# 旧数据里遗留的空串预置字段要能一次性清洗成缺省，且幂等、不动其他字段。
+(
+  STATE_FILE="$work/split-preset-cleanup-state.json"
+  printf '%s\n' '{"schema_version":7,"users":[],"outbound_presets":[{"name":"Exit","upstream":{"protocol":"shadowsocks","server":"exit.example.com","server_port":443,"method":"aes-128-gcm","password":"secret"}}],"rule_presets":[{"name":"AI","url":"https://rules.example.com/ai.srs"}],"splits":[{"name":"blank","url":"https://rules.example.com/blank.srs","scope":"all","user":null,"upstream":{"protocol":"shadowsocks","server":"exit.example.com","server_port":443,"method":"aes-128-gcm","password":"secret"},"outbound_tag":"blank-out","rule_set_tag":"blank-rule","rule_preset":"","outbound_preset":"","status":"active"},{"name":"half","url":"https://rules.example.com/ai.srs","scope":"all","user":null,"upstream":{"protocol":"shadowsocks","server":"exit.example.com","server_port":443,"method":"aes-128-gcm","password":"secret"},"outbound_tag":"half-out","rule_set_tag":"half-rule","rule_preset":"AI","outbound_preset":"","status":"disabled"},{"name":"clean","url":"https://rules.example.com/clean.srs","scope":"all","user":null,"upstream":{"protocol":"shadowsocks","server":"exit.example.com","server_port":443,"method":"aes-128-gcm","password":"secret"},"outbound_tag":"clean-out","rule_set_tag":"clean-rule","status":"active"}]}' > "$STATE_FILE"
+  snapshot="$(jq -c '[.splits[] | {name,url,scope,upstream,outbound_tag,rule_set_tag,status}] + [.outbound_presets, .rule_presets]' "$STATE_FILE")"
+  if split_preset_fields_are_current; then
+    echo 'empty preset fields must be reported as stale data' >&2
+    exit 1
+  fi
+  state_normalize_split_preset_fields
+  split_preset_fields_are_current
+  jq -e --argjson snapshot "$snapshot" '
+    (.splits[] | select(.name == "blank") | (has("rule_preset") | not) and (has("outbound_preset") | not)) and
+    (.splits[] | select(.name == "half") | .rule_preset == "AI" and (has("outbound_preset") | not)) and
+    (.splits[] | select(.name == "clean") | (has("rule_preset") | not) and (has("outbound_preset") | not)) and
+    (([.splits[] | {name,url,scope,upstream,outbound_tag,rule_set_tag,status}] + [.outbound_presets, .rule_presets]) == $snapshot)
+  ' "$STATE_FILE" >/dev/null
+  cleaned="$(cat "$STATE_FILE")"
+  state_normalize_split_preset_fields
+  [[ "$(cat "$STATE_FILE")" == "$cleaned" ]]
+)
+
 (
   rollback_marker="$work/split-edit-rollback"
   later_marker="$work/split-edit-later"
@@ -5259,6 +5313,21 @@ if validate_migration_payload_structure "$work/migration-unsafe-url.json" >/dev/
   echo 'migration payload must reject private rule-set URLs' >&2
   exit 1
 fi
+# 分流预置字段是空串时迁移包会被判定为不可安全恢复；清洗成缺省字段后必须能重新通过校验。
+jq '.state.splits=[{"name":"blank","url":"https://rules.example.com/blank.srs","scope":"all","user":null,"status":"active","outbound_tag":"blank-out","rule_set_tag":"blank-rule","rule_preset":"","outbound_preset":"","upstream":{"protocol":"anytls","server":"exit.example.com","server_port":443,"password":"exit-secret","sni":"exit.example.com","insecure":false}}]' \
+  "$migration_payload" > "$work/migration-blank-preset.json"
+if validate_migration_payload_structure "$work/migration-blank-preset.json" >/dev/null 2>&1; then
+  echo 'migration payload must reject a split whose preset fields are empty strings' >&2
+  exit 1
+fi
+(
+  STATE_FILE="$work/migration-blank-preset-state.json"
+  jq '.state' "$work/migration-blank-preset.json" > "$STATE_FILE"
+  state_normalize_split_preset_fields
+  jq --slurpfile state "$STATE_FILE" '.state = $state[0]' "$work/migration-blank-preset.json" \
+    > "$work/migration-normalized-preset.json"
+)
+validate_migration_payload_structure "$work/migration-normalized-preset.json"
 select_migration_restore_mode <<<'' >/dev/null
 [[ "$MIGRATION_RESTORE_MODE" == merge ]]
 select_migration_restore_mode <<<'2' >/dev/null

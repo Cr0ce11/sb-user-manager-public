@@ -18,6 +18,9 @@ run_standalone_interactive_startup() {
   if ! migrate_legacy_ss2022_udp_inbounds; then
     log '警告：旧版 SS2022 + ShadowTLS 用户的 UDP 支持暂未完成迁移，请稍后重新运行脚本或使用「服务与配置检查」'
   fi
+  if ! migrate_empty_split_preset_fields; then
+    log '警告：分流的预置来源记录暂未完成整理，请稍后重新运行脚本或使用「服务与配置检查」'
+  fi
   if ! migrate_shared_preset_runtime_configs; then
     log '警告：共享预置配置暂未完成整理，请稍后重新运行脚本或使用「服务与配置检查」'
   fi
