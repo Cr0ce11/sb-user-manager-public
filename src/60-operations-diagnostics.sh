@@ -415,6 +415,7 @@ read_numbered_index() {
   while true; do
     if ! read -r -p "$prompt" choice; then return 1; fi
     if [[ ! "$choice" =~ ^[0-9]+$ ]]; then echo '输入无效：请输入列表前面的数字编号。'; continue; fi
+    choice=$((10#$choice))
     if ((choice == 0)); then return 1; fi
     if ((choice < 1 || choice > maximum)); then echo '输入无效：该编号不在当前列表中，请重新选择。'; continue; fi
     SELECTED_INDEX=$((choice - 1))
@@ -782,50 +783,53 @@ collect_user_consistency_issue_rows() {
     def nfuse_port_exists($name; $port):
       any($nfuse[] | select(.name == $name) | .ports[]?; .start <= $port and .end >= $port);
     $state.users[] as $user |
-    (if ($user.endpoints | type) == "array" then $user.endpoints[]
-     else {protocol:($user.protocol // "ss2022"),transport:($user.transport // "shadowtls"),port:$user.port} end) as $endpoint |
     $user.name as $name |
     $user.status as $status |
-    $endpoint.protocol as $protocol |
-    ($endpoint.transport // "-") as $transport |
-    $endpoint.port as $port |
     ($user.metered // ($user.limit_gib != null)) as $metered |
+    (if $metered then "a" else "c" end) as $expected_tier |
     any($user.endpoints[]?; .protocol == "ss2022" and .transport == "shadowtls") as $has_legacy |
-    (if $protocol == "anytls" then ["anytls-" + $name]
-     elif $transport == "shadowtls" then ["st-" + $name, "ss-" + $name, "ss-udp-" + $name]
-     elif $has_legacy then ["ss-direct-" + $name]
-     else ["ss-" + $name] end) as $expected_tags |
-    $expected_tags[0] as $expected |
-    ($expected_tags[] as $tag |
-      if $status == "active" and (inbound_exists($tag) | not) then
-        issue(true; "[可自动修复] 用户 \($name) 缺少连接配置（\($tag)）")
-      elif $status == "disabled" and inbound_exists($tag) then
-        issue(true; "[可自动修复] 已停用用户 \($name) 仍保留连接配置（\($tag)）")
-      else empty end),
-    (if $protocol == "ss2022" and $transport == "shadowtls" and $status == "active" and
-        inbound_exists("ss-udp-" + $name) and
-        (any($config.inbounds[]?;
-          .tag == ("ss-udp-" + $name) and .type == "shadowsocks" and .network == "udp" and .listen_port == $port) | not)
-     then issue(true; "[可自动修复] 用户 \($name) 的 UDP 连接配置不正确") else empty end),
-    (if $protocol == "ss2022" and $transport == "direct" and $status == "active" and
-        (any($config.inbounds[]?;
-          .tag == $expected and .type == "shadowsocks" and .listen_port == $port and ((.network // "") == "")) | not)
-     then issue(true; "[可自动修复] 用户 \($name) 的原生 SS2022 连接配置不正确") else empty end),
-    (if $protocol == "ss2022" and $transport == "direct" and ($has_legacy | not) and
-        any($config.inbounds[]?; .tag == ("st-" + $name) or .tag == ("ss-udp-" + $name))
-     then issue(true; "[可自动修复] 用户 \($name) 的原生 SS2022 仍有旧版 ShadowTLS 连接残留") else empty end),
+    ((if ($user.endpoints | type) == "array" then $user.endpoints[]
+      else {protocol:($user.protocol // "ss2022"),transport:($user.transport // "shadowtls"),port:$user.port} end) as $endpoint |
+     $endpoint.protocol as $protocol |
+     ($endpoint.transport // "-") as $transport |
+     $endpoint.port as $port |
+     (if $protocol == "anytls" then ["anytls-" + $name]
+      elif $transport == "shadowtls" then ["st-" + $name, "ss-" + $name, "ss-udp-" + $name]
+      elif $has_legacy then ["ss-direct-" + $name]
+      else ["ss-" + $name] end) as $expected_tags |
+     $expected_tags[0] as $expected |
+     ($expected_tags[] as $tag |
+       if $status == "active" and (inbound_exists($tag) | not) then
+         issue(true; "[可自动修复] 用户 \($name) 缺少连接配置（\($tag)）")
+       elif $status == "disabled" and inbound_exists($tag) then
+         issue(true; "[可自动修复] 已停用用户 \($name) 仍保留连接配置（\($tag)）")
+       else empty end),
+     (if $protocol == "ss2022" and $transport == "shadowtls" and $status == "active" and
+         inbound_exists("ss-udp-" + $name) and
+         (any($config.inbounds[]?;
+           .tag == ("ss-udp-" + $name) and .type == "shadowsocks" and .network == "udp" and .listen_port == $port) | not)
+      then issue(true; "[可自动修复] 用户 \($name) 的 UDP 连接配置不正确") else empty end),
+     (if $protocol == "ss2022" and $transport == "direct" and $status == "active" and
+         (any($config.inbounds[]?;
+           .tag == $expected and .type == "shadowsocks" and .listen_port == $port and ((.network // "") == "")) | not)
+      then issue(true; "[可自动修复] 用户 \($name) 的原生 SS2022 连接配置不正确") else empty end),
+     (if $protocol == "ss2022" and $transport == "direct" and ($has_legacy | not) and
+         any($config.inbounds[]?; .tag == ("st-" + $name) or .tag == ("ss-udp-" + $name))
+      then issue(true; "[可自动修复] 用户 \($name) 的原生 SS2022 仍有旧版 ShadowTLS 连接残留") else empty end),
+     (if nfuse_user_exists($name) and nfuse_tier_exists($name; $expected_tier) and
+         (nfuse_port_exists($name; $port) | not) then
+        issue(true; "[可自动修复] 用户 \($name) 的端口 \($port) 尚未接入流量统计")
+      else empty end)),
     (if (nfuse_user_exists($name) | not) then
        issue(true; "[可自动修复] 用户 \($name) 缺少流量统计记录")
-     elif (nfuse_tier_exists($name; (if $metered then "a" else "c" end)) | not) then
+     elif (nfuse_tier_exists($name; $expected_tier) | not) then
        issue(false; "[需要处理] 用户 \($name) 的流量记录类型不正确（应为 \(if $metered then "计量" else "不限额统计" end)）")
-     elif (nfuse_port_exists($name; $port) | not) then
-       issue(true; "[可自动修复] 用户 \($name) 的端口 \($port) 尚未接入流量统计")
      else empty end)
   '
 }
 
 audit_consistency() {
-  local config_json nfuse_json user_issue_rows issue_repairable issue_message expiry_rows split_rows split name split_status rule_tag out_tag scope scope_user scope_tags expires
+  local config_json nfuse_json user_issue_rows issue_repairable issue_message expiry_rows split_rows split name split_status rule_tag out_tag scope scope_user scope_user_status scope_tags expires
   local preset_link_rows preset_kind preset_reason managed_tags legacy_cleanup legacy_count
   AUDIT_ISSUES=0
   AUDIT_REPAIRABLE=0
@@ -879,7 +883,21 @@ audit_consistency() {
     scope_user="$(jq -r 'if .scope == "user" then (.user // "") else "" end' <<<"$split")" || return 1
     rule_tag="$(split_runtime_rule_tag_from_json "$split")" || return 1
     out_tag="$(split_runtime_out_tag_from_json "$split")" || return 1
-    if [[ "$split_status" == active ]]; then
+    scope_user_status=""
+    if [[ -n "$scope_user" ]]; then
+      scope_user_status="$(jq -r --arg name "$scope_user" 'first(.users[]? | select(.name == $name) | .status) // ""' "$STATE_FILE")" || return 1
+    fi
+    if [[ "$split_status" == active && "$scope_user_status" == disabled ]]; then
+      # 用户已停用时这条专属分流不会写入运行配置，只需确认没有残留规则
+      scope_tags="$(split_user_inbound_tags "$scope_user")" || return 1
+      if jq -e --arg rule "$rule_tag" --arg out "$out_tag" --argjson expected "$scope_tags" '
+        .route.rules[]? | select(.rule_set == $rule and .outbound == $out and
+          ([.inbound[]? as $tag | select($expected | index($tag) != null)] | length) > 0)
+      ' <<<"$config_json" >/dev/null; then
+        printf '  [可自动修复] 分流 %s 指定的用户 %s 已停用，但连接规则仍在生效\n' "$name" "$scope_user"
+        ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
+      fi
+    elif [[ "$split_status" == active ]]; then
       if ! jq -e --arg tag "$rule_tag" '.route.rule_set[]? | select(.tag == $tag)' <<<"$config_json" >/dev/null ||
          ! jq -e --arg out "$out_tag" '.outbounds[]? | select(.tag == $out)' <<<"$config_json" >/dev/null ||
          ! jq -e --arg rule "$rule_tag" --arg out "$out_tag" '.route.rules[]? | select(.rule_set == $rule and .outbound == $out)' <<<"$config_json" >/dev/null; then
@@ -1018,6 +1036,7 @@ repair_consistency() {
 
 prompt_consistency() {
   local answer
+  ensure_management_environment_ready || return 0
   prepare_core
   audit_consistency
   ((AUDIT_REPAIRABLE>0)) || return 0

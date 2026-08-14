@@ -907,6 +907,19 @@ if read_numbered_index '请选择编号：' 3 </dev/null >/dev/null; then
   exit 1
 fi
 
+# 带前导零的编号必须按十进制解析：08 不能让算术展开中断调用栈，010 也不能选中第 8 项。
+SELECTED_INDEX=''
+read_numbered_index '请选择编号：' 12 <<<'08' >/dev/null
+[[ "$SELECTED_INDEX" == 7 ]]
+SELECTED_INDEX=''
+read_numbered_index '请选择编号：' 12 <<<'010' >/dev/null
+[[ "$SELECTED_INDEX" == 9 ]]
+SELECTED_INDEX=''
+if read_numbered_index '请选择编号：' 12 <<<'00' >/dev/null; then
+  echo 'numbered prompt should treat 00 as the return choice' >&2
+  exit 1
+fi
+
 stderr_probe="$work/stderr-probe"
 {
   release_operation_lock
@@ -5882,6 +5895,21 @@ migration_backup_menu_body="$(declare -f migration_backup_menu)"
 grep -Fq "check_all '批量体检全部备份（只读）'" <<<"$migration_backup_menu_body"
 grep -Fq 'check_all_migration_backups' <<<"$migration_backup_menu_body"
 
+# 未部署时「服务与配置检查」要回到菜单，而生成诊断报告仍然可用。
+(
+  CONF_FILE="$work/absent-manager.conf"
+  rm -f "$CONF_FILE"
+  pause_menu() { :; }
+  prepare_core() { printf 'PREPARE_CORE_RAN\n'; }
+  audit_consistency() { printf 'AUDIT_RAN\n'; AUDIT_REPAIRABLE=0; }
+  prompt_consistency > "$work/prompt-consistency-not-deployed"
+  grep -Fq '尚未部署管理环境。' "$work/prompt-consistency-not-deployed"
+  ! grep -Fq 'AUDIT_RAN' "$work/prompt-consistency-not-deployed"
+  ! grep -Fq 'PREPARE_CORE_RAN' "$work/prompt-consistency-not-deployed"
+)
+diagnostic_report_menu_body="$(declare -f diagnostic_report_menu)"
+! grep -Fq 'ensure_management_environment_ready' <<<"$diagnostic_report_menu_body"
+
 SB_SYSTEM_ROOT="$work/snapshot-system"
 ENVIRONMENT_BACKUP_BASE="$work/environment-backups"
 export SB_SYSTEM_ROOT ENVIRONMENT_BACKUP_BASE
@@ -6879,6 +6907,95 @@ fi
 共发现 11 个问题，其中 9 个可以自动修复。
 EOF
   cmp -s "$audit_expected" "$audit_output"
+)
+
+# 流量记录缺失和类型不正确属于用户本身，双协议用户也只能各报一条。
+(
+  STATE_FILE="$work/audit-user-nfuse-state.json"
+  SINGBOX_CONFIG="$work/audit-user-nfuse-config.json"
+  SINGBOX_BIN=audit_user_nfuse_singbox
+  printf '%s\n' '{
+    "schema_version":7,
+    "users":[
+      {"name":"dual","status":"active","metered":false,"endpoints":[{"protocol":"ss2022","transport":"shadowtls","port":20101},{"protocol":"anytls","port":20102}]}
+    ],
+    "splits":[],
+    "outbound_presets":[],
+    "rule_presets":[]
+  }' > "$STATE_FILE"
+  printf '%s\n' '{
+    "inbounds":[
+      {"tag":"st-dual"},
+      {"tag":"ss-dual"},
+      {"type":"shadowsocks","tag":"ss-udp-dual","network":"udp","listen_port":20101},
+      {"tag":"anytls-dual"}
+    ],
+    "outbounds":[],
+    "route":{"rule_set":[],"rules":[]}
+  }' > "$SINGBOX_CONFIG"
+  audit_user_nfuse_singbox() {
+    [[ "${1:-}" == format && "${2:-}" == -c && "${3:-}" == "$SINGBOX_CONFIG" ]] || return 1
+    command cat "$SINGBOX_CONFIG"
+  }
+  nfuse() {
+    [[ "${1:-}" == list && "${2:-}" == --json ]] || return 1
+    printf '%s\n' '[]'
+  }
+  audit_consistency > "$work/audit-user-missing-output"
+  [[ "$AUDIT_ISSUES" == 1 && "$AUDIT_REPAIRABLE" == 1 ]]
+  [[ "$(grep -Fc '缺少流量统计记录' "$work/audit-user-missing-output")" == 1 ]]
+  nfuse() {
+    [[ "${1:-}" == list && "${2:-}" == --json ]] || return 1
+    printf '%s\n' '[{"name":"dual","tier":"a","ports":[{"start":20101,"end":20102}]}]'
+  }
+  audit_consistency > "$work/audit-user-tier-output"
+  [[ "$AUDIT_ISSUES" == 1 && "$AUDIT_REPAIRABLE" == 0 ]]
+  [[ "$(grep -Fc '流量记录类型不正确' "$work/audit-user-tier-output")" == 1 ]]
+  # 端口问题仍然依端点判定，两个端点各报一条
+  nfuse() {
+    [[ "${1:-}" == list && "${2:-}" == --json ]] || return 1
+    printf '%s\n' '[{"name":"dual","tier":"c","ports":[]}]'
+  }
+  audit_consistency > "$work/audit-user-port-output"
+  [[ "$AUDIT_ISSUES" == 2 && "$AUDIT_REPAIRABLE" == 2 ]]
+  grep -Fq '[可自动修复] 用户 dual 的端口 20101 尚未接入流量统计' "$work/audit-user-port-output"
+  grep -Fq '[可自动修复] 用户 dual 的端口 20102 尚未接入流量统计' "$work/audit-user-port-output"
+)
+
+# 已停用用户的专属分流本就不会写入运行配置：不能报缺失，但残留规则仍要检出。
+(
+  STATE_FILE="$work/audit-disabled-split-state.json"
+  SINGBOX_CONFIG="$work/audit-disabled-split-config.json"
+  SINGBOX_BIN=audit_disabled_split_singbox
+  printf '%s\n' '{
+    "schema_version":7,
+    "users":[
+      {"name":"paused","status":"disabled","metered":false,"endpoints":[{"protocol":"anytls","port":20201}]}
+    ],
+    "splits":[
+      {"name":"AI","status":"active","scope":"user","user":"paused","url":"https://rules.example/ai.srs","rule_set_tag":"AI","outbound_tag":"Hinet"}
+    ],
+    "outbound_presets":[],
+    "rule_presets":[]
+  }' > "$STATE_FILE"
+  printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rule_set":[],"rules":[]}}' > "$SINGBOX_CONFIG"
+  audit_disabled_split_singbox() {
+    [[ "${1:-}" == format && "${2:-}" == -c && "${3:-}" == "$SINGBOX_CONFIG" ]] || return 1
+    command cat "$SINGBOX_CONFIG"
+  }
+  nfuse() {
+    [[ "${1:-}" == list && "${2:-}" == --json ]] || return 1
+    printf '%s\n' '[{"name":"paused","tier":"c","ports":[{"start":20201,"end":20201}]}]'
+  }
+  audit_consistency > "$work/audit-disabled-split-output"
+  [[ "$AUDIT_ISSUES" == 0 && "$AUDIT_REPAIRABLE" == 0 ]]
+  grep -Fq '一切正常' "$work/audit-disabled-split-output"
+  printf '%s\n' '{"inbounds":[],"outbounds":[{"tag":"Hinet"}],
+    "route":{"rule_set":[{"tag":"AI","url":"https://rules.example/ai.srs"}],
+      "rules":[{"rule_set":"AI","outbound":"Hinet","inbound":["anytls-paused"]}]}}' > "$SINGBOX_CONFIG"
+  audit_consistency > "$work/audit-disabled-split-stale-output"
+  [[ "$AUDIT_ISSUES" == 1 && "$AUDIT_REPAIRABLE" == 1 ]]
+  grep -Fq '[可自动修复] 分流 AI 指定的用户 paused 已停用，但连接规则仍在生效' "$work/audit-disabled-split-stale-output"
 )
 
 # 50 个 ShadowTLS 用户的一致性检查固定批量处理；重构前该夹具会启动 409 次 jq。
