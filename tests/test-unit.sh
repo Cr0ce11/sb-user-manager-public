@@ -2652,7 +2652,10 @@ qrencode_args="$work/shadowrocket-qr-args"
 ) < /dev/null > "$work/shadowrocket-qr.txt"
 grep -Fq 'qr:anytls://dummy-qr-secret@198.51.100.20:24443#sr-at' "$work/shadowrocket-qr.txt"
 [[ "$(tr '\0' '|' < "$qrencode_args")" == '-t|ANSIUTF8|-l|L|-m|1|' ]]
-! tr '\0' '\n' < "$qrencode_args" | grep -Fq 'dummy-qr-secret'
+if tr '\0' '\n' < "$qrencode_args" | grep -Fq 'dummy-qr-secret'; then
+  echo '导入链接含明文密码，不能作为命令行参数出现在 qrencode 的 argv 里' >&2
+  exit 1
+fi
 
 ipv6_anytls_url="$(PUBLIC_SERVER=2001:db8::1 shadowrocket_anytls_url '{"name":"ipv6-at","port":24444,"anytls_password":"dummy","tls_sni":"ipv6.example.com"}')"
 grep -Fq 'anytls://dummy@[2001:db8::1]:24444?' <<<"$ipv6_anytls_url"
@@ -5151,10 +5154,17 @@ state_remove_user anytls-custom
   STATE_FILE="$work/expiry-render-state.json"
   printf '%s\n' '{"schema_version":3,"users":[{"name":"expiry-render","port":20024,"status":"active","metered":false,"usage_offset_bytes":0,"expires_at":"2026-11-14T17:01:23+0800","created_at":"2026-07-15T00:00:00+08:00"}],"splits":[]}' > "$STATE_FILE"
   rendered_expiry="$(render_user_list '[]')"
-  grep -Fq '2026-11-14 17:01:23' <<<"$rendered_expiry"
-  grep -Fq '2026-07-15 00:00:00' <<<"$rendered_expiry"
-  ! grep -Fq '+0800' <<<"$rendered_expiry"
-  ! grep -Fq '+08:00' <<<"$rendered_expiry"
+  # 到期时间与创建时间是最后两列，必须整列锚定到行尾比对：
+  # 只用子串匹配的话，"2026-11-14 17:01:23+0800" 也会命中 "2026-11-14 17:01:23"。
+  grep -Eq '(^|[[:space:]])2026-11-14 17:01:23[[:space:]]+2026-07-15 00:00:00[[:space:]]*$' <<<"$rendered_expiry"
+  if grep -Fq '+0800' <<<"$rendered_expiry"; then
+    echo '到期时间不应保留 +0800 时区尾巴' >&2
+    exit 1
+  fi
+  if grep -Fq '+08:00' <<<"$rendered_expiry"; then
+    echo '创建时间不应保留 +08:00 时区尾巴' >&2
+    exit 1
+  fi
 )
 
 printf '%s\n' '{"schema_version":3,"users":[{"name":"quota-user","port":20002,"status":"active","metered":true,"limit_gib":1,"billing_anchor":1,"expires_at":null,"created_at":"2026-07-14T00:00:00+00:00","method":"2022-blake3-aes-128-gcm","shadowtls_sni":"quota.example.com"}],"splits":[]}' > "$STATE_FILE"
