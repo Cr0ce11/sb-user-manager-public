@@ -1114,16 +1114,24 @@ write_transaction_journal() {
     --arg script_version "$SCRIPT_VERSION" \
     --argjson pid "$$" \
     '{format_version:$format,status:"active",operation:$operation,backup_stamp:$stamp,started_at:$started_at,script_version:$script_version,pid:$pid}' > "$tmp" ||
-    ! chmod 600 "$tmp" || ! sync_transaction_path "$tmp" || ! mv -- "$tmp" "$TRANSACTION_JOURNAL" ||
-    ! sync_transaction_path "$TRANSACTION_DIR"; then
+    ! chmod 600 "$tmp" || ! sync_transaction_path "$tmp" || ! mv -- "$tmp" "$TRANSACTION_JOURNAL"; then
     rm -f -- "$tmp"
     return 1
   fi
+  # mv 成功即表示日志已经生效；目录同步失败只影响掉电后的持久性，不能再当作日志未写入处理
+  sync_transaction_path "$TRANSACTION_DIR" ||
+    log "提示：恢复记录目录未能同步到磁盘，本次操作仍在保护中"
 }
 
 begin_operation_transaction() {
-  local operation="$1" nfuse_tmp nfuse_snapshot stamp
+  local operation="$1" nfuse_tmp nfuse_snapshot stamp journal_stamp
   if ((ACTIVE_TRANSACTION_DEPTH > 0)); then
+    # 嵌套前确认日志仍然存在且指向本次事务，避免在没有保护的情况下继续修改
+    journal_stamp="$(active_operation_backup_stamp 2>/dev/null || true)"
+    if [[ -z "$journal_stamp" || "$journal_stamp" != "${ACTIVE_TRANSACTION_STAMP:-}" ]]; then
+      printf '错误：本次操作的恢复记录已经丢失或不匹配。为保护现有数据，本次操作已停止。恢复记录：%s\n' "$TRANSACTION_JOURNAL" >&2
+      return 1
+    fi
     ((ACTIVE_TRANSACTION_DEPTH+=1))
     return 0
   fi
@@ -1151,6 +1159,12 @@ begin_operation_transaction() {
      ! { [[ ! -f "$BACKUP_DIR/sb-user-manager.conf.$stamp" ]] || sync_transaction_path "$BACKUP_DIR/sb-user-manager.conf.$stamp"; } ||
      ! mv -- "$nfuse_tmp" "$nfuse_snapshot" || ! sync_transaction_path "$BACKUP_DIR" ||
      ! write_transaction_journal "$operation" "$stamp"; then
+    if [[ -e "$TRANSACTION_JOURNAL" || -L "$TRANSACTION_JOURNAL" ]]; then
+      # 日志一旦写入就必须保留同一 stamp 的备份，否则会留下指向已删备份的孤儿日志
+      rm -f -- "$nfuse_tmp"
+      printf '错误：本次操作未能开始，但恢复记录已经写入。请重新运行脚本完成自动恢复。恢复记录：%s\n' "$TRANSACTION_JOURNAL" >&2
+      return 1
+    fi
     rm -f -- "$nfuse_tmp" "$nfuse_snapshot" \
       "$BACKUP_DIR/config.json.$stamp" "$BACKUP_DIR/managed-users.json.$stamp" "$BACKUP_DIR/sb-user-manager.conf.$stamp"
     return 1
@@ -1173,7 +1187,7 @@ validate_transaction_journal() {
 
 restore_nfuse_snapshot() {
   local stamp="$1" snapshot before_state
-  local current_json managed_names desired_names name account tier limit anchor used port_spec port_id
+  local current_json managed_names desired_names name account tier limit anchor used port_spec port_id account_exists
   snapshot="$BACKUP_DIR/nfuse.json.$stamp"
   before_state="$BACKUP_DIR/managed-users.json.$stamp"
   [[ -r "$snapshot" && -r "$before_state" && -r "$STATE_FILE" ]] || return 1
@@ -1207,13 +1221,24 @@ restore_nfuse_snapshot() {
     [[ "$anchor" =~ ^[0-9]+$ ]] && ((anchor >= 1 && anchor <= 28)) || anchor=1
     used="$(jq -er '.used_bytes | select(type == "number" and . >= 0 and . == floor)' <<<"$account")" || return 1
     if jq -e --arg name "$name" '.[] | select(.name == $name)' <<<"$current_json" >/dev/null; then
+      account_exists=true
       nfuse set-tier "$name" --tier "$tier" --limit "$limit" --anchor "$anchor" >/dev/null || return 1
       while IFS= read -r port_id; do
         [[ -n "$port_id" ]] || continue
         nfuse port rm "$port_id" >/dev/null || return 1
       done < <(jq -r --arg name "$name" '.[] | select(.name == $name) | .ports[].id' <<<"$current_json")
     else
+      account_exists=false
       nfuse add "$name" --tier "$tier" --limit "$limit" --anchor "$anchor" >/dev/null || return 1
+    fi
+    if [[ "$tier" == c && "$account_exists" == true ]]; then
+      # 存活的自用账户不会被重建，用量需显式归零；快照用量由 restore_tier_c_usage_offsets 记入 usage_offset_bytes。
+      # Nfuse 是否接受对不限额账户设置用量无法在此确认，被拒绝时退回本函数已有的删除重建路径（重建出来的账户用量本来就是 0）。
+      if ! nfuse set-usage "$name" 0 >/dev/null 2>&1; then
+        log "提示：自用用户 ${name} 的流量记录无法直接归零，改用删除后重建的方式恢复"
+        nfuse rm "$name" --cascade >/dev/null || return 1
+        nfuse add "$name" --tier "$tier" --limit "$limit" --anchor "$anchor" >/dev/null || return 1
+      fi
     fi
     while IFS= read -r port_spec; do
       [[ -n "$port_spec" ]] || continue
@@ -1257,15 +1282,18 @@ restore_tier_c_usage_offsets() {
 }
 
 clear_operation_transaction() {
-  rm -f -- "$TRANSACTION_JOURNAL" || return 1
-  sync_transaction_path "$TRANSACTION_DIR" || return 1
+  local rc=0
+  # 内存状态必须无条件复位，否则删除成功、同步失败时会留下没有日志保护的空嵌套
+  rm -f -- "$TRANSACTION_JOURNAL" || rc=1
+  sync_transaction_path "$TRANSACTION_DIR" || rc=1
   ACTIVE_TRANSACTION_STAMP=""
   ACTIVE_TRANSACTION_OPERATION=""
   ACTIVE_TRANSACTION_DEPTH=0
+  return "$rc"
 }
 
 rollback_operation_transaction() {
-  local rc="${1:-1}" stamp="${ACTIVE_TRANSACTION_STAMP:-}" operation="${ACTIVE_TRANSACTION_OPERATION:-未知}"
+  local rc="${1:-1}" stamp="${ACTIVE_TRANSACTION_STAMP:-}" operation="${ACTIVE_TRANSACTION_OPERATION:-未知}" failed=false
   if [[ -z "$stamp" && -r "$TRANSACTION_JOURNAL" ]]; then
     validate_transaction_journal || { log "严重错误：事务日志损坏，拒绝自动恢复：$TRANSACTION_JOURNAL"; return 1; }
     stamp="$(jq -r '.backup_stamp' "$TRANSACTION_JOURNAL")"
@@ -1275,7 +1303,11 @@ rollback_operation_transaction() {
   trap - ERR
   clear_signal_rollback
   log "上次操作未正常完成，正在自动恢复修改前的数据：$operation"
-  if ! restore_nfuse_snapshot "$stamp" || ! restore_backup "$stamp" || ! restore_tier_c_usage_offsets "$stamp"; then
+  # 三个恢复动作必须各自执行完，避免前一步失败时留下只回滚了一半的混合状态
+  restore_nfuse_snapshot "$stamp" || failed=true
+  restore_backup "$stamp" || failed=true
+  restore_tier_c_usage_offsets "$stamp" || failed=true
+  if [[ "$failed" == true ]]; then
     log "严重错误：自动恢复失败。为避免扩大问题，请勿继续修改用户或分流；恢复记录和备份已保留"
     return 1
   fi
@@ -1303,7 +1335,11 @@ commit_operation_transaction() {
   if [[ -f "$CONF_FILE" ]]; then sync_transaction_path "$CONF_FILE" || return 1; fi
   if [[ -f "$nfuse_db" ]]; then sync_transaction_path "$nfuse_db" || return 1; fi
   if [[ -f "$nfuse_db-wal" ]]; then sync_transaction_path "$nfuse_db-wal" || return 1; fi
-  clear_operation_transaction || return 1
+  # 数据到这里已经全部落盘，本次操作事实上已经提交成功；恢复标记的清理失败不能再当作提交失败，
+  # 否则调用方会在一个字节都没有回滚的情况下告诉用户「操作失败并已恢复」
+  if ! clear_operation_transaction; then
+    log "修改已经保存成功；只是恢复标记未能完全清理，不需要重做本次操作。若下次启动时提示自动恢复，请先运行「服务与配置检查」核对：$TRANSACTION_JOURNAL"
+  fi
   if ! prune_operation_transaction_backups "$OPERATION_BACKUP_RETENTION"; then
     log "提示：旧的内部操作备份暂未能自动整理，不影响本次操作结果"
   fi
@@ -1331,11 +1367,22 @@ release_environment_lock() {
   { exec 8>&-; } 2>/dev/null || true
 }
 
+ensure_environment_lock_directory() {
+  local lock_directory
+  lock_directory="$(dirname "$ENVIRONMENT_LOCK_FILE")" || return 1
+  if [[ -e "$lock_directory" || -L "$lock_directory" ]]; then
+    # 目录已存在时只做类型检查，不改动既有权限
+    [[ -d "$lock_directory" && ! -L "$lock_directory" ]] || return 1
+    return 0
+  fi
+  install -d -m 755 -- "$lock_directory"
+}
+
 begin_environment_transaction() {
   local operation="$1" snapshot="$2" tmp path operation_journal
   shift 2
   operation_journal="${TRANSACTION_JOURNAL:-$(system_path /var/lib/sb-user-manager/transactions/active.json)}" || return 1
-  install -d -m 755 "$(dirname "$ENVIRONMENT_LOCK_FILE")" || return 1
+  ensure_environment_lock_directory || return 1
   exec 8>"$ENVIRONMENT_LOCK_FILE"
   flock -n 8 || { release_environment_lock; return 1; }
   [[ ! -e "$ENVIRONMENT_TRANSACTION_JOURNAL" && ! -L "$ENVIRONMENT_TRANSACTION_JOURNAL" ]] || {
@@ -1403,7 +1450,7 @@ recover_environment_transaction() {
   environment_transaction_journal_is_trusted ||
     die "环境恢复日志权限或类型不安全，拒绝继续：$ENVIRONMENT_TRANSACTION_JOURNAL"
   acquire_operation_lock || die "$OPERATION_LOCK_ERROR"
-  install -d -m 755 "$(dirname "$ENVIRONMENT_LOCK_FILE")" || {
+  ensure_environment_lock_directory || {
     release_operation_lock
     die "无法创建环境恢复锁目录"
   }
@@ -1532,8 +1579,11 @@ finish_managed_operation() {
   fi
   trap - ERR
   clear_signal_rollback
-  if commit_operation_transaction; then return 0; fi
-  rc=$?
+  if commit_operation_transaction; then
+    return 0
+  else
+    rc=$?
+  fi
   log "修改未能安全保存，正在恢复操作前的数据"
   rollback_operation_transaction "$rc" || true
   return "$rc"

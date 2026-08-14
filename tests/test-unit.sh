@@ -3697,7 +3697,15 @@ fi
         nfuse_update '(.[] | select(.name == $name)) |= (.tier=$tier | .limit_gib=$limit | .limit_bytes=$limit_bytes)' \
           --arg name "$name" --arg tier "$4" --argjson limit "$6" --argjson limit_bytes "$limit_bytes"
         ;;
-      set-usage) nfuse_update '(.[] | select(.name == $name) | .used_bytes) = $used' --arg name "$2" --argjson used "$3";;
+      set-usage)
+        # 真实 Nfuse 是否接受对不限额账户设置用量无从验证，这个开关用来模拟它拒绝的情况。
+        if [[ "${nfuse_rejects_tier_c_set_usage:-false}" == true ]] &&
+           jq -e --arg name "$2" 'any(.[]; .name == $name and .tier == "c")' "$nfuse_state" >/dev/null; then
+          printf 'nfuse: set-usage is not supported for unlimited accounts\n' >&2
+          return 65
+        fi
+        nfuse_update '(.[] | select(.name == $name) | .used_bytes) = $used' --arg name "$2" --argjson used "$3"
+        ;;
       port)
         case "$2" in
           rm) nfuse_update 'map(.ports |= map(select(.id != $id)))' --argjson id "$3";;
@@ -3759,6 +3767,62 @@ fi
     all(.[]; .name != "bob")
   ' "$nfuse_state" >/dev/null
 
+  # 自用账户在操作中存活（没有被删掉重建）时，tier c 的用量同样必须归零，
+  # 否则收尾校验只要服务器上有跑过流量的自用用户就必然失败。
+  nfuse_update '(.[] | select(.name == "self-user") | .used_bytes) = 70'
+  begin_operation_transaction 'unit-self-user-survives'
+  stamp="$ACTIVE_TRANSACTION_STAMP"
+  jq -e 'any(.[]; .name == "self-user" and .tier == "c" and .used_bytes == 70)' "$BACKUP_DIR/nfuse.json.$stamp" >/dev/null
+  printf '%s\n' '{"schema_version":3,"users":[{"name":"alice","port":20011,"status":"active","metered":true,"limit_gib":3,"billing_anchor":5},{"name":"self-user","port":20002,"status":"active","metered":false,"usage_offset_bytes":65}],"splits":[]}' > "$STATE_FILE"
+  nfuse_update '(.[] | select(.name == "alice") | .limit_gib) = 3'
+  nfuse_update '(.[] | select(.name == "self-user") | .used_bytes) = 90'
+  ACTIVE_TRANSACTION_STAMP=""
+  ACTIVE_TRANSACTION_OPERATION=""
+  ACTIVE_TRANSACTION_DEPTH=0
+
+  recover_pending_transaction
+  [[ ! -e "$TRANSACTION_JOURNAL" ]]
+  jq -e '
+    any(.[]; .name == "alice" and .tier == "a" and .limit_gib == 2 and .used_bytes == 456) and
+    any(.[]; .name == "self-user" and .tier == "c" and .used_bytes == 0 and (.ports|length)==1 and .ports[0].start == 20002)
+  ' "$nfuse_state" >/dev/null
+  jq -e '
+    (.users[] | select(.name == "alice") | .port) == 20001 and
+    (.users[] | select(.name == "self-user") | .usage_offset_bytes) == 135
+  ' "$STATE_FILE" >/dev/null
+
+  # Nfuse 若拒绝对不限额账户设置用量，回滚必须退回到删除重建，而不是整体失败；
+  # 回滚前后的显示用量（used_bytes + usage_offset_bytes）必须守恒，端口也要按快照重新补回。
+  printf '%s\n' '{"schema_version":3,"users":[{"name":"alice","port":20001,"status":"active","metered":true,"limit_gib":2,"billing_anchor":5},{"name":"self-user","port":20002,"status":"active","metered":false,"usage_offset_bytes":65}],"splits":[]}' > "$STATE_FILE"
+  nfuse_update '(.[] | select(.name == "self-user") | .used_bytes) = 70'
+  nfuse_rejects_tier_c_set_usage=true
+  begin_operation_transaction 'unit-self-user-set-usage-rejected'
+  stamp="$ACTIVE_TRANSACTION_STAMP"
+  jq -e 'any(.[]; .name == "self-user" and .tier == "c" and .used_bytes == 70)' "$BACKUP_DIR/nfuse.json.$stamp" >/dev/null
+  printf '%s\n' '{"schema_version":3,"users":[{"name":"alice","port":20011,"status":"active","metered":true,"limit_gib":3,"billing_anchor":5},{"name":"self-user","port":20002,"status":"active","metered":false,"usage_offset_bytes":65}],"splits":[]}' > "$STATE_FILE"
+  nfuse_update '(.[] | select(.name == "alice") | .limit_gib) = 3'
+  nfuse_update '(.[] | select(.name == "self-user") | .used_bytes) = 90'
+  ACTIVE_TRANSACTION_STAMP=""
+  ACTIVE_TRANSACTION_OPERATION=""
+  ACTIVE_TRANSACTION_DEPTH=0
+
+  # 自动恢复失败时 recover_pending_transaction 会直接 die，套一层子 shell 才能把失败点留在本用例里
+  rc=0
+  ( recover_pending_transaction ) > "$work/self-user-set-usage-rejected.out" 2>&1 || rc=$?
+  if [[ "$rc" != 0 ]]; then
+    echo 'rollback must still succeed when nfuse refuses set-usage on an unlimited account' >&2
+    cat "$work/self-user-set-usage-rejected.out" >&2
+    exit 1
+  fi
+  [[ ! -e "$TRANSACTION_JOURNAL" ]]
+  jq -e '
+    any(.[]; .name == "self-user" and .tier == "c" and .limit_gib == 0 and .used_bytes == 0 and (.ports|length)==1 and .ports[0].start == 20002) and
+    any(.[]; .name == "alice" and .tier == "a" and .limit_gib == 2 and .used_bytes == 456)
+  ' "$nfuse_state" >/dev/null
+  jq -e '(.users[] | select(.name == "self-user") | .usage_offset_bytes) == 135' "$STATE_FILE" >/dev/null
+  grep -Fq '改用删除后重建的方式恢复' "$work/self-user-set-usage-rejected.out"
+  nfuse_rejects_tier_c_set_usage=false
+
   begin_operation_transaction 'nested-outer'
   begin_operation_transaction 'nested-inner'
   [[ "$ACTIVE_TRANSACTION_DEPTH" == 2 && -f "$TRANSACTION_JOURNAL" ]]
@@ -3766,6 +3830,196 @@ fi
   [[ "$ACTIVE_TRANSACTION_DEPTH" == 1 && -f "$TRANSACTION_JOURNAL" ]]
   commit_operation_transaction
   [[ "$ACTIVE_TRANSACTION_DEPTH" == 0 && ! -e "$TRANSACTION_JOURNAL" ]]
+)
+
+# 提交失败时改动已经被回滚，finish_managed_operation 必须把失败码交给调用方，
+# 否则界面会在数据已经撤销的情况下打印成功提示。
+(
+  events="$work/finish-commit-failure-events"
+  ACTIVE_TRANSACTION_STAMP=20240101-000000-1.1
+  ACTIVE_TRANSACTION_OPERATION=finish-commit-failure
+  ACTIVE_TRANSACTION_DEPTH=1
+  commit_operation_transaction() { return 77; }
+  rollback_operation_transaction() { printf 'rollback %s\n' "$1" >> "$events"; return "$1"; }
+  if finish_managed_operation > "$work/finish-commit-failure.out" 2>&1; then
+    echo 'finish_managed_operation must fail when the commit fails' >&2
+    exit 1
+  else
+    rc=$?
+  fi
+  [[ "$rc" == 77 ]]
+  diff -u <(printf 'rollback 77\n') "$events"
+)
+
+# 数据已经全部落盘、只有恢复标记的清理没能同步时，操作事实上已经提交成功：
+# 此时既不能说「正在恢复」，也不能一个恢复动作都不执行就让用户以为改动已经被撤销。
+(
+  events="$work/commit-cleanup-failure-events"
+  TRANSACTION_DIR="$work/commit-cleanup-failure"
+  TRANSACTION_JOURNAL="$TRANSACTION_DIR/active.json"
+  SINGBOX_CONFIG="$work/commit-cleanup-config.json"
+  STATE_FILE="$work/commit-cleanup-state.json"
+  CONF_FILE="$work/commit-cleanup-manager.conf"
+  NFUSE_DB="$work/commit-cleanup-nfuse.db"
+  mkdir -p "$TRANSACTION_DIR"
+  printf '%s\n' '{"marker":"committed"}' > "$SINGBOX_CONFIG"
+  printf '%s\n' '{"schema_version":3,"users":[],"splits":[]}' > "$STATE_FILE"
+  printf '%s\n' '{"backup_stamp":"20240101-000000-1.1"}' > "$TRANSACTION_JOURNAL"
+  ACTIVE_TRANSACTION_STAMP=20240101-000000-1.1
+  ACTIVE_TRANSACTION_OPERATION=commit-cleanup-failure
+  ACTIVE_TRANSACTION_DEPTH=1
+  nfuse() { [[ "${1:-}" == persist ]]; }
+  # 只有事务目录的 sync 失败：数据都已经写入并同步，日志文件也已经删掉
+  sync_transaction_path() { [[ "$1" != "$TRANSACTION_DIR" ]]; }
+  prune_operation_transaction_backups() { return 0; }
+  restore_nfuse_snapshot() { printf 'nfuse %s\n' "$1" >> "$events"; }
+  restore_backup() { printf 'backup %s\n' "$1" >> "$events"; }
+  restore_tier_c_usage_offsets() { printf 'offsets %s\n' "$1" >> "$events"; }
+  rc=0
+  finish_managed_operation > "$work/commit-cleanup-failure.out" 2>&1 || rc=$?
+  if grep -Fq '正在恢复' "$work/commit-cleanup-failure.out"; then
+    echo 'a committed operation must never claim that the data is being restored' >&2
+    exit 1
+  fi
+  if [[ -e "$events" ]]; then
+    echo 'no restore step may run when the data was already committed' >&2
+    exit 1
+  fi
+  grep -Fq '修改已经保存成功' "$work/commit-cleanup-failure.out"
+  if [[ "$rc" != 0 ]]; then
+    echo "a committed operation must not be reported as failed: rc=$rc" >&2
+    exit 1
+  fi
+  [[ ! -e "$TRANSACTION_JOURNAL" ]]
+  [[ "$ACTIVE_TRANSACTION_DEPTH" == 0 && -z "$ACTIVE_TRANSACTION_STAMP" ]]
+)
+
+# 日志删除成功、目录同步失败时也必须复位内存状态，否则后续操作会在没有日志保护的情况下空嵌套。
+(
+  TRANSACTION_DIR="$work/clear-transaction-partial"
+  TRANSACTION_JOURNAL="$TRANSACTION_DIR/active.json"
+  mkdir -p "$TRANSACTION_DIR"
+  printf '%s\n' '{"backup_stamp":"20240101-000000-1.1"}' > "$TRANSACTION_JOURNAL"
+  ACTIVE_TRANSACTION_STAMP=20240101-000000-1.1
+  ACTIVE_TRANSACTION_OPERATION=clear-partial
+  ACTIVE_TRANSACTION_DEPTH=1
+  sync_transaction_path() { return 1; }
+  if clear_operation_transaction; then
+    echo 'clear_operation_transaction must report the failed directory sync' >&2
+    exit 1
+  fi
+  [[ ! -e "$TRANSACTION_JOURNAL" ]]
+  [[ "$ACTIVE_TRANSACTION_DEPTH" == 0 && -z "$ACTIVE_TRANSACTION_STAMP" && -z "$ACTIVE_TRANSACTION_OPERATION" ]]
+)
+
+# 嵌套事务必须确认日志仍然存在且指向本次备份组，不满足时明确失败而不是静默嵌套。
+(
+  TRANSACTION_DIR="$work/nested-invariant"
+  TRANSACTION_JOURNAL="$TRANSACTION_DIR/active.json"
+  mkdir -p "$TRANSACTION_DIR"
+  ACTIVE_TRANSACTION_STAMP=20240101-000000-1.1
+  ACTIVE_TRANSACTION_OPERATION=nested-invariant
+  ACTIVE_TRANSACTION_DEPTH=1
+  if begin_operation_transaction 'nested-without-journal' > "$work/nested-invariant.out" 2>&1; then
+    echo 'nested transaction must fail when the recovery journal is gone' >&2
+    exit 1
+  fi
+  [[ "$ACTIVE_TRANSACTION_DEPTH" == 1 ]]
+  grep -Fq '恢复记录已经丢失或不匹配' "$work/nested-invariant.out"
+  printf '%s\n' '{"backup_stamp":"20240101-000000-2.2"}' > "$TRANSACTION_JOURNAL"
+  if begin_operation_transaction 'nested-stamp-mismatch' >/dev/null 2>&1; then
+    echo 'nested transaction must fail when the recovery journal points at another backup group' >&2
+    exit 1
+  fi
+  [[ "$ACTIVE_TRANSACTION_DEPTH" == 1 ]]
+)
+
+# mv 成功即表示日志已经生效；结尾的目录同步失败不能把已安装的日志当成写入失败。
+(
+  TRANSACTION_DIR="$work/journal-dir-sync"
+  TRANSACTION_JOURNAL="$TRANSACTION_DIR/active.json"
+  sync_transaction_path() { [[ "$1" != "$TRANSACTION_DIR" ]]; }
+  write_transaction_journal 'journal-dir-sync' '20240101-000000-1.1' > "$work/journal-dir-sync.out"
+  [[ -f "$TRANSACTION_JOURNAL" ]]
+  validate_transaction_journal
+  grep -Fq '恢复记录目录未能同步到磁盘' "$work/journal-dir-sync.out"
+)
+
+# 日志一旦写入，失败清理就不能删掉同一 stamp 的备份组，否则会留下让脚本每次启动都失败的孤儿日志。
+(
+  BACKUP_DIR="$work/orphan-journal-backups"
+  TRANSACTION_DIR="$work/orphan-journal-transactions"
+  TRANSACTION_JOURNAL="$TRANSACTION_DIR/active.json"
+  ENVIRONMENT_TRANSACTION_JOURNAL="$work/orphan-journal-environment.json"
+  SINGBOX_CONFIG="$work/orphan-journal-config.json"
+  STATE_FILE="$work/orphan-journal-state.json"
+  CONF_FILE="$work/orphan-journal-manager.conf"
+  mkdir -p "$BACKUP_DIR" "$TRANSACTION_DIR"
+  printf '%s\n' '{"marker":"before"}' > "$SINGBOX_CONFIG"
+  printf '%s\n' '{"schema_version":3,"users":[],"splits":[]}' > "$STATE_FILE"
+  printf '%s\n' 'SS2022_SHADOWTLS_SNI="before-ss.example.com"' > "$CONF_FILE"
+  ACTIVE_TRANSACTION_STAMP=""
+  ACTIVE_TRANSACTION_OPERATION=""
+  ACTIVE_TRANSACTION_DEPTH=0
+  sync_transaction_path() { return 0; }
+  nfuse() {
+    case "${1:-}" in
+      list) [[ "${2:-}" == --json ]] && printf '%s\n' '[]';;
+      persist) return 0;;
+      *) return 64;;
+    esac
+  }
+  write_transaction_journal() {
+    printf '{"format_version":%s,"status":"active","operation":"%s","backup_stamp":"%s","started_at":"unit","script_version":"%s","pid":%s}\n' \
+      "$TRANSACTION_FORMAT_VERSION" "$1" "$2" "$SCRIPT_VERSION" "$$" > "$TRANSACTION_JOURNAL"
+    return 1
+  }
+  if begin_operation_transaction 'orphan-journal' > "$work/orphan-journal.out" 2>&1; then
+    echo 'begin_operation_transaction must fail when the journal cannot be completed' >&2
+    exit 1
+  fi
+  [[ "$ACTIVE_TRANSACTION_DEPTH" == 0 ]]
+  validate_transaction_journal
+  orphan_stamp="$(jq -r '.backup_stamp' "$TRANSACTION_JOURNAL")"
+  operation_backup_group_is_complete "$orphan_stamp"
+  [[ -f "$BACKUP_DIR/nfuse.json.$orphan_stamp" ]]
+)
+
+# 回滚链必须逐项执行，前一步失败也不能跳过后面的恢复动作。
+(
+  events="$work/rollback-chain-events"
+  TRANSACTION_JOURNAL="$work/rollback-chain-journal.json"
+  ACTIVE_TRANSACTION_STAMP=20240101-000000-1.1
+  ACTIVE_TRANSACTION_OPERATION=rollback-chain
+  ACTIVE_TRANSACTION_DEPTH=1
+  restore_nfuse_snapshot() { printf 'nfuse %s\n' "$1" >> "$events"; return 1; }
+  restore_backup() { printf 'backup %s\n' "$1" >> "$events"; }
+  restore_tier_c_usage_offsets() { printf 'offsets %s\n' "$1" >> "$events"; }
+  if rollback_operation_transaction 9 > "$work/rollback-chain.out" 2>&1; then
+    echo 'rollback must fail when a restore step fails' >&2
+    exit 1
+  else
+    rc=$?
+  fi
+  [[ "$rc" == 1 ]]
+  diff -u <(printf 'nfuse 20240101-000000-1.1\nbackup 20240101-000000-1.1\noffsets 20240101-000000-1.1\n') "$events"
+)
+
+# 环境锁目录已存在时只做类型检查：符号链接必须拒绝，且不得改动目标目录权限。
+(
+  ENVIRONMENT_LOCK_FILE="$work/environment-lock-symlink/lock-dir/environment.lock"
+  ENVIRONMENT_TRANSACTION_JOURNAL="$work/environment-lock-symlink/recovery.json"
+  TRANSACTION_JOURNAL="$work/environment-lock-symlink/operation.json"
+  mkdir -p "$work/environment-lock-symlink/real-lock-dir"
+  chmod 700 "$work/environment-lock-symlink/real-lock-dir"
+  ln -s "$work/environment-lock-symlink/real-lock-dir" "$work/environment-lock-symlink/lock-dir"
+  if begin_environment_transaction lock-symlink "$work/environment-lock-symlink/snapshot" /usr/local/bin/nfuse \
+      > "$work/environment-lock-symlink.out" 2>&1; then
+    echo 'environment transaction must reject a symlinked lock directory' >&2
+    exit 1
+  fi
+  [[ ! -e "$ENVIRONMENT_LOCK_FILE" ]]
+  [[ "$(manager_file_mode "$work/environment-lock-symlink/real-lock-dir")" == 700 ]]
 )
 
 (
