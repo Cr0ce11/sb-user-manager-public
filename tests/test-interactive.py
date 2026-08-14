@@ -18,6 +18,7 @@ source ./sb-user-manager.sh
 
 LOCK_FILE="$TEST_LOCK_PATH"
 CONF_FILE="$TEST_CONF_PATH"
+MIGRATION_BACKUP_DIR="$TEST_MIGRATION_BACKUP_DIR"
 EXPECTED_PWD="$PWD"
 EXPECTED_UMASK="$(umask)"
 EXPECTED_IFS="$(printf '%q' "$IFS")"
@@ -175,10 +176,13 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="sb-menu-test-") as work:
         lock_path = os.path.join(work, "manager.lock")
         conf_path = os.path.join(work, "sb-user-manager.conf")
+        migration_backup_dir = os.path.join(work, "migration-backups")
+        os.mkdir(migration_backup_dir)
         open(conf_path, "w", encoding="utf-8").close()
         env = os.environ.copy()
         env["TEST_LOCK_PATH"] = lock_path
         env["TEST_CONF_PATH"] = conf_path
+        env["TEST_MIGRATION_BACKUP_DIR"] = migration_backup_dir
         master, slave = pty.openpty()
         process = subprocess.Popen(
             ["bash", "-c", SHELL_FIXTURE],
@@ -227,6 +231,32 @@ def main() -> None:
             attributes = termios.tcgetattr(master)
             if not attributes[3] & termios.ECHO:
                 raise AssertionError("terminal echo disabled at menu prompt")
+
+        # 未部署时会崩的备份项：必须被项级护栏挡住并回到「数据备份与恢复」。
+        def expect_backup_item_blocked(choice: str) -> None:
+            send(f"{choice}\n")
+            expect("尚未部署管理环境")
+            expect("系统管理 → 部署与卸载 → 安装或修复环境")
+            expect("按回车返回菜单…")
+            send("\n")
+            expect("数据备份与恢复")
+            expect_choice_prompt()
+
+        # 未部署时本来就能用的备份项：护栏不得把它们一起挡掉。
+        # marker 是该项的正常输出；被误挡时它不会出现，expect 会超时报错。
+        def expect_backup_item_available(choice: str, marker: str) -> None:
+            start = len(transcript)
+            send(f"{choice}\n")
+            expect(marker)
+            segment = bytes(transcript[start:])
+            if "尚未部署管理环境".encode("utf-8") in segment:
+                raise AssertionError(
+                    f"backup menu item {choice} must stay usable without a deployed environment"
+                )
+            expect("按回车返回菜单…")
+            send("\n")
+            expect("数据备份与恢复")
+            expect_choice_prompt()
 
         try:
             expect("sb-user-manager")
@@ -431,13 +461,35 @@ def main() -> None:
             send("3\n")
             expect("系统管理")
             expect_choice_prompt()
+            # 「数据备份与恢复」用项级护栏：菜单本身仍要能进，只挡会崩的那 6 项。
             send("5\n")
-            expect("尚未部署管理环境")
-            expect("系统管理 → 部署与卸载 → 安装或修复环境")
-            expect("按回车返回菜单…")
-            send("\n")
+            expect("数据备份与恢复")
+            expect_choice_prompt()
+            expect_backup_item_blocked("1")
+            expect_backup_item_blocked("2")
+            expect_backup_item_blocked("3")
+            expect_backup_item_available("4", "暂无迁移备份。")
+            expect_backup_item_blocked("5")
+            expect_backup_item_available("6", "暂无迁移备份可供体检。")
+            expect_backup_item_blocked("7")
+            reports_start = len(transcript)
+            send("8\n")
+            expect("恢复记录")
+            expect("1. 查看记录列表")
+            if "尚未部署管理环境".encode("utf-8") in bytes(transcript[reports_start:]):
+                raise AssertionError(
+                    "backup menu item 8 must stay usable without a deployed environment"
+                )
+            expect_choice_prompt()
+            send("0\n")
+            expect("数据备份与恢复")
+            expect_choice_prompt()
+            expect_backup_item_available("9", "暂无迁移备份。")
+            expect_backup_item_blocked("10")
+            send("0\n")
             expect("系统管理")
             expect_choice_prompt()
+            # 「默认连接域名（SNI）」三项全会崩，保持菜单级护栏。
             send("6\n")
             expect("尚未部署管理环境")
             expect("系统管理 → 部署与卸载 → 安装或修复环境")
