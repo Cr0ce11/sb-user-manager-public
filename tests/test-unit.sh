@@ -3825,6 +3825,11 @@ fi
       persist) return 0;;
       rm) nfuse_update 'map(select(.name != $name))' --arg name "$2";;
       add)
+        # 模拟「删除成功但重建失败」：账户会从流量库彻底消失，脚本必须给出可执行的补救命令。
+        if [[ "${nfuse_fails_add:-false}" == true ]]; then
+          printf 'nfuse: daemon is not available\n' >&2
+          return 70
+        fi
         name="$2"; limit_bytes="$(awk -v value="$6" 'BEGIN {printf "%.0f", value*1073741824}')"
         nfuse_update '. += [{id:99,name:$name,tier:$tier,limit_gib:$limit,limit_bytes:$limit_bytes,used_bytes:0,ports:[]}]' \
           --arg name "$name" --arg tier "$4" --argjson limit "$6" --argjson limit_bytes "$limit_bytes"
@@ -3960,6 +3965,30 @@ fi
   grep -Fq '改用删除后重建的方式恢复' "$work/self-user-set-usage-rejected.out"
   nfuse_rejects_tier_c_set_usage=false
 
+  # 删除重建的最坏情况：删成功、建失败，自用账户彻底丢失。
+  # 恢复流程不能只留下一句「自动恢复失败」，必须点名账户并给出可直接照抄的重建命令。
+  (
+    nfuse_rejects_tier_c_set_usage=true
+    nfuse_fails_add=true
+    rebuild_out="$work/tier-c-rebuild-failure.out"
+    if restore_nfuse_snapshot "$stamp" > "$rebuild_out" 2>&1; then
+      echo 'restoring must fail when the self-use account cannot be recreated' >&2
+      exit 1
+    fi
+    if ! grep -Fq '已从流量库删除但未能重建' "$rebuild_out"; then
+      echo 'a lost self-use account must be named explicitly in the log' >&2
+      exit 1
+    fi
+    if ! grep -Fq 'nfuse add self-user --tier c' "$rebuild_out"; then
+      echo 'the log must contain a runnable command to recreate the lost account' >&2
+      exit 1
+    fi
+    if ! grep -Fq 'daemon is not available' "$rebuild_out"; then
+      echo "Nfuse 的原始错误必须保留，管理员据此才能分辨故障类型" >&2
+      exit 1
+    fi
+  )
+
   begin_operation_transaction 'nested-outer'
   begin_operation_transaction 'nested-inner'
   [[ "$ACTIVE_TRANSACTION_DEPTH" == 2 && -f "$TRANSACTION_JOURNAL" ]]
@@ -4029,6 +4058,45 @@ fi
   fi
   [[ ! -e "$TRANSACTION_JOURNAL" ]]
   [[ "$ACTIVE_TRANSACTION_DEPTH" == 0 && -z "$ACTIVE_TRANSACTION_STAMP" ]]
+)
+
+# 恢复标记删不掉是另一回事：下次启动会按它无条件回滚，把这次修改悄悄撤销。
+# 此时绝不能报告成功，必须当场失败并说明原因。
+(
+  events="$work/commit-journal-kept-events"
+  TRANSACTION_DIR="$work/commit-journal-kept"
+  TRANSACTION_JOURNAL="$TRANSACTION_DIR/active.json"
+  SINGBOX_CONFIG="$work/commit-journal-kept-config.json"
+  STATE_FILE="$work/commit-journal-kept-state.json"
+  CONF_FILE="$work/commit-journal-kept-manager.conf"
+  NFUSE_DB="$work/commit-journal-kept-nfuse.db"
+  mkdir -p "$TRANSACTION_DIR"
+  printf '%s\n' '{"marker":"committed"}' > "$SINGBOX_CONFIG"
+  printf '%s\n' '{"schema_version":3,"users":[],"splits":[]}' > "$STATE_FILE"
+  printf '%s\n' '{"backup_stamp":"20240101-000000-1.1"}' > "$TRANSACTION_JOURNAL"
+  ACTIVE_TRANSACTION_STAMP=20240101-000000-1.1
+  ACTIVE_TRANSACTION_OPERATION=commit-journal-kept
+  ACTIVE_TRANSACTION_DEPTH=1
+  nfuse() { [[ "${1:-}" == persist ]]; }
+  sync_transaction_path() { return 0; }
+  prune_operation_transaction_backups() { return 0; }
+  # 删除失败：恢复标记留在磁盘上
+  rm() { if [[ "${*}" == *"$TRANSACTION_JOURNAL"* ]]; then return 1; fi; command rm "$@"; }
+  restore_nfuse_snapshot() { printf 'nfuse %s\n' "$1" >> "$events"; }
+  restore_backup() { printf 'backup %s\n' "$1" >> "$events"; }
+  restore_tier_c_usage_offsets() { printf 'offsets %s\n' "$1" >> "$events"; }
+  rc=0
+  commit_operation_transaction > "$work/commit-journal-kept.out" 2>&1 || rc=$?
+  if [[ "$rc" == 0 ]]; then
+    echo 'a commit whose recovery journal survives must not be reported as successful' >&2
+    exit 1
+  fi
+  if grep -Fq '修改已经保存成功' "$work/commit-journal-kept.out"; then
+    echo 'the message must not claim success while the journal still triggers a rollback' >&2
+    exit 1
+  fi
+  grep -Fq '下次启动会按它自动撤销本次修改' "$work/commit-journal-kept.out"
+  [[ -e "$TRANSACTION_JOURNAL" ]]
 )
 
 # 日志删除成功、目录同步失败时也必须复位内存状态，否则后续操作会在没有日志保护的情况下空嵌套。
@@ -4140,6 +4208,28 @@ fi
   fi
   [[ "$rc" == 1 ]]
   diff -u <(printf 'nfuse 20240101-000000-1.1\nbackup 20240101-000000-1.1\noffsets 20240101-000000-1.1\n') "$events"
+)
+
+# 但第三步依赖第二步：restore_backup 失败时状态文件还没被还原，
+# 再累加 usage_offset_bytes 会在每次自动恢复时重复叠加一份快照用量。
+(
+  events="$work/rollback-offset-guard-events"
+  TRANSACTION_JOURNAL="$work/rollback-offset-guard-journal.json"
+  ACTIVE_TRANSACTION_STAMP=20240101-000000-1.1
+  ACTIVE_TRANSACTION_OPERATION=rollback-offset-guard
+  ACTIVE_TRANSACTION_DEPTH=1
+  restore_nfuse_snapshot() { printf 'nfuse %s\n' "$1" >> "$events"; }
+  restore_backup() { printf 'backup %s\n' "$1" >> "$events"; return 1; }
+  restore_tier_c_usage_offsets() { printf 'offsets %s\n' "$1" >> "$events"; }
+  if rollback_operation_transaction 9 > "$work/rollback-offset-guard.out" 2>&1; then
+    echo 'rollback must fail when restoring the backup fails' >&2
+    exit 1
+  fi
+  if grep -Fq 'offsets ' "$events"; then
+    echo 'usage offsets must not be re-applied when the state file was not restored' >&2
+    exit 1
+  fi
+  diff -u <(printf 'nfuse 20240101-000000-1.1\nbackup 20240101-000000-1.1\n') "$events"
 )
 
 # 环境锁目录已存在时只做类型检查：符号链接必须拒绝，且不得改动目标目录权限。
