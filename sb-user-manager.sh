@@ -7748,13 +7748,21 @@ take_over_installed_manager() {
 # <<< manager_channel_handoff
 
 installed_singbox_version() { "${SINGBOX_BIN:-/usr/local/bin/sing-box}" version 2>/dev/null | awk 'NR==1 {print $3}' || true; }
-# 已知边界：只挡二进制缺失或丢执行位，文件残缺但仍可执行时版本记录依旧被信任。
 installed_nfuse_version() {
-  local bin="${NFUSE_BIN:-/usr/local/bin/nfuse}"
-  # 二进制缺失时版本记录不可信；返回空串让部署流程重新下载。
+  local bin="${NFUSE_BIN:-/usr/local/bin/nfuse}" reported rc=0
+  # 二进制缺失、丢执行位或根本跑不起来时版本记录都不可信；返回空串让部署流程重新下载。
   [[ -x "$bin" ]] || return 0
+  # 残缺的二进制可能挂起而不是立刻失败，因此加超时；没有 timeout 命令的环境退回直接执行。
+  if command -v timeout >/dev/null 2>&1; then
+    reported="$(timeout 5 "$bin" version 2>/dev/null)" || rc=$?
+  else
+    reported="$("$bin" version 2>/dev/null)" || rc=$?
+  fi
+  # 只要能跑起来（正常退出或有输出）就认为二进制可用。版本号仍以记录为准，
+  # 这样 Nfuse 日后改变 version 输出格式时不会被误判为损坏而陷入反复重装。
+  if ((rc != 0)) && [[ -z "$reported" ]]; then return 0; fi
   if [[ -r "$DEPLOYED_VERSIONS_FILE" ]]; then sed -n 's/^NFUSE_VERSION=//p' "$DEPLOYED_VERSIONS_FILE"
-  else "$bin" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true
+  else grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<<"$reported" | head -n1 || true
   fi
 }
 
