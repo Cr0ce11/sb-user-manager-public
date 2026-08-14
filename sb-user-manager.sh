@@ -1231,15 +1231,21 @@ restore_nfuse_snapshot() {
       account_exists=false
       nfuse add "$name" --tier "$tier" --limit "$limit" --anchor "$anchor" >/dev/null || return 1
     fi
+    if [[ "$tier" == c && "$account_exists" == true ]]; then
+      # 存活的自用账户不会被重建，用量需显式归零；快照用量由 restore_tier_c_usage_offsets 记入 usage_offset_bytes。
+      # Nfuse 是否接受对不限额账户设置用量无法在此确认，被拒绝时退回本函数已有的删除重建路径（重建出来的账户用量本来就是 0）。
+      if ! nfuse set-usage "$name" 0 >/dev/null 2>&1; then
+        log "提示：自用用户 ${name} 的流量记录无法直接归零，改用删除后重建的方式恢复"
+        nfuse rm "$name" --cascade >/dev/null || return 1
+        nfuse add "$name" --tier "$tier" --limit "$limit" --anchor "$anchor" >/dev/null || return 1
+      fi
+    fi
     while IFS= read -r port_spec; do
       [[ -n "$port_spec" ]] || continue
       nfuse port add "$name" "$port_spec" >/dev/null || return 1
     done < <(jq -r '.ports[] | if .start == .end then (.start|tostring) else ((.start|tostring) + "-" + (.end|tostring)) end' <<<"$account")
     if [[ "$tier" != c ]]; then
       nfuse set-usage "$name" "$used" >/dev/null || return 1
-    elif [[ "$account_exists" == true ]]; then
-      # 存活的自用账户不会被重建，用量需显式归零；快照用量由 restore_tier_c_usage_offsets 记入 usage_offset_bytes
-      nfuse set-usage "$name" 0 >/dev/null || return 1
     fi
     current_json="$(nfuse list --json)" || return 1
   done <<<"$desired_names"
@@ -1329,7 +1335,11 @@ commit_operation_transaction() {
   if [[ -f "$CONF_FILE" ]]; then sync_transaction_path "$CONF_FILE" || return 1; fi
   if [[ -f "$nfuse_db" ]]; then sync_transaction_path "$nfuse_db" || return 1; fi
   if [[ -f "$nfuse_db-wal" ]]; then sync_transaction_path "$nfuse_db-wal" || return 1; fi
-  clear_operation_transaction || return 1
+  # 数据到这里已经全部落盘，本次操作事实上已经提交成功；恢复标记的清理失败不能再当作提交失败，
+  # 否则调用方会在一个字节都没有回滚的情况下告诉用户「操作失败并已恢复」
+  if ! clear_operation_transaction; then
+    log "修改已经保存成功；只是恢复标记未能完全清理，不需要重做本次操作。若下次启动时提示自动恢复，请先运行「服务与配置检查」核对：$TRANSACTION_JOURNAL"
+  fi
   if ! prune_operation_transaction_backups "$OPERATION_BACKUP_RETENTION"; then
     log "提示：旧的内部操作备份暂未能自动整理，不影响本次操作结果"
   fi
