@@ -11353,6 +11353,7 @@ prompt_move_split() {
     read -r -p '移动到第几条（留空保持，输入 0 返回）：' position
     [[ -n "$position" ]] || { echo "顺序未变化。"; return 0; }
     [[ "$position" != 0 ]] || { MENU_RETURNED=true; return 0; }
+    if [[ "$position" =~ ^[0-9]+$ ]]; then position=$((10#$position)); fi
     if [[ "$position" =~ ^[0-9]+$ ]] && ((position >= 1 && position <= count)); then break; fi
     printf '输入无效：请输入 1 到 %s 之间的数字。\n' "$count"
   done

@@ -5,11 +5,21 @@ This is deliberately a conservative, dependency-free Bash scanner rather than a
 full parser.  It follows simple-command boundaries, nested command
 substitutions, loops and case arms closely enough to audit the generated
 manager.  Quoted or dynamically expanded command names are outside this gate.
+
+The same scanner also enforces a small set of call conventions that the manager
+already established in one place but repeatedly lost at sibling call sites.
+Every convention below is deliberately narrow so that the current manager
+reports nothing:
+
+* cancellable prompts must have their exit status checked;
+* `$?` must not be read after an `if` that has no `else`;
+* payloads must reach `qrencode` through stdin instead of argv;
+* a numeric answer typed at a prompt must be normalised with `10#`.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 import sys
 from pathlib import Path
@@ -200,6 +210,21 @@ DISPATCH_FORWARDED_POSITION = {
     "read_validated_value": 4,
     "prompt_user_status_action": 1,
 }
+
+# 这些提示函数在用户取消或输入结束时返回非零，调用点必须检查返回值，
+# 否则会拿着上一轮的全局结果继续执行。参照 select_migration_restore_mode。
+CANCELLABLE_PROMPTS = {
+    "prompt_migration_choice",
+    "read_menu_choice",
+    "read_numbered_index",
+    "read_validated_value",
+    "ui_menu_select",
+}
+PROMPT_GUARD_PREFIXES = {"!", "elif", "if", "until", "while"}
+PROMPT_GUARD_TERMINATORS = {"&&", "||"}
+
+# 命令行参数对同机其他进程可见，涉密内容只能走环境变量或管道。
+STDIN_ONLY_PAYLOAD_TARGETS = {"qrencode"}
 
 
 @dataclass(frozen=True)
@@ -521,7 +546,7 @@ def tokenize(source: str, first_line: int = 1) -> list[list[Token]]:
     return streams
 
 
-def simple_command_arguments(tokens: list[Token], start: int) -> list[Token]:
+def scan_simple_command(tokens: list[Token], start: int) -> tuple[list[Token], int]:
     arguments: list[Token] = []
     i = start
     while i < len(tokens):
@@ -538,7 +563,11 @@ def simple_command_arguments(tokens: list[Token], start: int) -> list[Token]:
             continue
         arguments.append(tokens[i])
         i += 1
-    return arguments
+    return arguments, i
+
+
+def simple_command_arguments(tokens: list[Token], start: int) -> list[Token]:
+    return scan_simple_command(tokens, start)[0]
 
 
 def literal_dispatch_target(token: Token) -> Token | None:
@@ -578,7 +607,21 @@ def dispatched_command_calls(command: str, arguments: list[Token]) -> list[Token
     return calls
 
 
-def command_calls(tokens: list[Token]) -> list[Token]:
+@dataclass
+class ConventionFindings:
+    unchecked_prompts: list[Token] = field(default_factory=list)
+    argv_payloads: list[Token] = field(default_factory=list)
+
+
+def prompt_status_is_checked(tokens: list[Token], index: int, end: int) -> bool:
+    if index > 0 and tokens[index - 1].value in PROMPT_GUARD_PREFIXES:
+        return True
+    return end < len(tokens) and tokens[end].value in PROMPT_GUARD_TERMINATORS
+
+
+def command_calls(
+    tokens: list[Token], findings: ConventionFindings | None = None
+) -> list[Token]:
     calls: list[Token] = []
     expect_command = True
     case_patterns: list[bool] = []
@@ -688,10 +731,114 @@ def command_calls(tokens: list[Token]) -> list[Token]:
             continue
         if token.bare and (COMMAND_NAME.match(value) or value == "["):
             calls.append(token)
-            calls.extend(dispatched_command_calls(value, simple_command_arguments(tokens, i + 1)))
+            arguments, end = scan_simple_command(tokens, i + 1)
+            calls.extend(dispatched_command_calls(value, arguments))
+            if findings is not None:
+                if value in CANCELLABLE_PROMPTS and not prompt_status_is_checked(
+                    tokens, i, end
+                ):
+                    findings.unchecked_prompts.append(token)
+                if value in STDIN_ONLY_PAYLOAD_TARGETS and any(
+                    "$" in argument.value for argument in arguments
+                ):
+                    findings.argv_payloads.append(token)
         expect_command = False
         i += 1
     return calls
+
+
+STATUS_CAPTURE = re.compile(r"^(?:local\s+)?([A-Za-z_][A-Za-z0-9_]*)=\"?\$\?\"?$")
+CLOSING_IF = re.compile(r"(?:^|[;\s])fi$")
+INLINE_ELSE = re.compile(r"(?:^|[;\s])(?:else|elif)(?:[;\s]|$)")
+FUNCTION_BODY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\) \{$")
+PROMPT_READ = re.compile(
+    r"\bread\s+-r\s+-p\s+(?:'[^']*'|\"(?:[^\"\\]|\\.)*\"|\S+)\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
+ARITHMETIC_SPAN = re.compile(r"\(\((.*?)\)\)")
+
+
+def indent_width(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def status_captured_after_if(lines: list[str]) -> list[tuple[str, int]]:
+    """`if ... fi` 没有 else 分支时退出码恒为 0，之后取 $? 拿不到失败码。"""
+    findings: list[tuple[str, int]] = []
+    for index, raw in enumerate(lines):
+        capture = STATUS_CAPTURE.match(raw.strip())
+        if capture is None:
+            continue
+        name = capture.group(1)
+        previous = index - 1
+        while previous >= 0 and not lines[previous].strip():
+            previous -= 1
+        if previous < 0:
+            continue
+        closing = lines[previous].strip()
+        if not CLOSING_IF.search(closing):
+            continue
+        if closing != "fi":
+            if INLINE_ELSE.search(closing) is None:
+                findings.append((name, index + 1))
+            continue
+        indent = indent_width(lines[previous])
+        depth = 0
+        has_else = False
+        scan = previous - 1
+        while scan >= 0:
+            candidate = lines[scan]
+            text = candidate.strip()
+            if text and indent_width(candidate) == indent:
+                if text == "fi":
+                    depth += 1
+                elif text.startswith("if ") or text.startswith("if["):
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif depth == 0 and (text == "else" or text.startswith("elif ")):
+                    has_else = True
+            scan -= 1
+        if not has_else:
+            findings.append((name, index + 1))
+    return findings
+
+
+def unnormalised_prompt_arithmetic(lines: list[str]) -> list[tuple[str, int]]:
+    """用户在提示里输入的十进制数字必须先经 10# 归一，否则 08 会被当成八进制。"""
+    findings: list[tuple[str, int]] = []
+    start = 0
+    while start < len(lines):
+        if FUNCTION_BODY.match(lines[start]) is None:
+            start += 1
+            continue
+        end = start + 1
+        while end < len(lines) and lines[end] != "}":
+            end += 1
+        body = lines[start + 1 : end]
+        prompted = {match for line in body for match in PROMPT_READ.findall(line)}
+        tracked = {
+            name
+            for name in prompted
+            if any(f'"${name}" =~ ^[0-9]+$' in line for line in body)
+        }
+        normalised: set[str] = set()
+        reported: set[str] = set()
+        for offset, line in enumerate(body):
+            for name in sorted(tracked - reported):
+                literal = rf"10#\$\{{?{name}\}}?"
+                if re.search(rf"(?<![A-Za-z0-9_]){name}=\$\(\(\s*{literal}\s*\)\)", line):
+                    normalised.add(name)
+                    continue
+                if name in normalised:
+                    continue
+                bare = re.compile(rf"(?<![A-Za-z0-9_#]){name}(?![A-Za-z0-9_])")
+                for span in ARITHMETIC_SPAN.findall(line):
+                    if bare.search(re.sub(literal, "", span)):
+                        findings.append((name, start + 1 + offset + 1))
+                        reported.add(name)
+                        break
+        start = end + 1
+    return findings
 
 
 def main() -> int:
@@ -703,15 +850,39 @@ def main() -> int:
     defined = set(FUNCTION_DEFINITION.findall(source))
     allowed = defined | SHELL_TARGETS | EXTERNAL_TARGETS
     unknown: dict[tuple[str, int], None] = {}
+    findings = ConventionFindings()
     for stream in tokenize(mask_heredoc_bodies(source)):
-        for call in command_calls(stream):
+        for call in command_calls(stream, findings):
             if call.value not in allowed:
                 unknown[(call.value, call.line)] = None
+    failed = False
     if unknown:
         for name, line in sorted(unknown, key=lambda item: (item[1], item[0])):
             print(f"undefined bare command target {name} at line {line}", file=sys.stderr)
-        return 1
-    return 0
+        failed = True
+    for call in sorted(findings.unchecked_prompts, key=lambda token: token.line):
+        print(
+            f"unchecked cancellable prompt {call.value} at line {call.line}",
+            file=sys.stderr,
+        )
+        failed = True
+    for call in sorted(findings.argv_payloads, key=lambda token: token.line):
+        print(
+            f"payload passed to {call.value} as an argument at line {call.line}",
+            file=sys.stderr,
+        )
+        failed = True
+    lines = source.splitlines()
+    for name, line in status_captured_after_if(lines):
+        print(
+            f"exit status read into {name} after an if without else at line {line}",
+            file=sys.stderr,
+        )
+        failed = True
+    for name, line in unnormalised_prompt_arithmetic(lines):
+        print(f"prompt value {name} used without 10# at line {line}", file=sys.stderr)
+        failed = True
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

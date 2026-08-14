@@ -46,6 +46,28 @@ GitHub 分支保护要求 `validate`、`jq16-compat` 和 `debian-standalone-e2e`
 
 安装了 ShellCheck 时还应运行 CI 中的对应检查。测试失败时不得通过修改测试期望来掩盖行为回归。
 
+## 代码约定门禁
+
+同一种写法一旦在某处确立，兄弟调用点必须跟上。`tests/test-static.sh` 和
+`tests/check-shell-call-targets.py` 把下列约定变成机器检查，改动前先看这里，
+不要在新代码里重新发明写法：
+
+- 可取消的提示函数（`ui_menu_select`、`read_menu_choice`、`read_numbered_index`、
+  `read_validated_value`、`prompt_migration_choice`）返回非零表示用户取消或输入结束，
+  调用点必须检查返回值，不能用分号接着读全局结果。
+- `if ... fi` 没有 `else` 分支时退出码恒为 0，失败码只能像 `run_step_or_rollback`
+  那样写在 `else rc=$?` 里。
+- 涉密内容只能通过环境变量或管道传给外部命令，不能作为命令行参数暴露给同机其他进程。
+- 用户在提示里输入的十进制数字先用 `$((10#$value))` 归一再参与运算，
+  否则 `08` 会被当成八进制。
+- 需要已部署环境的交互入口先调用 `ensure_management_environment_ready` 护栏。
+- 保留现有部署的流程（`deploy_environment false`）必须先判断 sing-box 通道，
+  不得把测试通道静默替换成正式版。
+- 可选文本字段（`outbound_preset`、`rule_preset` 以及三个 `runtime_*_tag`）
+  在本项目里「空字符串」和「字段不存在」是同一个意思，判空一律写
+  `(.field // "") == ""`。`(.field // null)` 对空字符串求值仍是空字符串，
+  会把已保存的空值判成有值。
+
 ## 完成定义
 
 一项代码变更只有在以下条件全部满足时才算完成：
