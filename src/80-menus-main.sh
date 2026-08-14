@@ -49,6 +49,7 @@ prompt_global_sni_change() {
 }
 
 global_sni_menu() {
+  ensure_management_environment_ready || return 0
   local choice
   while true; do
     prepare_menu_screen
@@ -118,6 +119,7 @@ user_management_menu() {
 }
 
 migration_backup_menu() {
+  ensure_management_environment_ready || return 0
   while true; do
     prepare_menu_screen
     ui_menu_begin

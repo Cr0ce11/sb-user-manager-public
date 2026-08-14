@@ -162,11 +162,6 @@ import_migration_backup() {
   echo 'mock migration import'
 }
 
-global_sni_menu() {
-  acquire_test_lock
-  echo 'mock global sni menu'
-}
-
 singbox_channel_menu() {
   acquire_test_lock
   echo 'mock sing-box channel menu'
@@ -405,7 +400,9 @@ def main() -> None:
             expect("系统管理")
             expect_choice_prompt()
             send("6\n")
-            expect("mock global sni menu")
+            expect("默认连接域名（SNI）")
+            expect_choice_prompt()
+            send("0\n")
             expect("系统管理")
             expect_choice_prompt()
             send("7\n")
@@ -429,6 +426,26 @@ def main() -> None:
             expect("系统管理 → 部署与卸载 → 安装或修复环境")
             expect("按回车返回菜单…")
             send("\n")
+            expect("sb-user-manager")
+            expect_choice_prompt()
+            send("3\n")
+            expect("系统管理")
+            expect_choice_prompt()
+            send("5\n")
+            expect("尚未部署管理环境")
+            expect("系统管理 → 部署与卸载 → 安装或修复环境")
+            expect("按回车返回菜单…")
+            send("\n")
+            expect("系统管理")
+            expect_choice_prompt()
+            send("6\n")
+            expect("尚未部署管理环境")
+            expect("系统管理 → 部署与卸载 → 安装或修复环境")
+            expect("按回车返回菜单…")
+            send("\n")
+            expect("系统管理")
+            expect_choice_prompt()
+            send("0\n")
             expect("sb-user-manager")
             expect_choice_prompt()
             if "错误：管理配置不是普通文件".encode("utf-8") in transcript:
