@@ -5325,6 +5325,109 @@ fi
       .runtime_outbound_tag == $runtime_out and .runtime_rule_tag == $runtime_rule)
   ' "$merge_output" >/dev/null
 )
+(
+  STATE_FILE="$work/merge-robust-state.json"
+  SINGBOX_CONFIG="$work/merge-robust-config.json"
+  printf '%s\n' '{"schema_version":3,"users":[{"name":"existing","port":20001,"protocol":"anytls","status":"active","metered":true,"anytls_password":"target-secret","tls_sni":"target.example.com"}],"splits":[]}' > "$STATE_FILE"
+  add_test_migration_runtime_fields "$STATE_FILE"
+  printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rules":[],"rule_set":[]}}' > "$SINGBOX_CONFIG"
+  merge_singbox() { [[ "$1" == format && "$2" == -c ]] && cat "$3"; }
+  SINGBOX_BIN=merge_singbox
+  port_is_listening() { return 1; }
+  nfuse() {
+    if [[ "$1" == list && "$2" == --json ]]; then
+      printf '%s\n' '[{"name":"existing","used_bytes":100}]'
+      return 0
+    fi
+    return 1
+  }
+
+  merge_source="$work/merge-robust-source.json"
+  merge_output="$work/merge-robust-output.json"
+  printf '%s\n' '{"format_version":1,"created_at":"2026-07-15T00:00:00+08:00","script_version":"4.25.7","source_hostname":"source","state":{"schema_version":7,"users":[{"name":"existing","port":20051,"protocol":"anytls","anytls_password":"backup-at","tls_sni":"backup.example.com","endpoints":[{"protocol":"anytls","port":20051,"anytls_password":"backup-at","tls_sni":"backup.example.com"},{"protocol":"ss2022","transport":"direct","port":20052,"ss2022_password":"backup-ss","method":"2022-blake3-aes-128-gcm"}]}],"splits":[],"outbound_presets":[],"rule_presets":[]},"nfuse_usage":[]}' > "$merge_source"
+  add_test_migration_runtime_fields "$merge_source"
+
+  # 用户按 Ctrl-D（EOF）时不能沿用上一次的选择，否则会静默按“覆盖”处理。
+  MIGRATION_CHOICE=2
+  if build_merge_migration_payload "$merge_source" "$merge_output" </dev/null >/dev/null 2>&1; then
+    echo 'EOF at a merge choice prompt should abort instead of reusing the previous answer' >&2
+    exit 1
+  fi
+  jq -e '
+    .merge_summary.users.replaced == 0 and (.state.users|length) == 1 and
+    .state.users[0].anytls_password == "target-secret"
+  ' "$merge_output" >/dev/null
+
+  # 同一个候选用户的两个端点填了同一个端口，必须当场拒绝并重新询问。
+  merge_log="$work/merge-robust-log.txt"
+  if ! printf '3\ndual\n20055\n20055\ndual\n20055\n20056\n' |
+      build_merge_migration_payload "$merge_source" "$merge_output" > "$merge_log"; then
+    echo 'duplicate ports inside one candidate user should be rejected while prompting, not by the final structure check' >&2
+    exit 1
+  fi
+  grep -Fq '两个协议必须使用不同端口' "$merge_log"
+  jq -e '
+    (.state.users|length) == 2 and
+    any(.state.users[]; .name == "dual" and ([.endpoints[].port] | sort) == [20055,20056]) and
+    .merge_summary.users.renamed == 1
+  ' "$merge_output" >/dev/null
+
+  # 合并中途按 Ctrl-D 与选「0. 返回」语义相同：优雅取消回菜单，不能让 die 打死整个脚本。
+  cancel_log="$work/merge-robust-cancel.txt"
+  if printf '1\n' | (
+      cancel_status=0
+      prepare_migration_effective_payload "$merge_source" "$merge_output" || cancel_status=$?
+      printf 'plan-returned:%s\n' "$cancel_status"
+      exit "$cancel_status"
+    ) > "$cancel_log" 2>&1; then
+    echo 'EOF during merge conflict resolution must not report a usable restore plan' >&2
+    exit 1
+  fi
+  cancel_output="$(cat "$cancel_log")"
+  if ! grep -Fq 'plan-returned:1' <<<"$cancel_output"; then
+    echo 'EOF during merge conflict resolution killed the whole script instead of returning to the caller' >&2
+    exit 1
+  fi
+  if grep -Fq '无法生成恢复方案' <<<"$cancel_output"; then
+    echo 'EOF during merge conflict resolution must not die with the "按上方提示处理后重试" wording; there is no such hint on screen' >&2
+    exit 1
+  fi
+  if ! grep -Fq '已取消合并，未修改服务器。' <<<"$cancel_output"; then
+    echo 'EOF during merge conflict resolution must take the same cancellation path as choosing "0. 返回"' >&2
+    exit 1
+  fi
+
+  # 只读的「预览备份」也走同一条准备链，按一次 Ctrl-D 必须回到菜单而不是退出脚本。
+  preview_log="$work/merge-robust-preview.txt"
+  ensure_migration_crypto_dependencies() { :; }
+  prepare_core() { :; }
+  need_cmd() { :; }
+  select_migration_backup() { SELECTED_MIGRATION_BACKUP="$merge_source"; }
+  decrypt_migration_backup() { cp "$1" "$2"; }
+  print_migration_preview() { echo 'unexpected-preview-output'; }
+  if ! printf '1\n' | (
+      preview_status=0
+      preview_migration_backup || preview_status=$?
+      printf 'preview-returned:%s\n' "$preview_status"
+      exit "$preview_status"
+    ) > "$preview_log" 2>&1; then
+    echo 'previewing a backup and pressing Ctrl-D must return to the menu, not abort the manager' >&2
+    exit 1
+  fi
+  preview_output="$(cat "$preview_log")"
+  if ! grep -Fq 'preview-returned:0' <<<"$preview_output"; then
+    echo 'preview_migration_backup did not return to its caller after EOF at a merge choice prompt' >&2
+    exit 1
+  fi
+  if grep -Fq '无法生成恢复方案' <<<"$preview_output"; then
+    echo 'a read-only preview must never die on EOF' >&2
+    exit 1
+  fi
+  if grep -Fq 'unexpected-preview-output' <<<"$preview_output"; then
+    echo 'a cancelled merge must not reach the preview rendering step' >&2
+    exit 1
+  fi
+)
 preview_state="$work/migration-preview-state.json"
 printf '%s\n' '{"schema_version":3,"users":[{"name":"migrate-ss","port":9999},{"name":"removed-user","port":10000}],"splits":[]}' > "$preview_state"
 saved_state_file="$STATE_FILE"
