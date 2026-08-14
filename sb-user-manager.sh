@@ -10108,7 +10108,8 @@ repair_consistency() {
 
 prompt_consistency() {
   local answer
-  ensure_management_environment_ready || return 0
+  # 护栏自己已经提示并暂停过，用 MENU_RETURNED 告诉调用点不要再暂停一次
+  ensure_management_environment_ready || { MENU_RETURNED=true; return 0; }
   prepare_core
   audit_consistency
   ((AUDIT_REPAIRABLE>0)) || return 0
@@ -10659,7 +10660,7 @@ EOF
     read_menu_choice '请选择：' '0,1,2,3,4,5,6' '' '请输入 0-6 之间的数字' || return 0
     choice="$PROMPT_VALUE"
     case "$choice" in
-      1) prompt_consistency; pause_menu;;
+      1) MENU_RETURNED=false; prompt_consistency; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
       2) create_diagnostic_report; pause_menu;;
       3) echo; print_diagnostic_reports || true; pause_menu;;
       4) show_diagnostic_report; pause_menu;;

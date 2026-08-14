@@ -609,14 +609,32 @@ class ConventionFindings:
     argv_payloads: list[Token] = field(default_factory=list)
 
 
-def prompt_status_is_checked(tokens: list[Token], index: int, end: int) -> bool:
+def prompt_status_is_checked(
+    tokens: list[Token], index: int, end: int, lines: list[str] | None = None
+) -> bool:
     if index > 0 and tokens[index - 1].value in PROMPT_GUARD_PREFIXES:
         return True
-    return end < len(tokens) and tokens[end].value in PROMPT_GUARD_TERMINATORS
+    # `{ prompt ...; } || return 1`：命令与 && / || 之间隔着 `;` 和 `}`
+    cursor = end
+    for _ in range(2):
+        if cursor < len(tokens) and tokens[cursor].value in {";", "}"}:
+            cursor += 1
+    if cursor < len(tokens) and tokens[cursor].value in PROMPT_GUARD_TERMINATORS:
+        return True
+    # `prompt ...` 紧跟一行 `rc=$?`：DEVELOPMENT.md 推崇的显式取状态写法
+    if lines is not None:
+        following = tokens[index].line
+        while following < len(lines) and not lines[following].strip():
+            following += 1
+        if following < len(lines) and STATUS_CAPTURE.match(lines[following].strip()):
+            return True
+    return False
 
 
 def command_calls(
-    tokens: list[Token], findings: ConventionFindings | None = None
+    tokens: list[Token],
+    findings: ConventionFindings | None = None,
+    lines: list[str] | None = None,
 ) -> list[Token]:
     calls: list[Token] = []
     expect_command = True
@@ -731,12 +749,13 @@ def command_calls(
             calls.extend(dispatched_command_calls(value, arguments))
             if findings is not None:
                 if value in CANCELLABLE_PROMPTS and not prompt_status_is_checked(
-                    tokens, i, end
+                    tokens, i, end, lines
                 ):
                     findings.unchecked_prompts.append(token)
-                if value in STDIN_ONLY_PAYLOAD_TARGETS and any(
-                    "$" in argument.value for argument in arguments
-                ):
+                # 要守的性质是「涉密内容必须走标准输入」，因此判定依据是命令是否由管道喂入，
+                # 而不是参数里有没有 $ —— 选项值（例如 -l "$level"）本来就允许出现变量
+                fed_by_pipe = i > 0 and tokens[i - 1].value == "|"
+                if value in STDIN_ONLY_PAYLOAD_TARGETS and not fed_by_pipe:
                     findings.argv_payloads.append(token)
         expect_command = False
         i += 1
@@ -822,7 +841,9 @@ def unnormalised_prompt_arithmetic(lines: list[str]) -> list[tuple[str, int]]:
         for offset, line in enumerate(body):
             for name in sorted(tracked - reported):
                 literal = rf"10#\$\{{?{name}\}}?"
-                if re.search(rf"(?<![A-Za-z0-9_]){name}=\$\(\(\s*{literal}\s*\)\)", line):
+                if re.search(
+                    rf'(?<![A-Za-z0-9_]){name}="?\$\(\(\s*{literal}\s*\)\)"?', line
+                ):
                     normalised.add(name)
                     continue
                 if name in normalised:
@@ -843,12 +864,13 @@ def main() -> int:
         return 2
     manager = Path(sys.argv[1])
     source = manager.read_text(encoding="utf-8")
+    source_lines = source.splitlines()
     defined = set(FUNCTION_DEFINITION.findall(source))
     allowed = defined | SHELL_TARGETS | EXTERNAL_TARGETS
     unknown: dict[tuple[str, int], None] = {}
     findings = ConventionFindings()
     for stream in tokenize(mask_heredoc_bodies(source)):
-        for call in command_calls(stream, findings):
+        for call in command_calls(stream, findings, source_lines):
             if call.value not in allowed:
                 unknown[(call.value, call.line)] = None
     failed = False

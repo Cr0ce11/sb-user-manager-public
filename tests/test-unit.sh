@@ -6009,8 +6009,40 @@ grep -Fq 'check_all_migration_backups' <<<"$migration_backup_menu_body"
   ! grep -Fq 'AUDIT_RAN' "$work/prompt-consistency-not-deployed"
   ! grep -Fq 'PREPARE_CORE_RAN' "$work/prompt-consistency-not-deployed"
 )
+# 未部署时仍能生成诊断报告是刻意设计：配置缺失时用内置默认值并在报告里如实标注，
+# 这恰恰是环境装不上时最有用的功能，不得给该菜单加菜单级护栏。
+# 注意断言必须写成显式 if：`! cmd` 在 set -e 下被 errexit 豁免，命中也不会变红。
+# 未部署时的护栏自己已经提示并暂停过，prompt_consistency 必须用 MENU_RETURNED
+# 告诉调用点不要再暂停一次，否则用户要连按两次回车才回得去菜单。
+(
+  CONF_FILE="$work/consistency-guard-missing.conf"
+  rm -f -- "$CONF_FILE"
+  pause_count=0
+  pause_menu() { pause_count=$((pause_count + 1)); }
+  MENU_RETURNED=false
+  prompt_consistency > "$work/consistency-guard.out" 2>&1
+  if [[ "$MENU_RETURNED" != true ]]; then
+    echo 'prompt_consistency must report that the guard already returned to the menu' >&2
+    exit 1
+  fi
+  if [[ "$pause_count" != 1 ]]; then
+    echo "the guard must pause exactly once, saw $pause_count" >&2
+    exit 1
+  fi
+  grep -Fq '尚未部署管理环境' "$work/consistency-guard.out"
+)
+# 调用点必须遵守 MENU_RETURNED，否则护栏暂停之后还会再暂停一次
+diagnostic_menu_dispatch="$(declare -f diagnostic_report_menu | tr -s '[:space:]' ' ')"
+if ! grep -Fq 'MENU_RETURNED=false; prompt_consistency; [[ "$MENU_RETURNED" == true ]] || pause_menu' <<<"$diagnostic_menu_dispatch"; then
+  echo 'diagnostic_report_menu must not pause again after the guard already did' >&2
+  exit 1
+fi
+
 diagnostic_report_menu_body="$(declare -f diagnostic_report_menu)"
-! grep -Fq 'ensure_management_environment_ready' <<<"$diagnostic_report_menu_body"
+if grep -Fq 'ensure_management_environment_ready' <<<"$diagnostic_report_menu_body"; then
+  echo 'diagnostic_report_menu must stay usable on an undeployed server; do not add a menu-level guard' >&2
+  exit 1
+fi
 
 SB_SYSTEM_ROOT="$work/snapshot-system"
 ENVIRONMENT_BACKUP_BASE="$work/environment-backups"
