@@ -120,14 +120,14 @@ chmod 700 "$work/bin/gh"
 
 immutable_args="$work/immutable-args"
 PATH="$work/bin:$PATH" \
-  GITHUB_REPOSITORY='DTB201/sb-user-manager-public' \
+  GITHUB_REPOSITORY='Cr0ce11/sb-user-manager-public' \
   SB_GH_ARGS_LOG="$immutable_args" \
   bash "$immutable_check" >/dev/null
-grep -Fxq 'api --method GET repos/DTB201/sb-user-manager-public/immutable-releases' "$immutable_args"
+grep -Fxq 'api --method GET repos/Cr0ce11/sb-user-manager-public/immutable-releases' "$immutable_args"
 
 for rejected_fixture in disabled missing malformed api-failure; do
   if PATH="$work/bin:$PATH" \
-    GITHUB_REPOSITORY='DTB201/sb-user-manager-public' \
+    GITHUB_REPOSITORY='Cr0ce11/sb-user-manager-public' \
     SB_GH_ARGS_LOG="$immutable_args" \
     SB_IMMUTABLE_FIXTURE="$rejected_fixture" \
     bash "$immutable_check" >/dev/null 2>&1; then

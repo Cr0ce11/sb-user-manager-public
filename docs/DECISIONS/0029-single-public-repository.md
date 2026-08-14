@@ -2,23 +2,23 @@
 
 ## 状态
 
-已接受并执行。关联 [公开 Issue #15](https://github.com/DTB201/sb-user-manager-public/issues/15)。
+已接受并执行。关联 [公开 Issue #15](https://github.com/Cr0ce11/sb-user-manager-public/issues/15)。
 
 ## 背景
 
-[ADR 0028](0028-clean-public-repository-transition.md) 为避免公开未经审计的历史，先用干净快照建立 `DTB201/sb-user-manager-public`，同时暂时保留原私有仓库和双版本发布。公开仓库随后完成了 v4.23.1 至 v4.25.2 的独立开发、完整 CI、匿名在线更新、分支保护与不可变 Release 验证，已经具备完整续作能力。
+[ADR 0028](0028-clean-public-repository-transition.md) 为避免公开未经审计的历史，先用干净快照建立 `Cr0ce11/sb-user-manager-public`，同时暂时保留原私有仓库和双版本发布。公开仓库随后完成了 v4.23.1 至 v4.25.2 的独立开发、完整 CI、匿名在线更新、分支保护与不可变 Release 验证，已经具备完整续作能力。
 
 继续维护双仓库会增加同步、凭据、Actions 额度和发布核对成本。原 v5 入口控制器与多落地方向从未开放正式数据面，项目所有者也不再需要其历史作为续作入口。
 
 ## 决定
 
-1. `DTB201/sb-user-manager-public` 是唯一正式仓库。新需求、缺陷、分支、Pull Request、CI、发布和安全报告全部在这里完成。
+1. `Cr0ce11/sb-user-manager-public` 是唯一正式仓库。新需求、缺陷、分支、Pull Request、CI、发布和安全报告全部在这里完成。
 2. 私有版、分享版双版本发布永久停止；原私有仓库在公开治理 PR 与 CI 通过后删除，不改名、不转为公开。
 3. 公开 Release 继续只发布 `sb-user-manager.sh` 及其 SHA-256，管理脚本匿名查询公开 Release。
 4. 继续保留旧私有版到同版本或更高公开版的受控接管、旧脚本元数据识别，以及对旧 `GITHUB_TOKEN` 配置的兼容丢弃。这些是现存低版本服务器的迁移安全网，不代表继续支持私有发布。
 5. 公开版不再承诺切回私有渠道。已经接管成功的服务器后续只从公开仓库更新。
-6. 原 v5 产品方向永久终止。已经进入已发布脚本的休眠基础由 [公开 Issue #17](https://github.com/DTB201/sb-user-manager-public/issues/17) 分阶段移除，不与仓库退役混做；最终只保留两个遗留 helper 文件名的失败关闭保护，避免旧符号链接误入普通菜单。
-7. 原私有仓库中的 Mihomo 候选需求以 [公开 Issue #16](https://github.com/DTB201/sb-user-manager-public/issues/16) 重新记录；其余私有双版本和 v5 开放事项不迁移。
+6. 原 v5 产品方向永久终止。已经进入已发布脚本的休眠基础由 [公开 Issue #17](https://github.com/Cr0ce11/sb-user-manager-public/issues/17) 分阶段移除，不与仓库退役混做；最终只保留两个遗留 helper 文件名的失败关闭保护，避免旧符号链接误入普通菜单。
+7. 原私有仓库中的 Mihomo 候选需求以 [公开 Issue #16](https://github.com/Cr0ce11/sb-user-manager-public/issues/16) 重新记录；其余私有双版本和 v5 开放事项不迁移。
 8. 保持公开仓库名称不变，避免破坏已经安装的公开版更新地址。
 
 ## 安全门禁
