@@ -211,6 +211,10 @@ grep -Fq 'build_split_runtime_plan()' sb-user-manager.sh
 grep -Fq 'stable_managed_tag()' sb-user-manager.sh
 grep -Fq 'validate_split_relationships()' sb-user-manager.sh
 grep -Fq 'migrate_shared_preset_runtime_configs()' sb-user-manager.sh
+grep -Fq 'split_preset_fields_are_current()' sb-user-manager.sh
+grep -Fq 'state_normalize_split_preset_fields()' sb-user-manager.sh
+grep -Fq 'migrate_empty_split_preset_fields()' sb-user-manager.sh
+[[ "$(grep -Fc 'migrate_empty_split_preset_fields' sb-user-manager.sh)" == 2 ]]
 grep -Fq 'if ! cmd_split_add "$name" "$url" "$scope" "$user" "$upstream" "$outbound_tag" "$rule_preset" "$outbound_preset"; then' sb-user-manager.sh
 grep -Fq '分流没有添加，现有配置没有改变。' sb-user-manager.sh
 grep -Fq 'SHARED_PRESET_RUNTIME_MARKER=' sb-user-manager.sh

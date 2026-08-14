@@ -57,6 +57,7 @@ ensure_manager_shortcut_for_interactive_startup() { record_stub_result sync-shor
 recover_transaction_before_menu() { record_stub_result recover-state; }
 migrate_backup_retention_once() { record_call migrate-backup-retention; }
 migrate_legacy_ss2022_udp_inbounds() { record_call migrate-udp; }
+migrate_empty_split_preset_fields() { record_call migrate-split-preset-fields; }
 migrate_shared_preset_runtime_configs() { record_call migrate-presets; }
 interactive_main() { record_stub_result standalone-menu; }
 prepare_core() { record_stub_result prepare-core; }
@@ -100,7 +101,7 @@ done
 # 交互启动保留原 standalone 顺序；全新服务器也只进入现有主菜单，不自动部署。
 reset_calls
 run_standalone_interactive_startup || fail 'interactive startup failed'
-assert_log $'recover-environment\nhandoff:interactive\nharden-backups\nsync-launch-copy\nsync-shortcut\nrecover-state\nmigrate-backup-retention\nmigrate-udp\nmigrate-presets\nstandalone-menu'
+assert_log $'recover-environment\nhandoff:interactive\nharden-backups\nsync-launch-copy\nsync-shortcut\nrecover-state\nmigrate-backup-retention\nmigrate-udp\nmigrate-split-preset-fields\nmigrate-presets\nstandalone-menu'
 
 # 关键步骤在条件调用上下文中也必须显式失败即止，不能依赖 set -e。
 for failure_case in \
@@ -109,7 +110,7 @@ for failure_case in \
   'sync-launch-copy|recover-environment;handoff:interactive;harden-backups;sync-launch-copy' \
   'sync-shortcut|recover-environment;handoff:interactive;harden-backups;sync-launch-copy;sync-shortcut' \
   'recover-state|recover-environment;handoff:interactive;harden-backups;sync-launch-copy;sync-shortcut;recover-state' \
-  'standalone-menu|recover-environment;handoff:interactive;harden-backups;sync-launch-copy;sync-shortcut;recover-state;migrate-backup-retention;migrate-udp;migrate-presets;standalone-menu'; do
+  'standalone-menu|recover-environment;handoff:interactive;harden-backups;sync-launch-copy;sync-shortcut;recover-state;migrate-backup-retention;migrate-udp;migrate-split-preset-fields;migrate-presets;standalone-menu'; do
   FAIL_AT="${failure_case%%|*}"
   expected_calls="${failure_case#*|}"
   expected_calls="${expected_calls//;/$'\n'}"
@@ -125,10 +126,11 @@ FAIL_AT=""
 harden_existing_environment_backups() { record_call harden-backups; return 1; }
 migrate_backup_retention_once() { record_call migrate-backup-retention; return 1; }
 migrate_legacy_ss2022_udp_inbounds() { record_call migrate-udp; return 1; }
+migrate_empty_split_preset_fields() { record_call migrate-split-preset-fields; return 1; }
 migrate_shared_preset_runtime_configs() { record_call migrate-presets; return 1; }
 reset_calls
 run_standalone_interactive_startup || fail 'warning path stopped the standalone menu'
-assert_log $'recover-environment\nhandoff:interactive\nharden-backups\nwarning\nsync-launch-copy\nsync-shortcut\nrecover-state\nmigrate-backup-retention\nwarning\nmigrate-udp\nwarning\nmigrate-presets\nwarning\nstandalone-menu'
+assert_log $'recover-environment\nhandoff:interactive\nharden-backups\nwarning\nsync-launch-copy\nsync-shortcut\nrecover-state\nmigrate-backup-retention\nwarning\nmigrate-udp\nwarning\nmigrate-split-preset-fields\nwarning\nmigrate-presets\nwarning\nstandalone-menu'
 
 # 全新或不完整环境中的无人值守到期任务必须失败关闭，不能移交或修改运行状态。
 rm -rf -- "$SB_SYSTEM_ROOT"

@@ -644,6 +644,41 @@ write_shared_preset_runtime_marker() {
   mv -- "$tmp" "$SHARED_PRESET_RUNTIME_MARKER"
 }
 
+split_preset_fields_are_current() {
+  [[ -r "$STATE_FILE" ]] || return 1
+  [[ "$(jq '[.splits[]? | select(.rule_preset == "" or .outbound_preset == "")] | length' "$STATE_FILE")" == 0 ]]
+}
+
+state_normalize_split_preset_fields() {
+  atomic_state_update '
+    .splits |= map(
+      (if .rule_preset == "" then del(.rule_preset) else . end) |
+      (if .outbound_preset == "" then del(.outbound_preset) else . end))
+  '
+}
+
+migrate_empty_split_preset_fields() {
+  [[ -r "$CONF_FILE" ]] || return 0
+  command -v jq >/dev/null || return 0
+  command -v flock >/dev/null || return 0
+  load_runtime_config || return 1
+  [[ -f "$STATE_FILE" && -f "$SINGBOX_CONFIG" && -x "$SINGBOX_BIN" && -x "$NFUSE_BIN" && -S "$NFUSE_SOCKET" ]] || return 0
+  split_preset_fields_are_current && return 0
+  exec 9>"$LOCK_FILE" || return 1
+  if ! flock -n 9; then release_operation_lock; return 1; fi
+  if ! recover_pending_transaction || ! init_state; then release_operation_lock; return 1; fi
+  if split_preset_fields_are_current; then
+    release_operation_lock
+    return 0
+  fi
+  if ! state_normalize_split_preset_fields; then
+    release_operation_lock
+    return 1
+  fi
+  log "已修正分流缺少预置来源时留下的空白记录"
+  release_operation_lock
+}
+
 migrate_shared_preset_runtime_configs() {
   [[ -r "$CONF_FILE" ]] || return 0
   command -v jq >/dev/null || return 0
@@ -680,7 +715,9 @@ state_add_split() {
   ) as $upstream |
     .splits += [{name:$name,url:$url,scope:$scope,user:(if $scope == "user" then $user else null end),upstream:$upstream,outbound_tag:$out_tag,rule_set_tag:$rule_tag,
       runtime_rule_tag:$runtime_rule_tag,runtime_outbound_tag:$runtime_outbound_tag,runtime_transport_tag:$runtime_transport_tag,
-      rule_preset:$rule_preset,outbound_preset:$outbound_preset,status:"active",created_at:$created_at}]
+      rule_preset:$rule_preset,outbound_preset:$outbound_preset,status:"active",created_at:$created_at}
+      | (if $rule_preset == "" then del(.rule_preset) else . end)
+      | (if $outbound_preset == "" then del(.outbound_preset) else . end)]
   ' --arg name "$1" --arg url "$2" --arg scope "$3" --arg user "$4" \
     --arg out_tag "$6" --arg rule_tag "$7" --arg rule_preset "$8" --arg outbound_preset "$9" \
     --arg runtime_rule_tag "${10}" --arg runtime_outbound_tag "${11}" --arg runtime_transport_tag "${12}" \
@@ -699,7 +736,9 @@ state_replace_split() {
     (.splits[] | select(.name == $name)) |=
       (. + {url:$url,scope:$scope,user:(if $scope == "user" then $user else null end),upstream:$upstream,outbound_tag:$out_tag,
         runtime_rule_tag:$runtime_rule_tag,runtime_outbound_tag:$runtime_outbound_tag,runtime_transport_tag:$runtime_transport_tag,
-        rule_preset:$rule_preset,outbound_preset:$outbound_preset,updated_at:$updated_at})
+        updated_at:$updated_at}
+       | (if $rule_preset == "" then del(.rule_preset) else .rule_preset = $rule_preset end)
+       | (if $outbound_preset == "" then del(.outbound_preset) else .outbound_preset = $outbound_preset end))
   ' --arg name "$1" --arg url "$2" --arg scope "$3" --arg user "$4" \
     --arg out_tag "$6" --arg rule_preset "$7" --arg outbound_preset "$8" \
     --arg runtime_rule_tag "$9" --arg runtime_outbound_tag "${10}" --arg runtime_transport_tag "${11}" \
