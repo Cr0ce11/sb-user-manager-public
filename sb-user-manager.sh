@@ -1188,6 +1188,7 @@ validate_transaction_journal() {
 restore_nfuse_snapshot() {
   local stamp="$1" snapshot before_state
   local current_json managed_names desired_names name account tier limit anchor used port_spec port_id account_exists
+  local set_usage_error
   snapshot="$BACKUP_DIR/nfuse.json.$stamp"
   before_state="$BACKUP_DIR/managed-users.json.$stamp"
   [[ -r "$snapshot" && -r "$before_state" && -r "$STATE_FILE" ]] || return 1
@@ -1234,10 +1235,17 @@ restore_nfuse_snapshot() {
     if [[ "$tier" == c && "$account_exists" == true ]]; then
       # 存活的自用账户不会被重建，用量需显式归零；快照用量由 restore_tier_c_usage_offsets 记入 usage_offset_bytes。
       # Nfuse 是否接受对不限额账户设置用量无法在此确认，被拒绝时退回本函数已有的删除重建路径（重建出来的账户用量本来就是 0）。
-      if ! nfuse set-usage "$name" 0 >/dev/null 2>&1; then
-        log "提示：自用用户 ${name} 的流量记录无法直接归零，改用删除后重建的方式恢复"
+      set_usage_error=""
+      if ! set_usage_error="$(nfuse set-usage "$name" 0 2>&1 >/dev/null)"; then
+        # 保留 Nfuse 的原始错误，管理员据此才能分辨「不支持这个操作」和「Nfuse 临时不可用」
+        log "提示：自用用户 ${name} 的流量记录无法直接归零（${set_usage_error:-无错误输出}），改用删除后重建的方式恢复"
         nfuse rm "$name" --cascade >/dev/null || return 1
-        nfuse add "$name" --tier "$tier" --limit "$limit" --anchor "$anchor" >/dev/null || return 1
+        # 账户此刻已从流量库删除，重建失败会让它彻底丢失。此处不隐瞒，直接给出可照抄的重建命令，
+        # 否则管理员只看到一句「自动恢复失败」，无从知道有个账户需要补回。
+        if ! nfuse add "$name" --tier "$tier" --limit "$limit" --anchor "$anchor" >/dev/null; then
+          log "严重错误：自用用户 ${name} 已从流量库删除但未能重建。请在排除 Nfuse 故障后手工执行：nfuse add ${name} --tier ${tier} --limit ${limit} --anchor ${anchor}"
+          return 1
+        fi
       fi
     fi
     while IFS= read -r port_spec; do
@@ -1281,11 +1289,16 @@ restore_tier_c_usage_offsets() {
   sync_transaction_path "$STATE_FILE"
 }
 
+# 返回码区分两种性质完全不同的失败，调用方必须分别处理：
+#   0 恢复标记已删除
+#   1 恢复标记已删除，但目录同步未完成（无害，下次启动不会误判为待恢复）
+#   2 恢复标记仍在磁盘上（危险，下次启动会按它自动回滚）
 clear_operation_transaction() {
   local rc=0
   # 内存状态必须无条件复位，否则删除成功、同步失败时会留下没有日志保护的空嵌套
   rm -f -- "$TRANSACTION_JOURNAL" || rc=1
   sync_transaction_path "$TRANSACTION_DIR" || rc=1
+  [[ ! -e "$TRANSACTION_JOURNAL" && ! -L "$TRANSACTION_JOURNAL" ]] || rc=2
   ACTIVE_TRANSACTION_STAMP=""
   ACTIVE_TRANSACTION_OPERATION=""
   ACTIVE_TRANSACTION_DEPTH=0
@@ -1303,15 +1316,22 @@ rollback_operation_transaction() {
   trap - ERR
   clear_signal_rollback
   log "上次操作未正常完成，正在自动恢复修改前的数据：$operation"
-  # 三个恢复动作必须各自执行完，避免前一步失败时留下只回滚了一半的混合状态
+  # 前两个恢复动作互不依赖，必须各自执行完，避免前一步失败时留下只回滚了一半的混合状态。
+  # 第三步把快照里的自用用量累加进状态文件的 usage_offset_bytes，前提是 restore_backup
+  # 已经把状态文件还原到操作前；还原失败时必须跳过，否则每次自动恢复都会重复累加一次。
   restore_nfuse_snapshot "$stamp" || failed=true
-  restore_backup "$stamp" || failed=true
-  restore_tier_c_usage_offsets "$stamp" || failed=true
+  if restore_backup "$stamp"; then
+    restore_tier_c_usage_offsets "$stamp" || failed=true
+  else
+    failed=true
+  fi
   if [[ "$failed" == true ]]; then
     log "严重错误：自动恢复失败。为避免扩大问题，请勿继续修改用户或分流；恢复记录和备份已保留"
     return 1
   fi
-  if ! clear_operation_transaction; then
+  local clear_rc=0
+  clear_operation_transaction || clear_rc=$?
+  if ((clear_rc >= 2)); then
     log "严重错误：数据已经恢复，但无法清除恢复标记：$TRANSACTION_JOURNAL"
     return 1
   fi
@@ -1335,10 +1355,18 @@ commit_operation_transaction() {
   if [[ -f "$CONF_FILE" ]]; then sync_transaction_path "$CONF_FILE" || return 1; fi
   if [[ -f "$nfuse_db" ]]; then sync_transaction_path "$nfuse_db" || return 1; fi
   if [[ -f "$nfuse_db-wal" ]]; then sync_transaction_path "$nfuse_db-wal" || return 1; fi
-  # 数据到这里已经全部落盘，本次操作事实上已经提交成功；恢复标记的清理失败不能再当作提交失败，
-  # 否则调用方会在一个字节都没有回滚的情况下告诉用户「操作失败并已恢复」
-  if ! clear_operation_transaction; then
-    log "修改已经保存成功；只是恢复标记未能完全清理，不需要重做本次操作。若下次启动时提示自动恢复，请先运行「服务与配置检查」核对：$TRANSACTION_JOURNAL"
+  # 数据到这里已经全部落盘，本次操作事实上已经提交成功。恢复标记删掉了但目录没同步不影响结果，
+  # 不能再当作提交失败，否则调用方会在一个字节都没有回滚的情况下告诉用户「操作失败并已恢复」。
+  # 但恢复标记仍在磁盘上是另一回事：下次启动会按它无条件自动回滚，把这次改动悄悄撤销，
+  # 此时必须如实报告失败，让调用方当场回滚并明确告知，而不是先说成功、事后被静默退回。
+  local clear_rc=0
+  clear_operation_transaction || clear_rc=$?
+  if ((clear_rc >= 2)); then
+    log "错误：修改已经保存，但恢复标记未能删除，下次启动会按它自动撤销本次修改：$TRANSACTION_JOURNAL"
+    return 1
+  fi
+  if ((clear_rc != 0)); then
+    log "提示：修改已经保存成功，恢复标记也已删除，只是目录同步未完成；不需要重做本次操作"
   fi
   if ! prune_operation_transaction_backups "$OPERATION_BACKUP_RETENTION"; then
     log "提示：旧的内部操作备份暂未能自动整理，不影响本次操作结果"
@@ -10080,7 +10108,8 @@ repair_consistency() {
 
 prompt_consistency() {
   local answer
-  ensure_management_environment_ready || return 0
+  # 护栏自己已经提示并暂停过，用 MENU_RETURNED 告诉调用点不要再暂停一次
+  ensure_management_environment_ready || { MENU_RETURNED=true; return 0; }
   prepare_core
   audit_consistency
   ((AUDIT_REPAIRABLE>0)) || return 0
@@ -10631,7 +10660,7 @@ EOF
     read_menu_choice '请选择：' '0,1,2,3,4,5,6' '' '请输入 0-6 之间的数字' || return 0
     choice="$PROMPT_VALUE"
     case "$choice" in
-      1) prompt_consistency; pause_menu;;
+      1) MENU_RETURNED=false; prompt_consistency; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
       2) create_diagnostic_report; pause_menu;;
       3) echo; print_diagnostic_reports || true; pause_menu;;
       4) show_diagnostic_report; pause_menu;;
