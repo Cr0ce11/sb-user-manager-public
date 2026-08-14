@@ -49,6 +49,7 @@ prompt_global_sni_change() {
 }
 
 global_sni_menu() {
+  ensure_management_environment_ready || return 0
   local choice
   while true; do
     prepare_menu_screen
@@ -137,15 +138,15 @@ migration_backup_menu() {
     ui_back_item '返回上一级'
     ui_menu_select || return 0
     case "$UI_MENU_ACTION" in
-      create) MENU_RETURNED=false; create_migration_backup; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
-      import) import_migration_backup; pause_menu;;
-      list) echo; show_backup_storage_overview; echo; print_migration_backups || true; pause_menu;;
+      create) ensure_management_environment_ready || continue; MENU_RETURNED=false; create_migration_backup; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
+      import) ensure_management_environment_ready || continue; import_migration_backup; pause_menu;;
+      list) ensure_management_environment_ready || continue; echo; show_backup_storage_overview; echo; print_migration_backups || true; pause_menu;;
       details) show_migration_backup_details; pause_menu;;
-      check) MENU_RETURNED=false; preview_migration_backup; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
+      check) ensure_management_environment_ready || continue; MENU_RETURNED=false; preview_migration_backup; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
       check_all) MENU_RETURNED=false; check_all_migration_backups; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
-      restore) MENU_RETURNED=false; restore_migration_backup; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
+      restore) ensure_management_environment_ready || continue; MENU_RETURNED=false; restore_migration_backup; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
       remove) delete_migration_backup; pause_menu;;
-      cleanup) cleanup_backup_retention; pause_menu;;
+      cleanup) ensure_management_environment_ready || continue; cleanup_backup_retention; pause_menu;;
       reports) migration_report_menu;;
       back) return 0;;
     esac
