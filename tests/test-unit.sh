@@ -187,7 +187,10 @@ EOF
   [[ "$MENU_RETURNED" == true ]]
 ) > "$work/state-three-protocol-menu.txt"
 grep -Fq '添加原生 SS2022' "$work/state-three-protocol-menu.txt"
-! grep -Fq '添加 SS2022 + ShadowTLS' "$work/state-three-protocol-menu.txt"
+if grep -Fq '添加 SS2022 + ShadowTLS' "$work/state-three-protocol-menu.txt"; then
+  echo 'unexpected 添加 SS2022 + ShadowTLS in $work/state-three-protocol-menu.txt' >&2
+  exit 1
+fi
 
 # 不计量用户的 metered=false 是合法状态；添加共享入口时不能把 jq -e 对 false 的
 # 返回码误判成读取失败，也不能在事务开始前静默退出。
@@ -604,9 +607,18 @@ for split_operation in \
   cmd_split_add cmd_split_disable cmd_split_enable cmd_split_remove cmd_split_edit cmd_split_move; do
   split_operation_body="$(declare -f "$split_operation")"
   [[ "$(grep -Fc 'rebuild_and_finish_split_operation' <<<"$split_operation_body")" == 1 ]]
-  ! grep -Fq 'run_managed_step rebuild_all_split_configs' <<<"$split_operation_body"
-  ! grep -Fq 'run_managed_step check_singbox_and_restart' <<<"$split_operation_body"
-  ! grep -Fq 'finish_managed_operation' <<<"$split_operation_body"
+  if grep -Fq 'run_managed_step rebuild_all_split_configs' <<<"$split_operation_body"; then
+    echo 'unexpected run_managed_step rebuild_all_split_configs in $split_operation_body' >&2
+    exit 1
+  fi
+  if grep -Fq 'run_managed_step check_singbox_and_restart' <<<"$split_operation_body"; then
+    echo 'unexpected run_managed_step check_singbox_and_restart in $split_operation_body' >&2
+    exit 1
+  fi
+  if grep -Fq 'finish_managed_operation' <<<"$split_operation_body"; then
+    echo 'unexpected finish_managed_operation in $split_operation_body' >&2
+    exit 1
+  fi
 done
 
 # 交互输入的编号必须先按十进制归一，否则 03 会带着前导零传给下游 jq。
@@ -700,10 +712,22 @@ EOF
 for migration_entry in preview_migration_backup restore_migration_backup; do
   migration_entry_body="$(declare -f "$migration_entry")"
   [[ "$(grep -Fc 'prepare_migration_payload_files "$SELECTED_MIGRATION_BACKUP" "$source_payload" "$payload"' <<<"$migration_entry_body")" == 1 ]]
-  ! grep -Fq 'decrypt_migration_backup "$SELECTED_MIGRATION_BACKUP"' <<<"$migration_entry_body"
-  ! grep -Fq 'normalize_migration_payload_schema "$source_payload"' <<<"$migration_entry_body"
-  ! grep -Fq 'validate_migration_payload_structure "$source_payload"' <<<"$migration_entry_body"
-  ! grep -Fq 'prepare_migration_effective_payload "$source_payload"' <<<"$migration_entry_body"
+  if grep -Fq 'decrypt_migration_backup "$SELECTED_MIGRATION_BACKUP"' <<<"$migration_entry_body"; then
+    echo 'unexpected decrypt_migration_backup "$SELECTED_MIGRATION_BACKUP" in $migration_entry_body' >&2
+    exit 1
+  fi
+  if grep -Fq 'normalize_migration_payload_schema "$source_payload"' <<<"$migration_entry_body"; then
+    echo 'unexpected normalize_migration_payload_schema "$source_payload" in $migration_entry_body' >&2
+    exit 1
+  fi
+  if grep -Fq 'validate_migration_payload_structure "$source_payload"' <<<"$migration_entry_body"; then
+    echo 'unexpected validate_migration_payload_structure "$source_payload" in $migration_entry_body' >&2
+    exit 1
+  fi
+  if grep -Fq 'prepare_migration_effective_payload "$source_payload"' <<<"$migration_entry_body"; then
+    echo 'unexpected prepare_migration_effective_payload "$source_payload" in $migration_entry_body' >&2
+    exit 1
+  fi
 done
 
 # 只有当前 SSH 的回连套接字确实归 sing-box 所有时才阻止重启；普通直连和无法判断的连接保持可用。
@@ -1541,8 +1565,14 @@ grep -Fxq 'external executable' "$atomic_install_external"
     exit 1
   fi
   grep -Fxq 'restart nfuse sing-box' "$service_events"
-  ! grep -Fq 'unexpected-ready' "$service_events"
-  ! grep -Fq 'start sb-user-expiry.timer' "$service_events"
+  if grep -Fq 'unexpected-ready' "$service_events"; then
+    echo 'unexpected unexpected-ready in $service_events' >&2
+    exit 1
+  fi
+  if grep -Fq 'start sb-user-expiry.timer' "$service_events"; then
+    echo 'unexpected start sb-user-expiry.timer in $service_events' >&2
+    exit 1
+  fi
 )
 
 (
@@ -1571,7 +1601,10 @@ grep -Fxq 'external executable' "$atomic_install_external"
   exec 8>"$work/shared-restore-failed.lock"
   restore_failed_environment_change unit-action /unit/broken-snapshot "$failed_work" > "$failed_log"
   grep -Fq '环境快照自动恢复失败' "$failed_log"
-  ! grep -Fq 'unexpected-clear' "$failed_log"
+  if grep -Fq 'unexpected-clear' "$failed_log"; then
+    echo 'unexpected unexpected-clear in $failed_log' >&2
+    exit 1
+  fi
   [[ ! -e "$failed_work" && -e "$failed_journal" ]]
   if { printf x >&8; } 2>/dev/null; then
     echo 'failed environment snapshot restore should release fd 8' >&2
@@ -1762,10 +1795,16 @@ grep -Fxq 'FLOW:fetch:false' "$work/install-fresh"
 grep -Fxq 'FLOW:deploy:true:' "$work/install-fresh"
 exercise_install_flow fresh n > "$work/install-fresh-cancel"
 grep -Fq '已取消部署' "$work/install-fresh-cancel"
-! grep -Fq 'FLOW:' "$work/install-fresh-cancel"
+if grep -Fq 'FLOW:' "$work/install-fresh-cancel"; then
+  echo 'unexpected FLOW: in $work/install-fresh-cancel' >&2
+  exit 1
+fi
 exercise_install_flow managed_complete '' > "$work/install-complete"
 grep -Fq '安装完整' "$work/install-complete"
-! grep -Fq 'FLOW:' "$work/install-complete"
+if grep -Fq 'FLOW:' "$work/install-complete"; then
+  echo 'unexpected FLOW: in $work/install-complete' >&2
+  exit 1
+fi
 
 exercise_install_flow managed_partial 1 > "$work/install-repair"
 grep -Fxq 'FLOW:prerequisites' "$work/install-repair"
@@ -1792,7 +1831,10 @@ install_repair_without_config_rc=$?
 set -e
 [[ "$install_repair_without_config_rc" == 0 ]]
 grep -Fxq 'FLOW:deploy:false:' "$work/install-repair-without-config"
-! grep -Fq 'unbound variable' "$work/install-repair-without-config"
+if grep -Fq 'unbound variable' "$work/install-repair-without-config"; then
+  echo 'unexpected unbound variable in $work/install-repair-without-config' >&2
+  exit 1
+fi
 
 # 自动修复必须沿用当前 sing-box 通道；测试版不能被静默换回正式版。
 install_flow_preview_bin="$work/install-flow-preview-sing-box"
@@ -1826,7 +1868,10 @@ grep -Fxq 'FLOW:singbox:1.13.14' "$work/install-repair-stable"
 exercise_install_flow external $'1\ny' > "$work/install-takeover"
 grep -Fxq 'FLOW:prerequisites' "$work/install-takeover"
 grep -Fxq 'FLOW:takeover' "$work/install-takeover"
-! grep -Fq 'FLOW:deploy' "$work/install-takeover"
+if grep -Fq 'FLOW:deploy' "$work/install-takeover"; then
+  echo 'unexpected FLOW:deploy in $work/install-takeover' >&2
+  exit 1
+fi
 exercise_install_flow external $'2\ny' > "$work/install-external-overwrite"
 grep -Fxq 'FLOW:fetch:false' "$work/install-external-overwrite"
 grep -Fxq 'FLOW:deploy:true:' "$work/install-external-overwrite"
@@ -1863,7 +1908,10 @@ unsafe_repair_rc=$?
 set -e
 [[ "$unsafe_repair_rc" == 1 ]]
 grep -Fq '已有用户连接配置，但用户资料缺失' "$work/install-unsafe-repair"
-! grep -Fq 'FLOW:deploy' "$work/install-unsafe-repair"
+if grep -Fq 'FLOW:deploy' "$work/install-unsafe-repair"; then
+  echo 'unexpected FLOW:deploy in $work/install-unsafe-repair' >&2
+  exit 1
+fi
 
 set +e
 (
@@ -1894,7 +1942,10 @@ update_failure_rc=$?
 set -e
 [[ "$update_failure_rc" == 1 ]]
 grep -Fxq 'UPDATE:deploy-called' "$work/update-failure"
-! grep -Fq '正在切换到新进程' "$work/update-failure"
+if grep -Fq '正在切换到新进程' "$work/update-failure"; then
+  echo 'unexpected 正在切换到新进程 in $work/update-failure' >&2
+  exit 1
+fi
 
 # 安装或更新必须在建立备份、停止服务或写入系统前确认 127.0.0.1 可绑定。
 # 该检查不能依赖 sing-box check，因为静态检查不会实际打开监听端口。
@@ -2367,7 +2418,10 @@ done
 )
 
 remove_obsolete_manager_config >/dev/null
-! grep -Eq '^(SS_METHOD|HANDSHAKE_SERVER|TLS_SERVER_NAME|PORT_MIN|PORT_MAX)=' "$CONF_FILE"
+if grep -Eq '^(SS_METHOD|HANDSHAKE_SERVER|TLS_SERVER_NAME|PORT_MIN|PORT_MAX)=' "$CONF_FILE"; then
+  echo 'unexpected ^(SS_METHOD|HANDSHAKE_SERVER|TLS_SERVER_NAME|PORT_MIN|PORT_MAX)= in $CONF_FILE' >&2
+  exit 1
+fi
 SS2022_SHADOWTLS_SNI="$DEFAULT_SS2022_SHADOWTLS_SNI"
 ANYTLS_SNI="$DEFAULT_ANYTLS_SNI"
 ensure_global_sni_config >/dev/null
@@ -2524,8 +2578,14 @@ done
   }
   [[ "$(make_user_inbounds_from_state "$batch_inbound_user")" == "$batch_inbound_expected" ]]
   [[ "$(wc -l < "$inbound_jq_calls" | tr -d ' ')" == 1 ]]
-  ! tr '\0' '\n' < "$inbound_jq_args" | grep -Fq 'any-secret'
-  ! tr '\0' '\n' < "$inbound_jq_args" | grep -Fq 'direct-secret'
+  if tr '\0' '\n' < "$inbound_jq_args" | grep -Fq 'any-secret'; then
+    echo 'unexpected any-secret in $inbound_jq_args' >&2
+    exit 1
+  fi
+  if tr '\0' '\n' < "$inbound_jq_args" | grep -Fq 'direct-secret'; then
+    echo 'unexpected direct-secret in $inbound_jq_args' >&2
+    exit 1
+  fi
 )
 
 # 50 个三入口用户协议重建固定为一次批量生成和一次配置改写，并保留外部入口与 endpoint 顺序。
@@ -2563,9 +2623,18 @@ done
   }
   rebuild_protocol_inbounds ss2022
   [[ "$(wc -l < "$rebuild_jq_calls" | tr -d ' ')" == 2 ]]
-  ! tr '\0' '\n' < "$rebuild_jq_args" | grep -Fq 'st-secret'
-  ! tr '\0' '\n' < "$rebuild_jq_args" | grep -Fq 'direct-secret'
-  ! tr '\0' '\n' < "$rebuild_jq_args" | grep -Fq 'any-secret'
+  if tr '\0' '\n' < "$rebuild_jq_args" | grep -Fq 'st-secret'; then
+    echo 'unexpected st-secret in $rebuild_jq_args' >&2
+    exit 1
+  fi
+  if tr '\0' '\n' < "$rebuild_jq_args" | grep -Fq 'direct-secret'; then
+    echo 'unexpected direct-secret in $rebuild_jq_args' >&2
+    exit 1
+  fi
+  if tr '\0' '\n' < "$rebuild_jq_args" | grep -Fq 'any-secret'; then
+    echo 'unexpected any-secret in $rebuild_jq_args' >&2
+    exit 1
+  fi
   command jq -e '
     (.inbounds | length) == 198 and
     .inbounds[0].tag == "external-a" and .inbounds[1].tag == "external-b" and
@@ -2647,7 +2716,10 @@ done
   cmd_export udp-export surge
 ) > "$work/udp-export.txt"
 grep -Fq 'udp-relay=true' "$work/udp-export.txt"
-! grep -Fq 'udp-port=' "$work/udp-export.txt"
+if grep -Fq 'udp-port=' "$work/udp-export.txt"; then
+  echo 'unexpected udp-port= in $work/udp-export.txt' >&2
+  exit 1
+fi
 
 [[ "$(url_percent_encode '节点 #+/')" == '%E8%8A%82%E7%82%B9%20%23%2B%2F' ]]
 
@@ -2659,8 +2731,14 @@ grep -Fq 'udp-relay=true' "$work/udp-export.txt"
   cmd_export sr-ss shadowrocket
   cmd_export sr-at shadowrocket
 ) > "$work/shadowrocket-urls.txt"
-! grep -Fq 'shadow-tls-password=' "$work/shadowrocket-urls.txt"
-! grep -Fq '=anytls,' "$work/shadowrocket-urls.txt"
+if grep -Fq 'shadow-tls-password=' "$work/shadowrocket-urls.txt"; then
+  echo 'unexpected shadow-tls-password= in $work/shadowrocket-urls.txt' >&2
+  exit 1
+fi
+if grep -Fq '=anytls,' "$work/shadowrocket-urls.txt"; then
+  echo 'unexpected =anytls, in $work/shadowrocket-urls.txt' >&2
+  exit 1
+fi
 python3 - "$work/shadowrocket-urls.txt" <<'PY'
 import base64
 import json
@@ -2702,7 +2780,10 @@ PY
   cmd_export direct-ss all
 ) > "$work/direct-export.txt"
 grep -Fq 'direct-ss = ss, 198.51.100.21, 20043, encrypt-method=2022-blake3-aes-128-gcm, password=MDEyMzQ1Njc4OWFiY2RlZg==, udp-relay=true' "$work/direct-export.txt"
-! grep -Fq 'shadow-tls-' "$work/direct-export.txt"
+if grep -Fq 'shadow-tls-' "$work/direct-export.txt"; then
+  echo 'unexpected shadow-tls- in $work/direct-export.txt' >&2
+  exit 1
+fi
 python3 - "$work/direct-export.txt" <<'PY'
 import base64
 import sys
@@ -2840,7 +2921,10 @@ jq -e '
   grep -Fxq 'ANYTLS_SNI="new-any.example.com"' "$CONF_FILE"
   jq -e '(.users[] | select(.name == "at-active") | .tls_sni) == "new-any.example.com"' "$STATE_FILE" >/dev/null
   cmp -s "$SINGBOX_CONFIG" "$work/global-sni-before-anytls.json"
-  ! grep -Fq 'systemctl:' "$sni_events"
+  if grep -Fq 'systemctl:' "$sni_events"; then
+    echo 'unexpected systemctl: in $sni_events' >&2
+    exit 1
+  fi
 )
 
 (
@@ -4742,7 +4826,10 @@ fi
     any(.users[]; .name=="imported" and .port==20002)
   ' "$STATE_FILE" >/dev/null
   grep -Fxq 'local:111' "$usage_log"
-  ! grep -Fq 'imported:' "$usage_log"
+  if grep -Fq 'imported:' "$usage_log"; then
+    echo 'unexpected imported: in $usage_log' >&2
+    exit 1
+  fi
   [[ "$(jq -r '.users[] | select(.name == "imported") | .usage_offset_bytes' "$STATE_FILE")" == 232 ]]
   grep -Fxq merge "$report_mode_log"
 )
@@ -4778,7 +4865,10 @@ printf '%s\n' '{"schema_version":3,"users":[{"name":"zeta","port":20003,"status"
 grep -Fq '1. alpha｜AnyTLS｜端口 20001｜启用' "$work/status-disable"
 grep -Fq '2. zeta｜SS2022 + ShadowTLS（旧版）｜端口 20003｜启用' "$work/status-disable"
 grep -Fxq 'ACTION:disable:alpha' "$work/status-disable"
-! grep -Fq 'beta｜' "$work/status-disable"
+if grep -Fq 'beta｜' "$work/status-disable"; then
+  echo 'unexpected beta｜ in $work/status-disable' >&2
+  exit 1
+fi
 (
   STATE_FILE="$status_action_state"
   MENU_RETURNED=false
@@ -4796,7 +4886,10 @@ grep -Fxq 'ACTION:enable:beta' "$work/status-enable"
   prompt_user_status_action cmd_disable active 停用 <<<'0'
   [[ "$MENU_RETURNED" == true ]]
 ) > "$work/status-return"
-! grep -Fq 'UNEXPECTED:' "$work/status-return"
+if grep -Fq 'UNEXPECTED:' "$work/status-return"; then
+  echo 'unexpected UNEXPECTED: in $work/status-return' >&2
+  exit 1
+fi
 
 add_split_return_state="$work/add-split-return-state.json"
 printf '%s\n' '{"schema_version":4,"users":[],"splits":[],"outbound_presets":[{"name":"out","upstream":{"protocol":"shadowsocks","server":"example.com","server_port":443,"method":"aes-128-gcm","password":"secret"}}],"rule_presets":[{"name":"rule","url":"https://example.com/rule.srs"}]}' > "$add_split_return_state"
@@ -4809,7 +4902,10 @@ printf '%s\n' '{"schema_version":4,"users":[],"splits":[],"outbound_presets":[{"
   [[ "$MENU_RETURNED" == true ]]
 ) > "$work/add-split-return"
 grep -Fq '输入 0 可返回分流管理。' "$work/add-split-return"
-! grep -Fq 'UNEXPECTED:' "$work/add-split-return"
+if grep -Fq 'UNEXPECTED:' "$work/add-split-return"; then
+  echo 'unexpected UNEXPECTED: in $work/add-split-return' >&2
+  exit 1
+fi
 
 diagnostic_state="$work/split-diagnostic-state.json"
 diagnostic_log="$work/split-diagnostic.log"
@@ -4848,7 +4944,10 @@ grep -Fq '已命中：AI' "$work/split-diagnostic-rendered"
 grep -Fq '未命中，走直连' "$work/split-diagnostic-rendered"
 grep -Fq '命中其他分流：Media' "$work/split-diagnostic-rendered"
 grep -Fq '未看到出口记录' "$work/split-diagnostic-rendered"
-! grep -Fq 'ignored.example' "$work/split-diagnostic-rendered"
+if grep -Fq 'ignored.example' "$work/split-diagnostic-rendered"; then
+  echo 'unexpected ignored.example in $work/split-diagnostic-rendered' >&2
+  exit 1
+fi
 
 diagnostic_root="$work/diagnostic"
 diagnostic_bin="$diagnostic_root/bin"
@@ -4930,10 +5029,14 @@ https://private.example/rules?a=1 203.0.113.20 [2001:db8::1] 2001:db8::2' \
   grep -Fq '[用户5] [用户4]' "$diagnostic_root/batch-redaction-actual.txt"
   grep -Fq '[已隐藏密码] [已隐藏密码] [已隐藏密码]' "$diagnostic_root/batch-redaction-actual.txt"
   grep -Fq '[已隐藏地址] [已隐藏服务器] [已隐藏IP] [已隐藏IP]' "$diagnostic_root/batch-redaction-actual.txt"
-  ! grep -Eq 'pass-long-secret|upstream-secret|private\.sni\.example|203\.0\.113\.20|2001:db8' \
-    "$diagnostic_root/batch-redaction-actual.txt"
-  ! tr '\0' '\n' < "$python_args" | grep -Eq \
-    'pass-long-secret|upstream-secret|private\.sni\.example|private\.example|203\.0\.113\.20|2001:db8'
+  if grep -Eq 'pass-long-secret|upstream-secret|private\.sni\.example|203\.0\.113\.20|2001:db8' "$diagnostic_root/batch-redaction-actual.txt"; then
+    echo 'unexpected pass-long-secret|upstream-secret|private\.sni\.example|203\.0\.113\.20|2001:db8 in $diagnostic_root/batch-redaction-actual.txt' >&2
+    exit 1
+  fi
+  if tr '\0' '\n' < "$python_args" | grep -Eq 'pass-long-secret|upstream-secret|private\.sni\.example|private\.example|203\.0\.113\.20|2001:db8'; then
+    echo 'unexpected pass-long-secret|upstream-secret|private\.sni\.example|private\.example|203\.0\.113\.20|2001:db8 in $python_args' >&2
+    exit 1
+  fi
   command() {
     if [[ "${1:-}" == -v && "${2:-}" == python3 ]]; then
       return 1
@@ -5158,7 +5261,10 @@ grep -Fxq 'ADD-SELF:anytls||global-any.example.com' "$work/add-default-anytls-sn
 EOF
 ) > "$work/add-default-multi" 2>&1
 grep -Fxq 'ADD-MULTI:self|2022-blake3-aes-128-gcm|global-any.example.com' "$work/add-default-multi"
-! grep -Fq 'UNEXPECTED-SINGLE' "$work/add-default-multi"
+if grep -Fq 'UNEXPECTED-SINGLE' "$work/add-default-multi"; then
+  echo 'unexpected UNEXPECTED-SINGLE in $work/add-default-multi' >&2
+  exit 1
+fi
 (
   load_runtime_config() { :; }
   MENU_RETURNED=false
@@ -5168,7 +5274,10 @@ grep -Fxq 'ADD-MULTI:self|2022-blake3-aes-128-gcm|global-any.example.com' "$work
 EOF
 ) > "$work/add-user-protocol-menu" 2>&1
 grep -Fq '输入无效：请输入 1、2、3 或 0' "$work/add-user-protocol-menu"
-! grep -Fq '为已有用户添加或移除协议' "$work/add-user-protocol-menu"
+if grep -Fq '为已有用户添加或移除协议' "$work/add-user-protocol-menu"; then
+  echo 'unexpected 为已有用户添加或移除协议 in $work/add-user-protocol-menu' >&2
+  exit 1
+fi
 
 user_management_body="$(declare -f user_management_menu)"
 grep -Fq "protocols '管理用户协议'" <<<"$user_management_body"
@@ -5189,7 +5298,10 @@ grep -Fq 'protocols)' <<<"$user_management_body"
 EOF
 ) > "$work/add-default-metered" 2>&1
 grep -Fxq 'ADD-MANAGED:anytls||global-any.example.com' "$work/add-default-metered"
-! grep -Fq 'UNEXPECTED-SELF' "$work/add-default-metered"
+if grep -Fq 'UNEXPECTED-SELF' "$work/add-default-metered"; then
+  echo 'unexpected UNEXPECTED-SELF in $work/add-default-metered' >&2
+  exit 1
+fi
 
 (
   load_runtime_config() {
@@ -5211,7 +5323,10 @@ EOF
 grep -Fq '输入无效：请输入 1、2 或 0，请重新输入。' "$work/add-invalid-retry"
 grep -Fq '输入无效：ShadowTLS SNI 必须是有效域名' "$work/add-invalid-retry"
 grep -Fxq 'ADD-RETRY:anytls||valid.example.com' "$work/add-invalid-retry"
-! grep -Fq 'UNEXPECTED-SELF' "$work/add-invalid-retry"
+if grep -Fq 'UNEXPECTED-SELF' "$work/add-invalid-retry"; then
+  echo 'unexpected UNEXPECTED-SELF in $work/add-invalid-retry' >&2
+  exit 1
+fi
 
 # 有效期调整菜单必须把正数和负数月数原样交给命令；负数先预览确认。
 renew_prompt_state="$work/renew-prompt-state.json"
@@ -5263,7 +5378,10 @@ n
 EOF
 ) > "$work/renew-prompt-cancel"
 grep -Fq '已取消有效期调整。' "$work/renew-prompt-cancel"
-! grep -Fq 'UNEXPECTED-RENEW' "$work/renew-prompt-cancel"
+if grep -Fq 'UNEXPECTED-RENEW' "$work/renew-prompt-cancel"; then
+  echo 'unexpected UNEXPECTED-RENEW in $work/renew-prompt-cancel' >&2
+  exit 1
+fi
 grep -Fq "renew '调整用户有效期'" src/80-menus-main.sh
 
 edit_prompt_state="$work/edit-prompt-state.json"
@@ -5300,7 +5418,10 @@ grep -Fxq 'EDIT:alice|20002|new.example.com|2022-blake3-aes-256-gcm|9|2026-10-15
   prompt_edit_user <<<'0'
   [[ "$MENU_RETURNED" == true ]]
 ) > "$work/edit-prompt-return"
-! grep -Fq 'UNEXPECTED:' "$work/edit-prompt-return"
+if grep -Fq 'UNEXPECTED:' "$work/edit-prompt-return"; then
+  echo 'unexpected UNEXPECTED: in $work/edit-prompt-return' >&2
+  exit 1
+fi
 
 state_remove_user alice
 [[ "$(jq '.users | length' "$STATE_FILE")" == 0 ]]
@@ -5465,8 +5586,14 @@ grep -Fq '启用' <<<"$rendered_users"
   column() { return 1; }
   rendered_fallback="$(render_user_list '[]')"
   grep -Fq 'fallback-user' <<<"$rendered_fallback"
-  ! grep -Fq 'fallback-secret' <<<"$rendered_fallback"
-  ! grep -Fq 'fallback.example.com' <<<"$rendered_fallback"
+  if grep -Fq 'fallback-secret' <<<"$rendered_fallback"; then
+    echo 'unexpected fallback-secret in $rendered_fallback' >&2
+    exit 1
+  fi
+  if grep -Fq 'fallback.example.com' <<<"$rendered_fallback"; then
+    echo 'unexpected fallback.example.com in $rendered_fallback' >&2
+    exit 1
+  fi
 )
 
 SB_SYSTEM_ROOT="$work/system-root"
@@ -5848,7 +5975,10 @@ batch_state_before="$(sha256sum "$STATE_FILE" "$SINGBOX_CONFIG")"
   grep -Fq 'sb-user-data-batch-payload-invalid.sbm：解密后内容异常' <<<"$batch_output"
   grep -Fq '汇总：健康 1，结构异常 1，密文校验失败 1，密码不匹配或认证失败 1，解密后内容异常 1，内部检查失败 0。' <<<"$batch_output"
   grep -Fq '没有修改备份文件或服务器上的用户、分流、配置与服务' <<<"$batch_output"
-  ! grep -Fq 'unit-test-password' <<<"$batch_output"
+  if grep -Fq 'unit-test-password' <<<"$batch_output"; then
+    echo 'unexpected unit-test-password in $batch_output' >&2
+    exit 1
+  fi
   [[ -z "$(find "$batch_inspection_root" -mindepth 1 -print -quit)" ]]
 )
 [[ "$batch_hashes_before" == "$(find "$batch_dir" -maxdepth 1 -type f -name '*.sbm' -exec sha256sum {} + | LC_ALL=C sort)" ]]
@@ -5959,8 +6089,14 @@ grep -Fq '发现 /root 顶层的迁移备份：' <<<"$auto_import_output"
 grep -Fq '1. sb-user-data-auto-new.sbm' <<<"$auto_import_output"
 grep -Fq '2. sb-user-data-auto-old.sbm' <<<"$auto_import_output"
 grep -Fq '3. 手动输入其他路径' <<<"$auto_import_output"
-! grep -Fq 'sb-user-data-auto-link.sbm' <<<"$auto_import_output"
-! grep -Fq 'sb-user-data-auto-nested.sbm' <<<"$auto_import_output"
+if grep -Fq 'sb-user-data-auto-link.sbm' <<<"$auto_import_output"; then
+  echo 'unexpected sb-user-data-auto-link.sbm in $auto_import_output' >&2
+  exit 1
+fi
+if grep -Fq 'sb-user-data-auto-nested.sbm' <<<"$auto_import_output"; then
+  echo 'unexpected sb-user-data-auto-nested.sbm in $auto_import_output' >&2
+  exit 1
+fi
 cmp -s "$bundle" "$MIGRATION_BACKUP_DIR/sb-user-data-auto-new.sbm"
 
 manual_outside_scan="$work/sb-user-data-manual-outside-scan.sbm"
@@ -6007,7 +6143,10 @@ jq -e '
   .result=="success" and .restored.users==2 and .restored.splits==0 and
   .failure_stage=="" and .environment_snapshot=="/root/example-snapshot" and (.package_sha256|length)==64
 ' "$MIGRATION_REPORT" >/dev/null
-! grep -Fq 'ss2022_password' "$MIGRATION_REPORT"
+if grep -Fq 'ss2022_password' "$MIGRATION_REPORT"; then
+  echo 'unexpected ss2022_password in $MIGRATION_REPORT' >&2
+  exit 1
+fi
 validate_migration_restore_report "$MIGRATION_REPORT"
 report_list="$(print_migration_reports)"
 grep -Fq '成功' <<<"$report_list"
@@ -6016,7 +6155,10 @@ report_details="$(printf '1\n' | show_migration_report_details)"
 grep -Fq '执行结果：成功' <<<"$report_details"
 grep -Fq '失败阶段：无' <<<"$report_details"
 grep -Fq '恢复前完整备份：/root/example-snapshot' <<<"$report_details"
-! grep -Fq 'ss2022_password' <<<"$report_details"
+if grep -Fq 'ss2022_password' <<<"$report_details"; then
+  echo 'unexpected ss2022_password in $report_details' >&2
+  exit 1
+fi
 printf '{"broken":true}\n' > "$MIGRATION_REPORT_DIR/migration-restore-99999999-999999-0.json"
 grep -Fq '报告异常' < <(print_migration_reports)
 rm -f "$MIGRATION_REPORT_DIR/migration-restore-99999999-999999-0.json"
@@ -6058,7 +6200,10 @@ unset -f getent
 for nested_menu in diagnostic_report_menu global_sni_menu migration_backup_menu singbox_channel_menu; do
   nested_menu_output="$(printf '0\n' | "$nested_menu")"
   grep -Fq '返回上一级' <<<"$nested_menu_output"
-  ! grep -Fq '返回主菜单' <<<"$nested_menu_output"
+  if grep -Fq '返回主菜单' <<<"$nested_menu_output"; then
+    echo 'unexpected 返回主菜单 in $nested_menu_output' >&2
+    exit 1
+  fi
 done
 migration_backup_menu_body="$(declare -f migration_backup_menu)"
 grep -Fq "check_all '批量体检全部备份（只读）'" <<<"$migration_backup_menu_body"
@@ -6073,8 +6218,14 @@ grep -Fq 'check_all_migration_backups' <<<"$migration_backup_menu_body"
   audit_consistency() { printf 'AUDIT_RAN\n'; AUDIT_REPAIRABLE=0; }
   prompt_consistency > "$work/prompt-consistency-not-deployed"
   grep -Fq '尚未部署管理环境。' "$work/prompt-consistency-not-deployed"
-  ! grep -Fq 'AUDIT_RAN' "$work/prompt-consistency-not-deployed"
-  ! grep -Fq 'PREPARE_CORE_RAN' "$work/prompt-consistency-not-deployed"
+  if grep -Fq 'AUDIT_RAN' "$work/prompt-consistency-not-deployed"; then
+    echo 'unexpected AUDIT_RAN in $work/prompt-consistency-not-deployed' >&2
+    exit 1
+  fi
+  if grep -Fq 'PREPARE_CORE_RAN' "$work/prompt-consistency-not-deployed"; then
+    echo 'unexpected PREPARE_CORE_RAN in $work/prompt-consistency-not-deployed' >&2
+    exit 1
+  fi
 )
 # 未部署时仍能生成诊断报告是刻意设计：配置缺失时用内置默认值并在报告里如实标注，
 # 这恰恰是环境装不上时最有用的功能，不得给该菜单加菜单级护栏。
@@ -6169,8 +6320,14 @@ PY
 [[ ! -e "$snapshot/root/var/lib/nfuse/nfuse.db-wal" ]]
 [[ ! -e "$snapshot/root/var/lib/nfuse/nfuse.db-shm" ]]
 [[ -z "$(find "$snapshot/root/var/lib/nfuse" -maxdepth 1 -name '.nfuse-snapshot.*' -print -quit)" ]]
-! grep -Fq 'nfuse.db-wal' "$snapshot/MANIFEST.sha256"
-! grep -Fq 'nfuse.db-shm' "$snapshot/MANIFEST.sha256"
+if grep -Fq 'nfuse.db-wal' "$snapshot/MANIFEST.sha256"; then
+  echo 'unexpected nfuse.db-wal in $snapshot/MANIFEST.sha256' >&2
+  exit 1
+fi
+if grep -Fq 'nfuse.db-shm' "$snapshot/MANIFEST.sha256"; then
+  echo 'unexpected nfuse.db-shm in $snapshot/MANIFEST.sha256' >&2
+  exit 1
+fi
 grep -Fq $'root/usr/local/bin/sbm\t/usr/local/sbin/sb-user-manager' "$snapshot/SYMLINKS.tsv"
 [[ "$(manager_file_mode "$ENVIRONMENT_BACKUP_BASE")" == 700 ]]
 [[ "$(manager_file_mode "$snapshot")" == 700 ]]
@@ -6758,11 +6915,17 @@ fi
   [[ "$ACTIVE_SIGNAL_ROLLBACK" == outer-rollback ]]
 )
 renew_body="$(declare -f cmd_renew)"
-! grep -Fq 'cmd_enable ' <<<"$renew_body"
+if grep -Fq 'cmd_enable ' <<<"$renew_body"; then
+  echo 'unexpected cmd_enable  in $renew_body' >&2
+  exit 1
+fi
 grep -Fq 'run_managed_step enable_user_without_transaction' <<<"$renew_body"
 renew_expiry_body="$(declare -f calculate_renewal_expiry)"
 grep -Fq 'date -d "$base_time ${months} months"' <<<"$renew_expiry_body"
-! grep -Fq '+${months} month' <<<"$renew_expiry_body"
+if grep -Fq '+${months} month' <<<"$renew_expiry_body"; then
+  echo 'unexpected +${months} month in $renew_expiry_body' >&2
+  exit 1
+fi
 grep -Fq 'date -d "$base_time ${months#-} months ago"' <<<"$renew_expiry_body"
 grep -Fq '^-?[1-9][0-9]*$' <<<"$renew_expiry_body"
 
@@ -6784,7 +6947,10 @@ if date -d '2026-08-15 10:20:30 UTC' +%s >/dev/null 2>&1; then
     renewal_october_base="$(date -d '2026-10-12 10:20:30 UTC' +%s)"
     [[ "$(calculate_renewal_expiry "$renewal_october_base" -1)" == 2026-09-12T10:20:30+0000 ]]
     [[ "$(calculate_renewal_expiry "$renewal_october_base" -2)" == 2026-08-12T10:20:30+0000 ]]
-    ! calculate_renewal_expiry "$renewal_october_base" 0 >/dev/null 2>&1
+    if calculate_renewal_expiry "$renewal_october_base" 0 >/dev/null 2>&1; then
+      echo 'calculate_renewal_expiry must not succeed here' >&2
+      exit 1
+    fi
   )
 else
   printf '%s\n' 'renewal date matrix skipped: GNU date is unavailable' >&2
@@ -6934,7 +7100,10 @@ fi
     exit 1
   fi
   grep -Fq '用户 invalid-expiry 的有效期格式无效，已跳过本次自动到期处理：not-a-date' "$work/expire-invalid-output"
-  ! grep -Fq 'syntax error' "$work/expire-invalid-output"
+  if grep -Fq 'syntax error' "$work/expire-invalid-output"; then
+    echo 'unexpected syntax error in $work/expire-invalid-output' >&2
+    exit 1
+  fi
   grep -Fxq 'expired-user:disabled' "$expire_status_calls"
   [[ "$(wc -l < "$expire_status_calls" | tr -d ' ')" == 1 ]]
   grep -Fxq 'expire-user:expired-user' "$expire_transaction_calls"
@@ -6964,7 +7133,10 @@ fi
 )
 
 # 秘密不得再通过 jq --arg 或 HMAC 外部进程 argv 传入。
-! grep -Eq -- '--arg (st_password|ss_password|password) ' src/30-user-runtime.sh
+if grep -Eq -- '--arg (st_password|ss_password|password) ' src/30-user-runtime.sh; then
+  echo 'unexpected --arg (st_password|ss_password|password)  in src/30-user-runtime.sh' >&2
+  exit 1
+fi
 grep -Fq '$ENV.SB_JQ_PASSWORD' src/30-user-runtime.sh
 if grep -REn -- '--arg (password|ss_password|shadowtls_password|st_password) |--argjson (u|upstream|new_outbounds|user|split|preset|incoming) "\$' \
   src/20-migration-backup.sh src/30-user-runtime.sh src/40-split-runtime.sh src/70-split-prompts.sh; then
@@ -6976,9 +7148,18 @@ if grep -En 'qrencode -t [^|]*\$' src/30-user-runtime.sh; then
   echo 'secrets must not be passed to qrencode through command-line arguments' >&2
   exit 1
 fi
-! grep -Fq 'Authorization: Bearer' src/50-install-update.sh
-! grep -Fq 'prompt_github_token' src/50-install-update.sh
-! grep -Fq 'github_curl_with_token' src/50-install-update.sh
+if grep -Fq 'Authorization: Bearer' src/50-install-update.sh; then
+  echo 'unexpected Authorization: Bearer in src/50-install-update.sh' >&2
+  exit 1
+fi
+if grep -Fq 'prompt_github_token' src/50-install-update.sh; then
+  echo 'unexpected prompt_github_token in src/50-install-update.sh' >&2
+  exit 1
+fi
+if grep -Fq 'github_curl_with_token' src/50-install-update.sh; then
+  echo 'unexpected github_curl_with_token in src/50-install-update.sh' >&2
+  exit 1
+fi
 (
   token_args="$work/github-token-args"
   curl() {
@@ -6993,8 +7174,14 @@ fi
   [[ "$LATEST_MANAGER_VERSION" == 9.9.9 ]]
   [[ "$LATEST_MANAGER_URL" == https://github.com/Cr0ce11/sb-user-manager-public/releases/download/v9.9.9/sb-user-manager.sh ]]
   [[ "$LATEST_MANAGER_SHA256" == "$(printf 'a%.0s' {1..64})" ]]
-  ! tr '\0' '\n' < "$token_args" | grep -Fq 'github-secret-token'
-  ! tr '\0' '\n' < "$token_args" | grep -Fq 'Authorization:'
+  if tr '\0' '\n' < "$token_args" | grep -Fq 'github-secret-token'; then
+    echo 'unexpected github-secret-token in $token_args' >&2
+    exit 1
+  fi
+  if tr '\0' '\n' < "$token_args" | grep -Fq 'Authorization:'; then
+    echo 'unexpected Authorization: in $token_args' >&2
+    exit 1
+  fi
   grep -Fxq 'https://api.github.com/repos/Cr0ce11/sb-user-manager-public/releases/latest' < <(tr '\0' '\n' < "$token_args")
 )
 ensure_migration_crypto_dependencies
@@ -7015,7 +7202,10 @@ for migration_entry in create_migration_backup show_migration_backup_details pre
 done
 grep -Fq 'migration_hmac_sha256_from_env' src/20-migration-backup.sh
 grep -Fq 'os.environ["SB_MIGRATION_HMAC_KEY"]' src/20-migration-backup.sh
-! grep -Fq 'macopt "hexkey:' src/20-migration-backup.sh
+if grep -Fq 'macopt "hexkey:' src/20-migration-backup.sh; then
+  echo 'unexpected macopt "hexkey: in src/20-migration-backup.sh' >&2
+  exit 1
+fi
 printf 'migration-hmac-regression\n' > "$work/migration-hmac-vector"
 (
   python3() {
@@ -7278,7 +7468,10 @@ EOF
   [[ "$AUDIT_ISSUES" == 0 && "$AUDIT_REPAIRABLE" == 0 ]]
   grep -Fq '一切正常' "$work/audit-batch-count-output"
   [[ "$(wc -l < "$audit_jq_calls" | tr -d ' ')" == 9 ]]
-  ! tr '\0' '\n' < "$audit_jq_args" | grep -Fq 'audit-secret'
+  if tr '\0' '\n' < "$audit_jq_args" | grep -Fq 'audit-secret'; then
+    echo 'unexpected audit-secret in $audit_jq_args' >&2
+    exit 1
+  fi
 )
 
 printf '%s\n' '{"schema_version":3,"users":[{"name":"test","status":"disabled","port":10001,"metered":true,"limit_gib":1},{"name":"crocell","status":"active","port":10000,"metered":false},{"name":"test2","status":"active","port":22547,"metered":true,"limit_gib":2}],"splits":[{"name":"AI","status":"active","scope":"user","user":"crocell","rule_set_tag":"AI","outbound_tag":"Hinet"}]}' > "$STATE_FILE"

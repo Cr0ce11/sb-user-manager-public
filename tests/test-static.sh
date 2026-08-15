@@ -50,7 +50,9 @@ shell_target_fixture="$(mktemp "${TMPDIR:-/tmp}/sb-shell-target-negative.XXXXXX"
 shell_target_output="$(mktemp "${TMPDIR:-/tmp}/sb-shell-target-output.XXXXXX")"
 convention_fixture="$(mktemp "${TMPDIR:-/tmp}/sb-convention-fixture.XXXXXX")"
 convention_output="$(mktemp "${TMPDIR:-/tmp}/sb-convention-output.XXXXXX")"
-trap 'rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fixture" "$shell_target_output" "$convention_fixture" "$convention_output"' EXIT
+negation_fixture="$(mktemp "${TMPDIR:-/tmp}/sb-negation-fixture.XXXXXX")"
+negation_output="$(mktemp "${TMPDIR:-/tmp}/sb-negation-output.XXXXXX")"
+trap 'rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fixture" "$shell_target_output" "$convention_fixture" "$convention_output" "$negation_fixture" "$negation_output"' EXIT
 sed '/^download_binaries() {/,/^}$/ {
   /LATEST_SINGBOX_URL/ s/ || return 1//
 }' sb-user-manager.sh > "$managed_step_fixture"
@@ -268,8 +270,31 @@ if grep -En "$optional_text_null_pattern" "$convention_fixture" | grep -Fv 'stat
   exit 1
 fi
 
+# 测试断言不得依赖裸 `!`：命令返回值被 ! 取反时 set -e 不会因它失败而退出，
+# 断言命中缺陷也不会让测试变红。条件上下文里的 ! 合法，检查器会放行。
+if ! bash tests/check-bare-negation.sh tests/*.sh >"$negation_output" 2>&1; then
+  cat "$negation_output" >&2
+  echo 'test assertions must not rely on a bare `!` command; use `if cmd; then echo ...; exit 1; fi`' >&2
+  exit 1
+fi
+printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' "! grep -Fq 'x' /dev/null" 'echo done' \
+  > "$negation_fixture"
+if bash tests/check-bare-negation.sh "$negation_fixture" >/dev/null 2>&1; then
+  echo 'bare negation check must reject a standalone `! cmd` assertion' >&2
+  exit 1
+fi
+printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' \
+  "if ! grep -Fq 'x' /dev/null; then" '  exit 1' 'fi' \
+  "while ! grep -Fq 'y' /dev/null; do" '  break' 'done' \
+  'if [[ ! -f /dev/null ]]; then' '  exit 1' 'fi' \
+  > "$negation_fixture"
+if ! bash tests/check-bare-negation.sh "$negation_fixture" >/dev/null 2>&1; then
+  echo 'bare negation check must allow `!` inside a conditional' >&2
+  exit 1
+fi
+
 rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fixture" "$shell_target_output"
-rm -f -- "$convention_fixture" "$convention_output"
+rm -f -- "$convention_fixture" "$convention_output" "$negation_fixture" "$negation_output"
 trap - EXIT
 
 version="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)"/\1/p' sb-user-manager.sh | head -n1)"

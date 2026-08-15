@@ -26,7 +26,7 @@
 从仓库根目录运行：
 
 ```bash
-bash -n sb-user-manager.sh tests/acceptance.sh tests/check-managed-step-errexit.sh tests/test-acceptance.sh tests/test-standalone-startup.sh tests/test-manager-handoff.sh tools/build-manager.sh tools/audit-public-readiness.sh tools/export-public-snapshot.sh tools/check-immutable-release-setting.sh tests/test-build.sh tests/test-public.sh tests/test-public-readiness.sh tests/test-public-snapshot.sh tests/test-release-workflow.sh
+bash -n sb-user-manager.sh tests/acceptance.sh tests/check-managed-step-errexit.sh tests/check-bare-negation.sh tests/test-acceptance.sh tests/test-standalone-startup.sh tests/test-manager-handoff.sh tools/build-manager.sh tools/audit-public-readiness.sh tools/export-public-snapshot.sh tools/check-immutable-release-setting.sh tests/test-build.sh tests/test-public.sh tests/test-public-readiness.sh tests/test-public-snapshot.sh tests/test-release-workflow.sh
 bash tools/build-manager.sh --check
 bash tests/test-build.sh
 bash tests/test-static.sh
@@ -63,6 +63,10 @@ GitHub 分支保护要求 `validate`、`jq16-compat` 和 `debian-standalone-e2e`
 - 需要已部署环境的交互入口先调用 `ensure_management_environment_ready` 护栏。
 - 保留现有部署的流程（`deploy_environment false`）必须先判断 sing-box 通道，
   不得把测试通道静默替换成正式版。
+- 测试断言不得写成独立成句的 `! cmd`。Bash 手册规定命令返回值被 `!` 取反时
+  `set -e` 不会因它失败而退出，这类断言命中缺陷也不会让测试变红。改用
+  `if cmd; then echo '说明为什么这是错的' >&2; exit 1; fi`。条件上下文中的 `!`
+  （`if ! cmd`、`while ! cmd`、`[[ ! -f x ]]` 等）是合法的，门禁会放行。
 - 可选文本字段（`outbound_preset`、`rule_preset` 以及三个 `runtime_*_tag`）
   在本项目里「空字符串」和「字段不存在」是同一个意思，判空一律写
   `(.field // "") == ""`。`(.field // null)` 对空字符串求值仍是空字符串，
