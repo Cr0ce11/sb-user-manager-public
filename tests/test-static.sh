@@ -105,6 +105,80 @@ if grep -Fq 'undefined_dynamic_dispatch_probe' "$shell_target_output"; then
   exit 1
 fi
 
+# 分词器读不懂的写法必须当场变红。原先的做法是把该处到文件末尾的全部内容当成一团
+# 不透明内容咽下去、退出码 0，于是该位置之后的所有静态约定都不再生效而无人知晓
+# （公开 Issue #102）。这里用一个没闭合的引号做反向样例。
+printf '#!/usr/bin/env bash\nstatic_tokenizer_giveup_fixture() {\n  local probe="缺一个右引号\n}\n' \
+  > "$convention_fixture"
+if python3 tests/check-shell-call-targets.py "$convention_fixture" >"$convention_output" 2>&1; then
+  echo 'shell call-target check must reject input its tokenizer cannot parse' >&2
+  exit 1
+fi
+grep -Fq 'tokenizer gave up' "$convention_output"
+
+# `$( )` 里的双引号串再套 `$(( ))` 是合法且实际用得到的写法，必须能解析：此前分词器会
+# 在算术展开的 `))` 处提前给命令替换收尾，并把之后的内容全部作废。探针放在这一行之后，
+# 报不出探针就说明检查在那里停了。
+cp sb-user-manager.sh "$convention_fixture"
+cat >> "$convention_fixture" <<'EOF'
+
+static_nested_arithmetic_fixture() {
+  local total=3 done_count=1 problems='[]'
+  problems="$(jq -c --arg m "共 ${total} 项，其中 $((total - done_count)) 项待处理" \
+    '. += [$m]' <<<"$problems")"
+  undefined_after_nested_arithmetic_probe
+}
+EOF
+if python3 tests/check-shell-call-targets.py "$convention_fixture" >"$convention_output" 2>&1; then
+  echo 'shell call-target check must still report an undefined target after a nested expansion' >&2
+  exit 1
+fi
+grep -Fq 'undefined bare command target undefined_after_nested_arithmetic_probe' "$convention_output"
+if grep -Fq 'tokenizer gave up' "$convention_output"; then
+  cat "$convention_output" >&2
+  echo 'the tokenizer must parse an arithmetic expansion nested in a quoted command substitution' >&2
+  exit 1
+fi
+
+# 覆盖率实测：除了分词器自己承认的放弃点，还可能有别的机制（例如 heredoc 屏蔽误判）
+# 让检查悄悄跳过文件中段，那种情况不会走到放弃出口。在管理脚本的多个位置各插一个
+# 未定义命令探针，每个都必须被报出来。
+coverage_probe_program='
+import pathlib, re, subprocess, sys
+
+fixture = sys.argv[1]
+lines = pathlib.Path("sb-user-manager.sh").read_text(encoding="utf-8").splitlines(keepends=True)
+spots = [n for n, line in enumerate(lines) if re.match(r"^[a-z_][a-z0-9_]*\(\) \{$", line)]
+if len(spots) < 20:
+    print("could not locate enough top-level function definitions to probe")
+    raise SystemExit(1)
+missed = []
+for fraction in (0.02, 0.35, 0.65, 0.95):
+    at = spots[int(len(spots) * fraction)]
+    probed = list(lines)
+    probed.insert(at, "static_coverage_probe_fixture() {\n  undefined_coverage_probe\n}\n\n")
+    pathlib.Path(fixture).write_text("".join(probed), encoding="utf-8")
+    if subprocess.run(["bash", "-n", fixture]).returncode != 0:
+        print(f"the probe inserted before line {at + 1} did not produce valid shell; pick another spot")
+        raise SystemExit(1)
+    result = subprocess.run(
+        [sys.executable, "tests/check-shell-call-targets.py", fixture],
+        capture_output=True,
+        text=True,
+    )
+    if "undefined_coverage_probe" not in result.stdout + result.stderr:
+        missed.append(at + 1)
+if missed:
+    print("static checks no longer cover the manager around line(s) "
+          + ", ".join(str(line) for line in missed))
+    raise SystemExit(1)
+'
+if ! python3 -c "$coverage_probe_program" "$convention_fixture" >"$convention_output" 2>&1; then
+  cat "$convention_output" >&2
+  echo 'the shell call-target check must cover the whole manager, not only its opening lines' >&2
+  exit 1
+fi
+
 # 调用约定的反向样例：每条约定都要能在故意写错的样例上报出来。
 cat > "$convention_fixture" <<'EOF'
 read_menu_choice() { :; }

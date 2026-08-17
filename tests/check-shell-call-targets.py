@@ -302,6 +302,15 @@ def matching_substitution(source: str, start: int) -> int | None:
         elif quote:
             if char == quote:
                 quote = ""
+            elif quote == '"' and source.startswith("$((", i):
+                # 双引号串里的算术展开必须整段跳过。按 `$(` 记一层、而引号内的裸括号
+                # 又不计数，深度就会少算一层，命令替换会在算术展开的 `))` 处提前收尾，
+                # 之后的内容全部作废（公开 Issue #102）。
+                end = matching_arithmetic_expansion(source, i + 3)
+                if end is None:
+                    return None
+                i = end + 1
+                continue
             elif quote == '"' and source.startswith("$(", i):
                 depth += 1
                 i += 1
@@ -311,6 +320,14 @@ def matching_substitution(source: str, start: int) -> int | None:
                     return i
         elif char in "'\"":
             quote = char
+        elif source.startswith("$((", i):
+            # 引号外的两个括号恰好各记一层，深度虽然算得平，但含义是错的：
+            # 算术展开里的引号和括号不该按命令替换的规则解释。这里同样整段跳过。
+            end = matching_arithmetic_expansion(source, i + 3)
+            if end is None:
+                return None
+            i = end + 1
+            continue
         elif source.startswith("$(", i):
             depth += 1
             i += 1
@@ -371,7 +388,17 @@ def matching_arithmetic_expansion(source: str, start: int) -> int | None:
     return None
 
 
-def tokenize(source: str, first_line: int = 1) -> list[list[Token]]:
+# 分词器碰到读不懂的写法时，原先的做法是把该处到输入末尾的全部内容当成一个
+# 不透明词元咽下去，然后正常返回。调用方无从察觉，于是该位置之后的所有静态约定
+# 都不再生效，而退出码仍是 0（公开 Issue #102）。现在每个放弃点都记进 giveups，
+# 由 main 报错退出：宁可当场变红，也不要门禁长期只覆盖文件的前半部分。
+def tokenize(
+    source: str,
+    first_line: int = 1,
+    giveups: list[tuple[int, str]] | None = None,
+) -> list[list[Token]]:
+    if giveups is None:
+        giveups = []
     streams: list[list[Token]] = []
     tokens: list[Token] = []
     line = first_line
@@ -438,6 +465,7 @@ def tokenize(source: str, first_line: int = 1) -> list[list[Token]]:
             if source.startswith("$((", i):
                 end = matching_arithmetic_expansion(source, i + 3)
                 if end is None:
+                    giveups.append((line, "unbalanced $(( arithmetic expansion"))
                     value.append(source[i:])
                     i = len(source)
                     bare = False
@@ -450,12 +478,13 @@ def tokenize(source: str, first_line: int = 1) -> list[list[Token]]:
             if source.startswith("$(", i):
                 end = matching_substitution(source, i + 2)
                 if end is None:
+                    giveups.append((line, "unbalanced $( command substitution"))
                     value.append(source[i:])
                     i = len(source)
                     bare = False
                     break
                 inner = source[i + 2 : end]
-                streams.extend(tokenize(inner, line))
+                streams.extend(tokenize(inner, line, giveups))
                 line += inner.count("\n")
                 value.append("$()")
                 bare = False
@@ -464,6 +493,7 @@ def tokenize(source: str, first_line: int = 1) -> list[list[Token]]:
             if source.startswith("${", i):
                 end = matching_parameter_expansion(source, i + 2)
                 if end is None:
+                    giveups.append((line, "unbalanced ${ parameter expansion"))
                     value.append(source[i:])
                     i = len(source)
                     bare = False
@@ -476,6 +506,8 @@ def tokenize(source: str, first_line: int = 1) -> list[list[Token]]:
             if char in "'\"":
                 bare = False
                 quote = char
+                quote_line = line
+                terminated = False
                 value.append(char)
                 i += 1
                 while i < len(source):
@@ -487,12 +519,15 @@ def tokenize(source: str, first_line: int = 1) -> list[list[Token]]:
                         i += 1
                         value.append(source[i])
                     elif current == quote:
+                        terminated = True
                         i += 1
                         break
                     elif quote == '"' and source.startswith("$((", i):
                         value.pop()
                         end = matching_arithmetic_expansion(source, i + 3)
                         if end is None:
+                            giveups.append((line, "unbalanced $(( arithmetic expansion"))
+                            terminated = True
                             value.append(source[i:])
                             i = len(source)
                             break
@@ -504,11 +539,13 @@ def tokenize(source: str, first_line: int = 1) -> list[list[Token]]:
                         value.pop()
                         end = matching_substitution(source, i + 2)
                         if end is None:
+                            giveups.append((line, "unbalanced $( command substitution"))
+                            terminated = True
                             value.append(source[i:])
                             i = len(source)
                             break
                         inner = source[i + 2 : end]
-                        streams.extend(tokenize(inner, line))
+                        streams.extend(tokenize(inner, line, giveups))
                         line += inner.count("\n")
                         value.append("$()")
                         i = end + 1
@@ -517,6 +554,8 @@ def tokenize(source: str, first_line: int = 1) -> list[list[Token]]:
                         value.pop()
                         end = matching_parameter_expansion(source, i + 2)
                         if end is None:
+                            giveups.append((line, "unbalanced ${ parameter expansion"))
+                            terminated = True
                             value.append(source[i:])
                             i = len(source)
                             break
@@ -525,6 +564,8 @@ def tokenize(source: str, first_line: int = 1) -> list[list[Token]]:
                         i = end + 1
                         continue
                     i += 1
+                if not terminated:
+                    giveups.append((quote_line, f"unterminated {quote} quote"))
                 continue
             if char == "\\" and i + 1 < len(source):
                 bare = False
@@ -870,11 +911,19 @@ def main() -> int:
     allowed = defined | SHELL_TARGETS | EXTERNAL_TARGETS
     unknown: dict[tuple[str, int], None] = {}
     findings = ConventionFindings()
-    for stream in tokenize(mask_heredoc_bodies(source)):
+    giveups: list[tuple[int, str]] = []
+    for stream in tokenize(mask_heredoc_bodies(source), 1, giveups):
         for call in command_calls(stream, findings, source_lines):
             if call.value not in allowed:
                 unknown[(call.value, call.line)] = None
     failed = False
+    for line, reason in sorted(dict.fromkeys(giveups)):
+        print(
+            f"tokenizer gave up at line {line} ({reason}); "
+            "everything after it went unchecked",
+            file=sys.stderr,
+        )
+        failed = True
     if unknown:
         for name, line in sorted(unknown, key=lambda item: (item[1], item[0])):
             print(f"undefined bare command target {name} at line {line}", file=sys.stderr)
