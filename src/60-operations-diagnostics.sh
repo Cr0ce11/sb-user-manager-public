@@ -837,7 +837,7 @@ audit_consistency() {
   local preset_link_rows preset_kind preset_reason managed_tags legacy_cleanup legacy_count
   AUDIT_ISSUES=0
   AUDIT_REPAIRABLE=0
-  config_json="$("$SINGBOX_BIN" format -c "$SINGBOX_CONFIG")" || return 1
+  config_json="$(singbox_config_for_comparison)" || return 1
   nfuse_json="$(nfuse list --json)" || return 1
   jq -e 'type == "object"' <<<"$config_json" >/dev/null || return 1
   jq -e 'type == "array"' <<<"$nfuse_json" >/dev/null || return 1

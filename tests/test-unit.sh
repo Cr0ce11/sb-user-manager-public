@@ -7753,4 +7753,81 @@ READONLYSOCK
 )
 
 
+# ============================================================
+# sing-box Listable 规范化：单元素 inbound 会被 format 塌成裸标量
+# ============================================================
+# 生产环境（Air）实测：写入 "inbound":["anytls-share"]，`sing-box format` 读回
+# "inbound":"anytls-share"。此前的比对直接对它做集合运算，jq 报
+# 「array and string cannot be subtracted」；而调用点写成 `if ! jq` / `|| return 1`，
+# 崩溃被当成「配置不符」，于是误报「分流尚未覆盖用户的全部连接」，并触发一次
+# 不必要的配置重建与 sing-box 重启。只有单一入口的用户会踩到 —— 而那是最常见的配置。
+(
+  listable_work="$work/listable"
+  mkdir -p "$listable_work"
+  SINGBOX_CONFIG="$listable_work/config.json"
+  SINGBOX_BIN="$listable_work/fake-singbox"
+  STATE_FILE="$listable_work/state.json"
+  # 假 sing-box 复现真实的塌陷行为：单元素 inbound 输出为裸标量
+  cat > "$SINGBOX_BIN" <<'LISTABLEBIN'
+#!/usr/bin/env bash
+if [[ "${1:-}" == format ]]; then
+  jq -c '.route.rules |= map(
+    if has("inbound") and ((.inbound | type) == "array") and ((.inbound | length) == 1)
+    then .inbound = .inbound[0] else . end)' "$3"
+else
+  exit 0
+fi
+LISTABLEBIN
+  chmod +x "$SINGBOX_BIN"
+  cat > "$SINGBOX_CONFIG" <<'LISTABLECFG'
+{"inbounds":[{"tag":"anytls-share","type":"anytls"}],
+ "outbounds":[{"tag":"mpo-share","type":"anytls"}],
+ "route":{"rule_set":[{"tag":"mpr-share","type":"remote"}],
+ "rules":[{"rule_set":"mpr-share","action":"route","outbound":"mpo-share","inbound":["anytls-share"]},
+          {"rule_set":"mpr-all","action":"route","outbound":"mpo-all"}]}}
+LISTABLECFG
+
+  # 先确认夹具真的复现了塌陷，否则这条测试测不到任何东西
+  if [[ "$("$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" | jq -r '.route.rules[0].inbound | type')" != string ]]; then
+    echo 'the fake sing-box must reproduce the Listable collapse for a single-element inbound' >&2
+    exit 1
+  fi
+
+  listable_config="$(singbox_config_for_comparison)"
+  if [[ "$(jq -r '.route.rules[0].inbound | type' <<<"$listable_config")" != array ]]; then
+    echo 'singbox_config_for_comparison must restore a collapsed inbound to an array' >&2
+    jq -c '.route.rules' <<<"$listable_config" >&2
+    exit 1
+  fi
+  # 本来没有 inbound 的规则不得被塞进这个字段
+  if jq -e '.route.rules[1] | has("inbound")' <<<"$listable_config" >/dev/null; then
+    echo 'normalisation must not invent an inbound field on rules that had none' >&2
+    exit 1
+  fi
+  # 还原之后集合运算必须能跑通，不再崩溃
+  if ! jq -e --argjson expected '["anytls-share"]' '
+      .route.rules[] | select(.rule_set == "mpr-share" and
+        ($expected - (.inbound // []) | length) == 0)' <<<"$listable_config" >/dev/null; then
+    echo 'the coverage comparison must succeed once inbound is an array' >&2
+    exit 1
+  fi
+  # 未还原时确实会崩（证明这条测试盯的是真问题，而不是恒真断言）
+  listable_raw="$("$SINGBOX_BIN" format -c "$SINGBOX_CONFIG")"
+  listable_rc=0
+  jq -e --argjson expected '["anytls-share"]' '
+    .route.rules[] | select(.rule_set == "mpr-share" and
+      ($expected - (.inbound // []) | length) == 0)' <<<"$listable_raw" >/dev/null 2>&1 || listable_rc=$?
+  if [[ "$listable_rc" == 0 ]]; then
+    echo 'the un-normalised comparison was expected to fail; the fixture no longer reproduces the bug' >&2
+    exit 1
+  fi
+)
+# 两处比对必须都经共用读入函数，不得再直接调用 format 后拿 .inbound 比对
+for listable_fn in shared_preset_runtime_is_current audit_consistency; do
+  if ! grep -Fq 'singbox_config_for_comparison' <<<"$(declare -f "$listable_fn")"; then
+    echo "${listable_fn} must read the running config through singbox_config_for_comparison" >&2
+    exit 1
+  fi
+done
+
 echo 'unit checks passed'

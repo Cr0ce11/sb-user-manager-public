@@ -575,9 +575,29 @@ rebuild_and_finish_split_operation() {
   finish_managed_operation || return 1
 }
 
+# sing-box 的 Listable 字段只有一个元素时，会被 `format` 规范化成裸标量：
+#   写入的 "inbound":["anytls-share"]  →  读回的 "inbound":"anytls-share"
+# 直接拿它和期望的标签数组做集合运算，jq 会因类型不符而报错
+# （array and string cannot be subtracted）。而这些比对的调用点写成
+# `if ! jq ...` 或 `jq ... || return 1`，jq 崩溃会被当成「配置不符」，
+# 于是既误报「分流尚未覆盖用户的全部连接」，又会触发一次不必要的配置重建与
+# sing-box 重启。字符串上的 `.inbound[]?` 还会安静地什么都不返回，让
+# 「已停用用户的规则仍在生效」这类检查静默失效。
+#
+# 因此凡是要拿运行配置和期望标签做比对的地方，都必须经这里读入，
+# 把 route.rules[].inbound 统一还原成数组。只有单一入口的用户会踩到，
+# 而那恰恰是最常见的配置。
+singbox_config_for_comparison() {
+  "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" | jq -c '
+    if (.route.rules? | type) == "array" then
+      .route.rules |= map(
+        if has("inbound") and ((.inbound | type) != "array") then .inbound = [.inbound] else . end)
+    else . end'
+}
+
 shared_preset_runtime_is_current() {
   local config rows split scope user user_status rule_tag out_tag transport_tag stored_rule stored_out stored_transport protocol inbounds tags legacy_cleanup
-  config="$("$SINGBOX_BIN" format -c "$SINGBOX_CONFIG")" || return 1
+  config="$(singbox_config_for_comparison)" || return 1
   tags="$(collect_managed_split_tags)" || return 1
   legacy_cleanup="$(collect_legacy_split_cleanup_plan_from_config "$config" "$tags")" || return 1
   [[ "$(jq '.rule_tags | length' <<<"$legacy_cleanup")" == 0 ]] || return 1
