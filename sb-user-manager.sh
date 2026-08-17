@@ -144,7 +144,9 @@ load_runtime_config() {
 
 die() {
   echo "错误：$*" >&2
-  exit 1
+  # 非交互只读入口把「工具自身出错」统一为退出码 3，避免与「提醒」(1) 混淆；
+  # 未设置时保持原有的 1，交互路径行为不变。
+  exit "${SB_READONLY_EXIT_CODE:-1}"
 }
 
 log() {
@@ -10764,6 +10766,267 @@ EOF
   done
 }
 
+# ============================================================
+# 非交互只读入口
+# ============================================================
+# 只读查询走独立路径，绝不经过 prepare_core —— 后者会取写锁、执行事务回滚（真的会改数据）
+# 并写状态文件。这里只读：不取锁、不恢复、不写任何项目文件。
+#
+# 不取锁是安全的：状态文件由 atomic_state_update 以临时文件加 rename 替换，无锁读到的
+# 必然是某个完整版本。因此只读查询既不阻塞正在操作的会话，也不会被对方阻塞，不需要在
+# 锁被占用时报错退出。
+#
+# 输出绝不包含密码、密钥、SNI、订阅链接或二维码：字段逐个显式构造，不复用任何导出函数。
+
+# 提前提醒的阈值：距到期天数与配额占用比例。集中在此便于日后调整。
+READONLY_EXPIRY_NOTICE_DAYS=7
+READONLY_QUOTA_NOTICE_RATIO=0.9
+
+readonly_now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+
+readonly_fail() {
+  printf '错误：%s\n' "$1" >&2
+  exit 3
+}
+
+# 只做只读查询需要的最小准备：校验权限与依赖、加载运行配置。
+# 期间任何内部 die 都会因 SB_READONLY_EXIT_CODE 归为退出码 3。
+readonly_prepare() {
+  local cmd
+  # 单元测试会以普通用户加载隔离环境；真实运行必须是 root，否则读不到 600 权限的用户数据。
+  # 与 runtime_config_expected_uid 采用同一判定方式。
+  if [[ "${SB_USER_MANAGER_LIBRARY:-false}" != true ]]; then
+    [[ $EUID -eq 0 ]] || readonly_fail '需要 root 权限读取管理数据，请以 root 运行。'
+  fi
+  for cmd in jq systemctl date; do
+    command -v "$cmd" >/dev/null 2>&1 || readonly_fail "缺少依赖命令：${cmd}"
+  done
+  [[ -r "$CONF_FILE" ]] ||
+    readonly_fail '尚未部署管理环境，请先在交互菜单中执行「系统管理 → 部署与卸载 → 安装或修复环境」。'
+  load_runtime_config
+  [[ -r "$STATE_FILE" ]] || readonly_fail "读不到用户数据：${STATE_FILE}"
+  command -v "$SINGBOX_BIN" >/dev/null 2>&1 || [[ -x "$SINGBOX_BIN" ]] ||
+    readonly_fail "读不到 sing-box 程序：${SINGBOX_BIN}"
+  command -v nfuse >/dev/null 2>&1 || readonly_fail '读不到 nfuse 程序，无法查询流量。'
+}
+
+# 服务状态：输出 服务名<TAB>systemd 状态
+readonly_service_rows() {
+  local service
+  for service in sing-box.service nfuse.service sb-user-expiry.timer; do
+    printf '%s\t%s\n' "$service" "$(systemctl is-active "$service" 2>/dev/null || true)"
+  done
+}
+
+# 用户快照：把状态文件与 Nfuse 用量合成只含非敏感字段的 JSON 数组。
+# 用量与剩余的算法与「查看用户」列表保持一致，否则同一台机器两处会给出不同数字。
+readonly_users_json() {
+  local usage_json name_filter="${1:-}"
+  usage_json="$(nfuse list --json)" || readonly_fail '无法读取 Nfuse 流量数据。'
+  jq -e 'type == "array"' <<<"$usage_json" >/dev/null || readonly_fail 'Nfuse 返回的流量数据无效。'
+  jq --argjson nfuse "$usage_json" --arg only "$name_filter" '
+    [.users[]
+     | select($only == "" or .name == $only)
+     | . as $user
+     | (($user.metered // ($user.limit_gib != null))) as $metered
+     | ($nfuse | map(select(.name == $user.name)) | first) as $meter
+     | {
+         name: $user.name,
+         protocols: [
+           if ($user.endpoints | type) == "array" then $user.endpoints[]
+           else {protocol:($user.protocol // "ss2022"), transport:($user.transport // "shadowtls")} end
+           | if .protocol == "anytls" then "anytls"
+             elif .transport == "shadowtls" then "ss2022_shadowtls"
+             else "ss2022" end
+         ],
+         enabled: ($user.status == "active"),
+         status: (if $user.status == "disabled" then "disabled"
+                  elif $metered and $meter != null and $meter.used_bytes >= $meter.limit_bytes then "quota_exhausted"
+                  else $user.status end),
+         metered: $metered,
+         expires_at: $user.expires_at,
+         quota_bytes: (if $metered and $meter != null then $meter.limit_bytes else null end),
+         used_bytes: (if $meter == null then null else ($meter.used_bytes + ($user.usage_offset_bytes // 0)) end),
+         remaining_bytes: (if ($metered | not) or $meter == null then null
+                           else ([$meter.limit_bytes - $meter.used_bytes, 0] | max) end)
+       }]
+  ' "$STATE_FILE"
+}
+
+readonly_bytes_to_gib() {
+  jq -rn --argjson v "$1" 'if $v == null then "-" else ((($v / 1073741824) * 100 | round) / 100 | tostring) + " GiB" end'
+}
+
+cmd_readonly_users() {
+  local as_json=false name='' users rows
+  # 只读子命令期间把「工具自身出错」统一为退出码 3。用局部变量而不是 export：
+  # export 会让整个进程后续所有 die 都变成 3，污染调用方（单元测试里已经踩到过）。
+  local SB_READONLY_EXIT_CODE=3
+  while (($#)); do
+    case "$1" in
+      --json) as_json=true; shift;;
+      --name) [[ -n "${2:-}" ]] || readonly_fail '--name 需要一个用户名。'; name="$2"; shift 2;;
+      *) readonly_fail "无法识别的参数：$1（可用：--json、--name <用户>）";;
+    esac
+  done
+  readonly_prepare
+  users="$(readonly_users_json "$name")" || return 3
+  if [[ -n "$name" ]] && [[ "$(jq 'length' <<<"$users")" == 0 ]]; then
+    readonly_fail "找不到用户：${name}"
+  fi
+  if [[ "$as_json" == true ]]; then
+    jq -n --argjson users "$users" --arg at "$(readonly_now)" '{generated_at:$at, users:$users}'
+    return 0
+  fi
+  if [[ "$(jq 'length' <<<"$users")" == 0 ]]; then
+    echo '暂无用户'
+    return 0
+  fi
+  rows="$(jq -r '
+    (["用户名","协议","状态","月配额","已用","剩余","到期时间"] | @tsv),
+    (.[] | [
+      .name,
+      (.protocols | map(if . == "anytls" then "AnyTLS" elif . == "ss2022_shadowtls" then "SS2022+ShadowTLS" else "SS2022" end) | join(" + ")),
+      (if .status == "disabled" then "停用" elif .status == "quota_exhausted" then "配额耗尽" else "启用" end),
+      (if .quota_bytes == null then "不限" else (((.quota_bytes / 1073741824) * 100 | round) / 100 | tostring) + " GiB" end),
+      (if .used_bytes == null then "-" else (((.used_bytes / 1073741824) * 100 | round) / 100 | tostring) + " GiB" end),
+      (if .remaining_bytes == null then "-" else (((.remaining_bytes / 1073741824) * 100 | round) / 100 | tostring) + " GiB" end),
+      (if .expires_at == null then "-" else (.expires_at | sub("T"; " ") | sub("[+-][0-9]{2}:?[0-9]{2}$"; "")) end)
+    ] | @tsv)' <<<"$users")" || readonly_fail '用户数据无法格式化。'
+  if ! printf '%s\n' "$rows" | column -t -s $'\t' 2>/dev/null; then
+    printf '%s\n' "$rows"
+  fi
+}
+
+cmd_readonly_status() {
+  local as_json=false services users issues=0 repairable=0 audit_rc=0
+  # 只读子命令期间把「工具自身出错」统一为退出码 3。用局部变量而不是 export：
+  # export 会让整个进程后续所有 die 都变成 3，污染调用方（单元测试里已经踩到过）。
+  local SB_READONLY_EXIT_CODE=3
+  local problems='[]' notices='[]' conclusion=ok code=0
+  while (($#)); do
+    case "$1" in
+      --json) as_json=true; shift;;
+      *) readonly_fail "无法识别的参数：$1（可用：--json）";;
+    esac
+  done
+  readonly_prepare
+  services="$(readonly_service_rows)"
+  while IFS=$'\t' read -r service state; do
+    [[ -n "$service" ]] || continue
+    [[ "$state" != active ]] || continue
+    problems="$(jq -c --arg m "服务未正常运行：${service}（${state:-未知}）" '. += [$m]' <<<"$problems")"
+  done <<<"$services"
+  # 用配置里的套接字路径，不写死 /run/nfuse.sock —— 只读入口既然读了配置就该尊重它
+  local nfuse_socket="${NFUSE_SOCKET:-/run/nfuse.sock}"
+  [[ -S "$nfuse_socket" ]] ||
+    problems="$(jq -c --arg m "流量统计通信未就绪：${nfuse_socket} 不存在" '. += [$m]' <<<"$problems")"
+  # 未完成的管理脚本接管：只读入口不执行恢复，但必须如实报出来，
+  # 否则读到的数据可能来自一个处于中间状态的环境。
+  if [[ -e "$MANAGER_HANDOFF_JOURNAL" || -L "$MANAGER_HANDOFF_JOURNAL" ]]; then
+    notices="$(jq -c --arg m '存在未完成的管理脚本接管，请在交互菜单中运行一次以完成恢复' '. += [$m]' <<<"$notices")"
+  fi
+  if [[ -e "$TRANSACTION_JOURNAL" || -L "$TRANSACTION_JOURNAL" ]]; then
+    notices="$(jq -c --arg m '存在未完成的操作恢复记录，请在交互菜单中运行一次以完成恢复' '. += [$m]' <<<"$notices")"
+  fi
+  # 复用「服务与配置检查」的判定逻辑本身，保证结论与菜单一致；报告正文丢弃，只取计数。
+  # 必须在当前 shell 里跑，命令替换会因子壳丢掉计数变量。
+  audit_consistency >/dev/null 2>&1 || audit_rc=$?
+  if ((audit_rc != 0)); then
+    problems="$(jq -c --arg m '配置一致性检查无法完成，请在交互菜单中查看「服务与配置检查」' '. += [$m]' <<<"$problems")"
+  else
+    issues="$AUDIT_ISSUES"
+    repairable="$AUDIT_REPAIRABLE"
+    if ((issues > repairable)); then
+      # 先把算术算进变量再插值：把 $(( )) 嵌在 $( ) 内的双引号串里会让
+      # tests/check-shell-call-targets.py 的分词器从此处起吞掉整个文件（静默不再检查）
+      local manual_issues=$((issues - repairable))
+      problems="$(jq -c --arg m "配置检查发现 ${issues} 项问题，其中 ${manual_issues} 项需要人工处理" '. += [$m]' <<<"$problems")"
+    elif ((issues > 0)); then
+      notices="$(jq -c --arg m "配置检查发现 ${issues} 项问题，均可在菜单中自动修复" '. += [$m]' <<<"$notices")"
+    fi
+  fi
+  users="$(readonly_users_json)" || return 3
+  # 提前提醒（一）7 天内到期。
+  # 时间戳必须用 parse_expiry_epoch 解析：状态文件里的 expires_at 带 %z 偏移（如 +0800），
+  # jq 的 fromdateiso8601 只认 Z 结尾，直接用它会整段报错、把提醒一起丢掉。
+  # 格式无效时按 cmd_expire 的既有做法告警并跳过，不影响其余用户。
+  local now_epoch expires expires_epoch days_left user_name
+  now_epoch="$(date +%s)"
+  while IFS=$'\t' read -r user_name expires; do
+    [[ -n "$user_name" ]] || continue
+    if ! expires_epoch="$(parse_expiry_epoch "$expires")"; then
+      notices="$(jq -c --arg m "用户 ${user_name} 的有效期格式无效，无法判断是否临近到期：${expires}" '. += [$m]' <<<"$notices")"
+      continue
+    fi
+    days_left=$(( (expires_epoch - now_epoch) / 86400 ))
+    ((days_left <= READONLY_EXPIRY_NOTICE_DAYS)) || continue
+    if ((days_left < 0)); then
+      notices="$(jq -c --arg m "用户 ${user_name} 已过期，等待下次到期检查停用" '. += [$m]' <<<"$notices")"
+    else
+      notices="$(jq -c --arg m "用户 ${user_name} 将在 ${days_left} 天后到期" '. += [$m]' <<<"$notices")"
+    fi
+  done < <(jq -r '.[] | select(.status != "disabled") | select(.expires_at != null) | [.name, .expires_at] | @tsv' <<<"$users")
+  # 提前提醒（二）计量用户已用超过配额的 90%。纯算术，留在 jq 里。
+  while IFS= read -r message; do
+    [[ -n "$message" ]] || continue
+    notices="$(jq -c --arg m "$message" '. += [$m]' <<<"$notices")"
+  done < <(jq -r --argjson ratio "$READONLY_QUOTA_NOTICE_RATIO" '
+    .[] | select(.status != "disabled")
+        | select(.quota_bytes != null and .used_bytes != null and .quota_bytes > 0)
+        | select((.used_bytes / .quota_bytes) >= $ratio)
+        | "用户 \(.name) 本月流量已用 \(((.used_bytes / .quota_bytes) * 100) | floor)%"
+  ' <<<"$users")
+  if [[ "$(jq 'length' <<<"$problems")" != 0 ]]; then
+    conclusion=problem; code=2
+  elif [[ "$(jq 'length' <<<"$notices")" != 0 ]]; then
+    conclusion=notice; code=1
+  fi
+  if [[ "$as_json" == true ]]; then
+    jq -n --arg at "$(readonly_now)" --arg conclusion "$conclusion" --argjson code "$code" \
+      --argjson problems "$problems" --argjson notices "$notices" \
+      --argjson issues "$issues" --argjson repairable "$repairable" \
+      --argjson users "$users" --arg services "$services" '
+      {generated_at:$at, conclusion:$conclusion, exit_code:$code,
+       services:($services | split("\n") | map(select(length > 0) | split("\t") | {name:.[0], state:.[1]})),
+       consistency:{issues:$issues, repairable:$repairable},
+       users:{total:($users|length),
+              active:($users|map(select(.status != "disabled"))|length),
+              disabled:($users|map(select(.status == "disabled"))|length)},
+       problems:$problems, notices:$notices}'
+    return "$code"
+  fi
+  case "$conclusion" in
+    ok) echo '结论：正常';;
+    notice) echo '结论：需要留意';;
+    problem) echo '结论：异常';;
+  esac
+  printf '检查时间：%s\n' "$(readonly_now)"
+  printf '服务：'
+  printf '%s' "$(jq -rn --arg s "$services" '$s | split("\n") | map(select(length>0) | split("\t") |
+    .[0] + " " + (if .[1] == "active" then "运行中" else (if .[1] == "" then "未知" else .[1] end) end)) | join(" / ")')"
+  printf '\n用户：%s 个（启用 %s，停用 %s）\n' \
+    "$(jq 'length' <<<"$users")" \
+    "$(jq 'map(select(.status != "disabled")) | length' <<<"$users")" \
+    "$(jq 'map(select(.status == "disabled")) | length' <<<"$users")"
+  jq -r '.[] | "异常：" + .' <<<"$problems"
+  jq -r '.[] | "留意：" + .' <<<"$notices"
+  [[ "$conclusion" == ok ]] && echo '配置检查：未发现问题'
+  return "$code"
+}
+
+# 只读子命令的统一入口。放在 main() 最前面调用，早于 root 检查与接管恢复，
+# 因为 recover_manager_handoff 会取锁并还原文件，只读查询不得触发它。
+run_readonly_command() {
+  local command="$1"
+  shift
+  case "$command" in
+    status) cmd_readonly_status "$@";;
+    users) cmd_readonly_users "$@";;
+    *) readonly_fail "未知的只读子命令：${command}";;
+  esac
+}
+
 prompt_split_scope_user() {
   local -a users=()
   local line i
@@ -11874,6 +12137,12 @@ interactive_main() {
 
 main() {
   local recovered_installed
+  # 只读子命令必须在 root 检查与接管恢复之前分发：recover_manager_handoff 会取锁并还原
+  # 文件，只读查询不得触发它；权限与依赖由 readonly_prepare 自行检查并归为退出码 3。
+  # 这里只匹配精确的子命令名，未知参数仍然落到下方 case 的 *) 分支被拒绝。
+  case "${1:-}" in
+    status|users) run_readonly_command "$@"; return $?;;
+  esac
   [[ $EUID -eq 0 ]] || die "必须使用 root 运行"
   recover_manager_handoff || die "未完成的管理脚本接管尚未安全恢复"
   if [[ "$MANAGER_HANDOFF_RECOVERED" == true ]]; then

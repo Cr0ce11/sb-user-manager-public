@@ -228,6 +228,12 @@ interactive_main() {
 
 main() {
   local recovered_installed
+  # 只读子命令必须在 root 检查与接管恢复之前分发：recover_manager_handoff 会取锁并还原
+  # 文件，只读查询不得触发它；权限与依赖由 readonly_prepare 自行检查并归为退出码 3。
+  # 这里只匹配精确的子命令名，未知参数仍然落到下方 case 的 *) 分支被拒绝。
+  case "${1:-}" in
+    status|users) run_readonly_command "$@"; return $?;;
+  esac
   [[ $EUID -eq 0 ]] || die "必须使用 root 运行"
   recover_manager_handoff || die "未完成的管理脚本接管尚未安全恢复"
   if [[ "$MANAGER_HANDOFF_RECOVERED" == true ]]; then
