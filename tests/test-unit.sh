@@ -7822,12 +7822,21 @@ LISTABLECFG
     exit 1
   fi
 )
-# 两处比对必须都经共用读入函数，不得再直接调用 format 后拿 .inbound 比对
-for listable_fn in shared_preset_runtime_is_current audit_consistency; do
-  if ! grep -Fq 'singbox_config_for_comparison' <<<"$(declare -f "$listable_fn")"; then
-    echo "${listable_fn} must read the running config through singbox_config_for_comparison" >&2
-    exit 1
-  fi
-done
+# 两处比对必须都用共用的还原规则，不得各写一套、也不得直接拿 format 的原始输出比对。
+# audit_consistency 把还原折进既有的类型校验调用（它的 jq 调用次数受性能门禁看守），
+# 因此这里认「引用了共用过滤器常量」，而不是硬要求函数名。
+if ! grep -Fq 'singbox_config_for_comparison' <<<"$(declare -f shared_preset_runtime_is_current)"; then
+  echo 'shared_preset_runtime_is_current must read the running config through singbox_config_for_comparison' >&2
+  exit 1
+fi
+if ! grep -Fq 'SINGBOX_CONFIG_NORMALISE_PROGRAM' <<<"$(declare -f audit_consistency)"; then
+  echo 'audit_consistency must normalise inbound with the shared filter' >&2
+  exit 1
+fi
+# 共用函数本身也必须用那份规则，两处不能各写一套
+if ! grep -Fq 'SINGBOX_CONFIG_NORMALISE_PROGRAM' <<<"$(declare -f singbox_config_for_comparison)"; then
+  echo 'singbox_config_for_comparison must use the shared normalisation filter' >&2
+  exit 1
+fi
 
 echo 'unit checks passed'

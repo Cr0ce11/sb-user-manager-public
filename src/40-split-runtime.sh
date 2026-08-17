@@ -587,12 +587,19 @@ rebuild_and_finish_split_operation() {
 # 因此凡是要拿运行配置和期望标签做比对的地方，都必须经这里读入，
 # 把 route.rules[].inbound 统一还原成数组。只有单一入口的用户会踩到，
 # 而那恰恰是最常见的配置。
-singbox_config_for_comparison() {
-  "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" | jq -c '
-    if (.route.rules? | type) == "array" then
+# 校验加还原的完整 jq 程序。两处比对共用同一份文本，避免各写一套后分叉。
+# 整段放在单引号常量里，调用处只做一次普通变量展开：内联拼接会产生转义双引号，
+# 而 tests/check-shell-call-targets.py 的分词器遇到那种写法会静默停止检查
+# 文件剩余部分（见公开 Issue #102）。
+SINGBOX_CONFIG_NORMALISE_PROGRAM='
+  if type != "object" then error("运行配置不是 JSON 对象") else . end
+  | if (.route.rules? | type) == "array" then
       .route.rules |= map(
         if has("inbound") and ((.inbound | type) != "array") then .inbound = [.inbound] else . end)
     else . end'
+
+singbox_config_for_comparison() {
+  "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" | jq -c "$SINGBOX_CONFIG_NORMALISE_PROGRAM"
 }
 
 shared_preset_runtime_is_current() {
