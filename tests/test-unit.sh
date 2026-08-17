@@ -7621,6 +7621,50 @@ READONLYSOCK
     exit 1
   fi
 
+  # 人读输出里的服务状态必须是中文：菜单侧早有中文映射，只读入口不得回落到
+  # systemd 的英文原文（曾经出现过 "sing-box.service failed" 与中文混排）。
+  # 两处共用 service_state_label，避免日后各说一套。
+  if [[ "$(service_state_label failed)" != 启动失败 ]] ||
+     [[ "$(service_state_label inactive)" != 未运行 ]] ||
+     [[ "$(service_state_label active)" != 运行中 ]]; then
+    echo 'service_state_label must render systemd states in Chinese' >&2
+    exit 1
+  fi
+  if ! grep -Fq 'service_state_label' <<<"$(declare -f show_service_status)"; then
+    echo 'show_service_status must reuse service_state_label so the two cannot drift' >&2
+    exit 1
+  fi
+  (
+    systemctl() { [[ "${2:-}" != sing-box.service ]] && printf 'active\n' || printf 'failed\n'; }
+    readonly_state_out="$(cmd_readonly_status || true)"
+    if ! grep -Fq 'sing-box.service 启动失败' <<<"$readonly_state_out"; then
+      echo 'read-only status must show the Chinese service state' >&2
+      printf '%s\n' "$readonly_state_out" >&2
+      exit 1
+    fi
+    if grep -Eq 'sing-box\.service (failed|inactive|activating)' <<<"$readonly_state_out"; then
+      echo 'read-only status must not fall back to the raw systemd state' >&2
+      exit 1
+    fi
+    # --json 保留原始状态作为机器契约
+    jq -e '[.services[] | select(.name == "sing-box.service") | .state] == ["failed"]' \
+      <<<"$(cmd_readonly_status --json || true)" >/dev/null
+    # systemctl 返回空时必须归一为 unknown。断言要钉 --json 里的原始状态：
+    # 制表符分隔在中间字段为空时会折叠，读取端错位后中文说法会跑到 state 位上，
+    # 只看人读输出里有没有「未知」是抓不到这个错位的。
+    systemctl() { printf '\n'; }
+    if ! jq -e '[.services[] | .state] | unique == ["unknown"]' \
+        <<<"$(cmd_readonly_status --json || true)" >/dev/null; then
+      echo 'an empty systemd state must be normalised to unknown in the JSON contract' >&2
+      jq -c '.services' <<<"$(cmd_readonly_status --json || true)" >&2
+      exit 1
+    fi
+    if ! grep -Fq '未知（unknown）' <<<"$(cmd_readonly_status || true)"; then
+      echo 'an empty systemd state must read as 未知 for humans' >&2
+      exit 1
+    fi
+  )
+
   # --- users ---
   readonly_users_json="$(cmd_readonly_users --json)"
   jq -e 'has("generated_at") and (.users | length) == 3' <<<"$readonly_users_json" >/dev/null
