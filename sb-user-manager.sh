@@ -6003,9 +6003,36 @@ rebuild_and_finish_split_operation() {
   finish_managed_operation || return 1
 }
 
+# sing-box 的 Listable 字段只有一个元素时，会被 `format` 规范化成裸标量：
+#   写入的 "inbound":["anytls-share"]  →  读回的 "inbound":"anytls-share"
+# 直接拿它和期望的标签数组做集合运算，jq 会因类型不符而报错
+# （array and string cannot be subtracted）。而这些比对的调用点写成
+# `if ! jq ...` 或 `jq ... || return 1`，jq 崩溃会被当成「配置不符」，
+# 于是既误报「分流尚未覆盖用户的全部连接」，又会触发一次不必要的配置重建与
+# sing-box 重启。字符串上的 `.inbound[]?` 还会安静地什么都不返回，让
+# 「已停用用户的规则仍在生效」这类检查静默失效。
+#
+# 因此凡是要拿运行配置和期望标签做比对的地方，都必须经这里读入，
+# 把 route.rules[].inbound 统一还原成数组。只有单一入口的用户会踩到，
+# 而那恰恰是最常见的配置。
+# 校验加还原的完整 jq 程序。两处比对共用同一份文本，避免各写一套后分叉。
+# 整段放在单引号常量里，调用处只做一次普通变量展开：内联拼接会产生转义双引号，
+# 而 tests/check-shell-call-targets.py 的分词器遇到那种写法会静默停止检查
+# 文件剩余部分（见公开 Issue #102）。
+SINGBOX_CONFIG_NORMALISE_PROGRAM='
+  if type != "object" then error("运行配置不是 JSON 对象") else . end
+  | if (.route.rules? | type) == "array" then
+      .route.rules |= map(
+        if has("inbound") and ((.inbound | type) != "array") then .inbound = [.inbound] else . end)
+    else . end'
+
+singbox_config_for_comparison() {
+  "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" | jq -c "$SINGBOX_CONFIG_NORMALISE_PROGRAM"
+}
+
 shared_preset_runtime_is_current() {
   local config rows split scope user user_status rule_tag out_tag transport_tag stored_rule stored_out stored_transport protocol inbounds tags legacy_cleanup
-  config="$("$SINGBOX_BIN" format -c "$SINGBOX_CONFIG")" || return 1
+  config="$(singbox_config_for_comparison)" || return 1
   tags="$(collect_managed_split_tags)" || return 1
   legacy_cleanup="$(collect_legacy_split_cleanup_plan_from_config "$config" "$tags")" || return 1
   [[ "$(jq '.rule_tags | length' <<<"$legacy_cleanup")" == 0 ]] || return 1
@@ -10006,7 +10033,10 @@ audit_consistency() {
   AUDIT_REPAIRABLE=0
   config_json="$("$SINGBOX_BIN" format -c "$SINGBOX_CONFIG")" || return 1
   nfuse_json="$(nfuse list --json)" || return 1
-  jq -e 'type == "object"' <<<"$config_json" >/dev/null || return 1
+  # 类型校验与 inbound 还原折在同一次 jq 调用里：本函数的 jq 调用次数受单元测试的
+  # 性能门禁看守（批量化后固定为 9 次），不能为还原再多开一个进程。程序文本与
+  # shared_preset_runtime_is_current 共用 SINGBOX_CONFIG_NORMALISE_PROGRAM。
+  config_json="$(jq -ce "$SINGBOX_CONFIG_NORMALISE_PROGRAM" <<<"$config_json")" || return 1
   jq -e 'type == "array"' <<<"$nfuse_json" >/dev/null || return 1
   user_issue_rows="$(collect_user_consistency_issue_rows "$config_json" "$nfuse_json")" || return 1
   expiry_rows="$(jq -r '.users[] | select(.expires_at != null) | [.name, (.expires_at | tostring)] | @tsv' "$STATE_FILE")" || return 1

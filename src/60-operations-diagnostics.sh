@@ -839,7 +839,10 @@ audit_consistency() {
   AUDIT_REPAIRABLE=0
   config_json="$("$SINGBOX_BIN" format -c "$SINGBOX_CONFIG")" || return 1
   nfuse_json="$(nfuse list --json)" || return 1
-  jq -e 'type == "object"' <<<"$config_json" >/dev/null || return 1
+  # 类型校验与 inbound 还原折在同一次 jq 调用里：本函数的 jq 调用次数受单元测试的
+  # 性能门禁看守（批量化后固定为 9 次），不能为还原再多开一个进程。程序文本与
+  # shared_preset_runtime_is_current 共用 SINGBOX_CONFIG_NORMALISE_PROGRAM。
+  config_json="$(jq -ce "$SINGBOX_CONFIG_NORMALISE_PROGRAM" <<<"$config_json")" || return 1
   jq -e 'type == "array"' <<<"$nfuse_json" >/dev/null || return 1
   user_issue_rows="$(collect_user_consistency_issue_rows "$config_json" "$nfuse_json")" || return 1
   expiry_rows="$(jq -r '.users[] | select(.expires_at != null) | [.name, (.expires_at | tostring)] | @tsv' "$STATE_FILE")" || return 1
