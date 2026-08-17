@@ -144,7 +144,9 @@ load_runtime_config() {
 
 die() {
   echo "错误：$*" >&2
-  exit 1
+  # 非交互只读入口把「工具自身出错」统一为退出码 3，避免与「提醒」(1) 混淆；
+  # 未设置时保持原有的 1，交互路径行为不变。
+  exit "${SB_READONLY_EXIT_CODE:-1}"
 }
 
 log() {

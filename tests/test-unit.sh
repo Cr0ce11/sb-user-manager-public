@@ -7514,4 +7514,199 @@ grep -Fq '原生 SS2022 仍有旧版 ShadowTLS 连接残留' "$work/audit-direct
 
 python3 tests/test-interactive.py
 
+# ============================================================
+# 非交互只读入口
+# ============================================================
+# 只读入口的分发位置很敏感：必须早于 root 检查与接管恢复（recover_manager_handoff 会取锁
+# 并还原文件），又不能让未知参数跟着被放行。以下断言把这两头都钉住。
+readonly_main_body="$(declare -f main | tr -s '[:space:]' ' ')"
+# 必须是精确匹配的 case 分支：写成 status* 之类会把未知参数一起放行
+if ! grep -Fq 'status | users)' <<<"$readonly_main_body"; then
+  echo 'main must dispatch the read-only subcommands with an exact-match case arm' >&2
+  exit 1
+fi
+if ! grep -Fq 'run_readonly_command "$@"' <<<"$readonly_main_body"; then
+  echo 'main must hand the read-only subcommands to run_readonly_command' >&2
+  exit 1
+fi
+# 分发必须出现在 root 检查之前，否则非 root 会拿到退出码 1 而不是 3
+readonly_dispatch_pos="$(awk 'index($0, "run_readonly_command") {print NR; exit}' <<<"$(declare -f main)")"
+readonly_root_pos="$(awk 'index($0, "必须使用 root 运行") {print NR; exit}' <<<"$(declare -f main)")"
+if [[ -z "$readonly_dispatch_pos" || -z "$readonly_root_pos" ]] ||
+   ((readonly_dispatch_pos >= readonly_root_pos)); then
+  echo 'the read-only dispatch must come before the root check and handoff recovery' >&2
+  exit 1
+fi
+# 未知参数不得被只读分发吞掉：main 里仍须保留拒绝分支
+if ! grep -Fq '本脚本采用交互方式，请直接运行且不要添加参数' <<<"$readonly_main_body"; then
+  echo 'main must keep rejecting unknown arguments' >&2
+  exit 1
+fi
+
+# 只读路径绝不能触碰会改状态的函数。这条比任何计时测试都可靠：没取锁就不可能被锁阻塞。
+# 只看代码不看注释：注释里为解释原因会提到这些函数名，那不是调用
+readonly_section="$(sed -n '/^# 非交互只读入口$/,$p' src/60-operations-diagnostics.sh | sed 's/#.*//')"
+for readonly_forbidden in prepare_core acquire_operation_lock recover_pending_transaction \
+  init_state atomic_state_update start_managed_operation finish_managed_operation; do
+  if grep -Fq "$readonly_forbidden" <<<"$readonly_section"; then
+    echo "the read-only section must not call ${readonly_forbidden}" >&2
+    exit 1
+  fi
+done
+
+(
+  readonly_work="$work/readonly"
+  mkdir -p "$readonly_work"
+  STATE_FILE="$readonly_work/state.json"
+  SINGBOX_CONFIG="$readonly_work/config.json"
+  CONF_FILE="$readonly_work/manager.conf"
+  NFUSE_SOCKET="$readonly_work/nfuse.sock"
+  SINGBOX_BIN="$readonly_work/fake-singbox"
+  MANAGER_HANDOFF_JOURNAL="$readonly_work/handoff.json"
+  TRANSACTION_JOURNAL="$readonly_work/transaction.json"
+  # 状态里刻意放入密码、SNI、加密方式和端口，用来核对它们绝不进入输出
+  cat > "$STATE_FILE" <<'READONLYSTATE'
+{"schema_version":7,"users":[
+ {"name":"ro-metered","port":24101,"protocol":"anytls","status":"active","metered":true,"limit_gib":100,"billing_anchor":5,"expires_at":"2026-09-01T00:00:00+0800","usage_offset_bytes":0,"created_at":"2026-01-01T00:00:00+08:00","anytls_password":"ro-secret-any","tls_sni":"ro.private.example","endpoints":[{"protocol":"anytls","port":24101,"anytls_password":"ro-secret-any","tls_sni":"ro.private.example"}]},
+ {"name":"ro-dual","port":24102,"protocol":"ss2022","transport":"direct","status":"active","metered":true,"limit_gib":50,"billing_anchor":5,"expires_at":null,"usage_offset_bytes":0,"created_at":"2026-01-01T00:00:00+08:00","ss2022_password":"ro-secret-ss","method":"2022-blake3-aes-128-gcm","endpoints":[{"protocol":"ss2022","transport":"direct","port":24102,"ss2022_password":"ro-secret-ss","method":"2022-blake3-aes-128-gcm"},{"protocol":"anytls","port":24103,"anytls_password":"ro-secret-any2","tls_sni":"dual.private.example"}]},
+ {"name":"ro-off","port":24104,"protocol":"ss2022","transport":"direct","status":"disabled","metered":false,"limit_gib":null,"billing_anchor":null,"expires_at":null,"usage_offset_bytes":0,"created_at":"2026-01-01T00:00:00+08:00","ss2022_password":"ro-secret-off","method":"2022-blake3-aes-128-gcm","endpoints":[{"protocol":"ss2022","transport":"direct","port":24104,"ss2022_password":"ro-secret-off","method":"2022-blake3-aes-128-gcm"}]}],
+ "splits":[],"outbound_presets":[],"rule_presets":[]}
+READONLYSTATE
+  printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$SINGBOX_CONFIG"
+  printf '%s\n' 'placeholder' > "$CONF_FILE"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$SINGBOX_BIN"
+  chmod +x "$SINGBOX_BIN"
+  # readonly_prepare 只检查配置可读与依赖存在，这里跳过真实的 load_runtime_config
+  load_runtime_config() { :; }
+  systemctl() { printf 'active\n'; }
+  nfuse() {
+    [[ "${1:-}" == list ]] || return 0
+    cat <<'READONLYNFUSE'
+[{"id":1,"name":"ro-metered","tier":"a","limit_gib":100,"limit_bytes":107374182400,"used_bytes":103079215104,"ports":[{"id":1,"start":24101,"end":24101}]},
+ {"id":2,"name":"ro-dual","tier":"a","limit_gib":50,"limit_bytes":53687091200,"used_bytes":1073741824,"ports":[{"id":2,"start":24102,"end":24103}]},
+ {"id":3,"name":"ro-off","tier":"c","limit_gib":0,"limit_bytes":0,"used_bytes":0,"ports":[{"id":3,"start":24104,"end":24104}]}]
+READONLYNFUSE
+  }
+  audit_consistency() { AUDIT_ISSUES=0; AUDIT_REPAIRABLE=0; return 0; }
+  # 到期解析依赖 GNU date，开发机上不一定有；这里桩掉以便在任何平台上验证本文件自己的
+  # 天数与阈值逻辑，真实解析由 parse_expiry_epoch 的既有用例与 Debian CI 覆盖。
+  parse_expiry_epoch() { printf '%s\n' "$(( $(date +%s) + 3 * 86400 ))"; }
+  : > "$NFUSE_SOCKET"
+  readonly_socket_is_real=false
+  if python3 - "$NFUSE_SOCKET" <<'READONLYSOCK' 2>/dev/null
+import os, socket, sys
+path = sys.argv[1]
+os.path.exists(path) and os.unlink(path)
+socket.socket(socket.AF_UNIX).bind(path)
+READONLYSOCK
+  then readonly_socket_is_real=true; fi
+
+  # --- 凭据泄露核对：这是本入口最重要的约束 ---
+  readonly_all_output="$( { cmd_readonly_users; cmd_readonly_users --json; \
+    cmd_readonly_status || true; cmd_readonly_status --json || true; } 2>&1 )"
+  # 只用字符串搜真正的秘密与可连接链接。端口号故意不放进这个列表：它会作为数字子串
+  # 出现在流量字节数里（例如 5241010000 含 24101），那是误报；端口的缺席由下面的
+  # 字段集合断言保证，比子串搜索更严也不会误报。
+  for readonly_secret in ro-secret-any ro-secret-ss ro-secret-any2 ro-secret-off \
+    ro.private.example dual.private.example 2022-blake3 \
+    'anytls://' 'ss://'; do
+    if grep -Fq "$readonly_secret" <<<"$readonly_all_output"; then
+      echo "read-only output must never contain credentials or connectable details: ${readonly_secret}" >&2
+      exit 1
+    fi
+  done
+  # 非 TTY 输出不得带终端转义
+  if printf '%s' "$readonly_all_output" | grep -q $'\033'; then
+    echo 'read-only output must not contain terminal escapes' >&2
+    exit 1
+  fi
+
+  # --- users ---
+  readonly_users_json="$(cmd_readonly_users --json)"
+  jq -e 'has("generated_at") and (.users | length) == 3' <<<"$readonly_users_json" >/dev/null
+  jq -e '.users[] | select(.name == "ro-dual") | .protocols == ["ss2022","anytls"]' <<<"$readonly_users_json" >/dev/null
+  jq -e '.users[] | select(.name == "ro-off") | .enabled == false and .quota_bytes == null' <<<"$readonly_users_json" >/dev/null
+  jq -e '.users[] | select(.name == "ro-metered") | .used_bytes == 103079215104 and .remaining_bytes == 4294967296' <<<"$readonly_users_json" >/dev/null
+  # 字段集合必须逐字相符：多一个字段就说明有东西溜了进来（端口、密码、SNI、加密方式…）
+  if ! jq -e '([.users[] | keys] | flatten | unique) ==
+      ["enabled","expires_at","metered","name","protocols","quota_bytes","remaining_bytes","status","used_bytes"]' \
+      <<<"$readonly_users_json" >/dev/null; then
+    echo 'read-only user records must expose exactly the non-sensitive field set' >&2
+    jq -c '[.users[] | keys] | flatten | unique' <<<"$readonly_users_json" >&2
+    exit 1
+  fi
+  jq -e '(.users | length) == 1 and .users[0].name == "ro-dual"' \
+    <<<"$(cmd_readonly_users --json --name ro-dual)" >/dev/null
+  readonly_rc=0
+  # readonly_fail 用 exit（对命令行入口是对的），因此失败路径必须放进子壳才抓得到退出码
+  ( cmd_readonly_users --name nobody ) >/dev/null 2>&1 || readonly_rc=$?
+  if [[ "$readonly_rc" != 3 ]]; then
+    echo "an unknown user name must exit 3, got ${readonly_rc}" >&2
+    exit 1
+  fi
+  readonly_rc=0
+  ( cmd_readonly_users --bogus ) >/dev/null 2>&1 || readonly_rc=$?
+  if [[ "$readonly_rc" != 3 ]]; then
+    echo "an unrecognised read-only flag must exit 3, got ${readonly_rc}" >&2
+    exit 1
+  fi
+
+  # --- status 的三档退出码 ---
+  if [[ "$readonly_socket_is_real" == true ]]; then
+    # 干净环境：唯一的提醒来自 3 天后到期与 96% 配额，因此应为 1
+    readonly_rc=0
+    readonly_status_json="$(cmd_readonly_status --json)" || readonly_rc=$?
+    if [[ "$readonly_rc" != 1 ]]; then
+      echo "a healthy environment with an expiring user must exit 1, got ${readonly_rc}" >&2
+      exit 1
+    fi
+    jq -e '.conclusion == "notice" and .exit_code == 1' <<<"$readonly_status_json" >/dev/null
+    jq -e '[.notices[] | select(test("将在 3 天后到期"))] | length == 1' <<<"$readonly_status_json" >/dev/null
+    jq -e '[.notices[] | select(test("已用 96%"))] | length == 1' <<<"$readonly_status_json" >/dev/null
+    jq -e '.users == {total:3, active:2, disabled:1}' <<<"$readonly_status_json" >/dev/null
+    # 服务异常必须升级为 2
+    readonly_rc=0
+    systemctl() { [[ "${2:-}" != sing-box.service ]] && printf 'active\n' || printf 'failed\n'; }
+    cmd_readonly_status --json >/dev/null 2>&1 || readonly_rc=$?
+    if [[ "$readonly_rc" != 2 ]]; then
+      echo "a failed service must exit 2, got ${readonly_rc}" >&2
+      exit 1
+    fi
+    systemctl() { printf 'active\n'; }
+    # 需人工处理的一致性问题必须升级为 2；全部可自动修复则只算提醒
+    readonly_rc=0
+    audit_consistency() { AUDIT_ISSUES=3; AUDIT_REPAIRABLE=1; return 0; }
+    cmd_readonly_status --json >/dev/null 2>&1 || readonly_rc=$?
+    if [[ "$readonly_rc" != 2 ]]; then
+      echo "consistency issues needing manual work must exit 2, got ${readonly_rc}" >&2
+      exit 1
+    fi
+    readonly_rc=0
+    audit_consistency() { AUDIT_ISSUES=2; AUDIT_REPAIRABLE=2; return 0; }
+    readonly_status_json="$(cmd_readonly_status --json)" || readonly_rc=$?
+    if [[ "$readonly_rc" != 1 ]]; then
+      echo "fully repairable issues must stay a notice, got ${readonly_rc}" >&2
+      exit 1
+    fi
+    jq -e '[.notices[] | select(test("均可在菜单中自动修复"))] | length == 1' <<<"$readonly_status_json" >/dev/null
+    audit_consistency() { AUDIT_ISSUES=0; AUDIT_REPAIRABLE=0; return 0; }
+    # 未完成的恢复记录必须被如实报出（只读入口不执行恢复）
+    printf '%s\n' '{"backup_stamp":"20260101-000000-1.1"}' > "$TRANSACTION_JOURNAL"
+    readonly_status_json="$(cmd_readonly_status --json)" || true
+    jq -e '[.notices[] | select(test("未完成的操作恢复记录"))] | length == 1' <<<"$readonly_status_json" >/dev/null
+    rm -f -- "$TRANSACTION_JOURNAL"
+  else
+    printf '%s\n' 'read-only status tiers skipped: unix socket fixture unavailable' >&2
+  fi
+
+  # --- 工具自身出错一律退出 3 ---
+  readonly_rc=0
+  ( CONF_FILE="$readonly_work/missing.conf"; cmd_readonly_status ) >/dev/null 2>&1 || readonly_rc=$?
+  if [[ "$readonly_rc" != 3 ]]; then
+    echo "a missing manager config must exit 3, got ${readonly_rc}" >&2
+    exit 1
+  fi
+)
+
+
 echo 'unit checks passed'
