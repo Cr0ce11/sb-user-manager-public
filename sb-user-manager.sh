@@ -9915,20 +9915,24 @@ EOF
   done
 }
 
+# systemd 状态的中文说法。菜单与非交互只读入口共用同一处，避免两边各说一套。
+service_state_label() {
+  case "${1:-}" in
+    active) printf '运行中\n';;
+    inactive) printf '未运行\n';;
+    failed) printf '启动失败\n';;
+    activating) printf '启动中\n';;
+    deactivating) printf '停止中\n';;
+    *) printf '未知（%s）\n' "${1:-unknown}";;
+  esac
+}
+
 show_service_status() {
   local service state description
   printf '\n%-24s %-12s %s\n' '项目' '状态' '说明'
   printf '%-24s %-12s %s\n' '------------------------' '------------' '------------------------------'
   while IFS='|' read -r service description; do
-    state="$(systemctl is-active "$service" 2>/dev/null || true)"
-    case "$state" in
-      active) state='运行中';;
-      inactive) state='未运行';;
-      failed) state='启动失败';;
-      activating) state='启动中';;
-      deactivating) state='停止中';;
-      *) state="未知（${state:-unknown}）";;
-    esac
+    state="$(service_state_label "$(systemctl is-active "$service" 2>/dev/null || true)")"
     printf '%-24s %-12s %s\n' "$service" "$state" "$description"
   done <<'EOF'
 sing-box.service|负责用户连接和分流
@@ -10810,11 +10814,16 @@ readonly_prepare() {
   command -v nfuse >/dev/null 2>&1 || readonly_fail '读不到 nfuse 程序，无法查询流量。'
 }
 
-# 服务状态：输出 服务名<TAB>systemd 状态
+# 服务状态：输出 服务名<TAB>systemd 原始状态<TAB>中文说法。
+# 人读输出用中文说法，--json 保留原始状态作为机器契约。
 readonly_service_rows() {
-  local service
+  local service state
   for service in sing-box.service nfuse.service sb-user-expiry.timer; do
-    printf '%s\t%s\n' "$service" "$(systemctl is-active "$service" 2>/dev/null || true)"
+    state="$(systemctl is-active "$service" 2>/dev/null || true)"
+    # 空状态归一为 unknown：制表符分隔在中间字段为空时会被折叠，读取端会错位；
+    # 同时也让 --json 里的 state 始终是个有意义的值而不是空串。
+    [[ -n "$state" ]] || state=unknown
+    printf '%s\t%s\t%s\n' "$service" "$state" "$(service_state_label "$state")"
   done
 }
 
@@ -10912,10 +10921,10 @@ cmd_readonly_status() {
   done
   readonly_prepare
   services="$(readonly_service_rows)"
-  while IFS=$'\t' read -r service state; do
+  while IFS=$'\t' read -r service state state_label; do
     [[ -n "$service" ]] || continue
     [[ "$state" != active ]] || continue
-    problems="$(jq -c --arg m "服务未正常运行：${service}（${state:-未知}）" '. += [$m]' <<<"$problems")"
+    problems="$(jq -c --arg m "服务未正常运行：${service}（${state_label}）" '. += [$m]' <<<"$problems")"
   done <<<"$services"
   # 用配置里的套接字路径，不写死 /run/nfuse.sock —— 只读入口既然读了配置就该尊重它
   local nfuse_socket="${NFUSE_SOCKET:-/run/nfuse.sock}"
@@ -11004,7 +11013,7 @@ cmd_readonly_status() {
   printf '检查时间：%s\n' "$(readonly_now)"
   printf '服务：'
   printf '%s' "$(jq -rn --arg s "$services" '$s | split("\n") | map(select(length>0) | split("\t") |
-    .[0] + " " + (if .[1] == "active" then "运行中" else (if .[1] == "" then "未知" else .[1] end) end)) | join(" / ")')"
+    .[0] + " " + .[2]) | join(" / ")')"
   printf '\n用户：%s 个（启用 %s，停用 %s）\n' \
     "$(jq 'length' <<<"$users")" \
     "$(jq 'map(select(.status != "disabled")) | length' <<<"$users")" \
