@@ -152,6 +152,7 @@ make_ss2022_inbound() {
 build_user_inbound_payload() {
   local mode="$1" protocol="$2" input_path="$3"
   jq -ce --arg mode "$mode" --arg protocol "$protocol" \
+    --arg cert_path "$ANYTLS_CERT_FILE" --arg key_path "$ANYTLS_KEY_FILE" \
     --argjson handshake_port "$HANDSHAKE_PORT" --argjson strict_mode "$SHADOWTLS_STRICT_MODE" '
     def required_string: if type == "string" and length > 0 then . else error("required string is missing") end;
     def required_number: if type == "number" then . else error("required number is missing") end;
@@ -181,7 +182,7 @@ build_user_inbound_payload() {
         ($endpoint.anytls_password | required_string) as $password |
         [{"type":"anytls","tag":("anytls-" + $name),"listen":"::","listen_port":$port,
           "users":[{"name":$name,"password":$password}],
-          "tls":{"enabled":true,"certificate_path":"/etc/sing-box/cert/anytls.crt","key_path":"/etc/sing-box/cert/anytls.key"}}]
+          "tls":{"enabled":true,"certificate_path":$cert_path,"key_path":$key_path}}]
       elif $protocol == "ss2022" then
         ($endpoint.transport // "shadowtls") as $transport |
         if ($transport == "direct" or $transport == "shadowtls") then . else error("unsupported SS2022 transport") end |
@@ -502,7 +503,8 @@ migrate_legacy_ss2022_udp_inbounds() {
 make_anytls_inbound() {
   local name="$1" port="$2" password="$3"
   SB_JQ_PASSWORD="$password" jq -n --arg name "$name" --argjson port "$port" \
-    '[{"type":"anytls","tag":("anytls-" + $name),"listen":"::","listen_port":$port,"users":[{"name":$name,"password":$ENV.SB_JQ_PASSWORD}],"tls":{"enabled":true,"certificate_path":"/etc/sing-box/cert/anytls.crt","key_path":"/etc/sing-box/cert/anytls.key"}}]'
+    --arg cert_path "$ANYTLS_CERT_FILE" --arg key_path "$ANYTLS_KEY_FILE" \
+    '[{"type":"anytls","tag":("anytls-" + $name),"listen":"::","listen_port":$port,"users":[{"name":$name,"password":$ENV.SB_JQ_PASSWORD}],"tls":{"enabled":true,"certificate_path":$cert_path,"key_path":$key_path}}]'
 }
 
 make_endpoint_inbounds_from_state() {
@@ -752,7 +754,7 @@ get_user_json() {
 }
 
 anytls_certificate_ready() {
-  [[ -f /etc/sing-box/cert/anytls.crt && -f /etc/sing-box/cert/anytls.key ]]
+  [[ -f "$ANYTLS_CERT_FILE" && -f "$ANYTLS_KEY_FILE" ]]
 }
 
 check_new_user_conflicts() {

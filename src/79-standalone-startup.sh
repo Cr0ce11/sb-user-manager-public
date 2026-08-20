@@ -36,9 +36,9 @@ standalone_environment_is_complete() {
     [[ -e "$rooted" || -L "$rooted" ]] || return 1
   done < <(
     kernel_core_paths
-    cat <<'EOF'
+    cat <<EOF
 /etc/sb-user-manager.conf
-/etc/sing-box/managed-users.json
+$MANAGER_DATA_DIR/managed-users.json
 /usr/local/sbin/sb-user-manager
 /usr/local/bin/nfuse
 /etc/systemd/system/nfuse.service

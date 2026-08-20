@@ -28,6 +28,11 @@ MIHOMO_BIN="/usr/local/bin/mihomo"
 MIHOMO_CONFIG="/etc/mihomo/config.json"
 MIHOMO_SERVICE="mihomo"
 MIHOMO_WORK_DIR="/var/lib/mihomo"
+# 管理器自身数据的根目录：用户资料、内部备份、AnyTLS 自签证书都在这里。
+# 这些是管理器的数据，不是 sing-box 的；目录名沿用 /etc/sing-box 纯属历史原因。
+# 这里是这三类路径的唯一来源，改这一个值整组跟着变。默认值不变，
+# 长期方向与搬家计划见公开 Issue #172。
+MANAGER_DATA_DIR="/etc/sing-box"
 MIN_SUPPORTED_STATE_SCHEMA_VERSION=0
 MIGRATION_FORMAT_VERSION=1
 MIGRATION_BUNDLE_VERSION=1
@@ -60,6 +65,18 @@ DEPLOYED_VERSIONS_FILE="${SB_DEPLOYED_VERSIONS_FILE:-/var/lib/sb-user-manager/ve
 DIAGNOSTIC_REPORT_DIR="${SB_DIAGNOSTIC_REPORT_DIR:-/root/sb-user-manager-diagnostics}"
 DEFAULT_SS2022_SHADOWTLS_SNI="publicassets.cdn-apple.com"
 DEFAULT_ANYTLS_SNI="weKbP9SVYU.download.windowsupdate.com"
+
+# 由 MANAGER_DATA_DIR 派生的路径。文件级与 load_runtime_config 两处共用这一个
+# 函数，而不是各写一遍拼接：两份写法迟早会漂移。
+# 需要文件级取值的原因与 SINGBOX_BIN 那一组相同——部署流程在管理配置写出之前
+# 就要用到证书目录（mihomo 单元里的 SAFE_PATHS），而那时 load_runtime_config
+# 只在子进程里跑过。
+resolve_manager_data_paths() {
+  CERT_DIR="$MANAGER_DATA_DIR/cert"
+  ANYTLS_CERT_FILE="$CERT_DIR/anytls.crt"
+  ANYTLS_KEY_FILE="$CERT_DIR/anytls.key"
+}
+resolve_manager_data_paths
 
 manager_file_uid() {
   stat -c '%u' -- "$1" 2>/dev/null || stat -f '%u' "$1" 2>/dev/null
@@ -110,7 +127,7 @@ parse_runtime_config() {
       STATE_FILE|LOCK_FILE|BACKUP_DIR|TRANSACTION_DIR|TRANSACTION_JOURNAL|\
       CLIENT_SERVER_PORT_OVERRIDE|PUBLIC_SERVER_OVERRIDE|GITHUB_TOKEN|\
       SS_METHOD|HANDSHAKE_SERVER|TLS_SERVER_NAME|PORT_MIN|PORT_MAX|PROXY_KERNEL|\
-      MIHOMO_BIN|MIHOMO_CONFIG|MIHOMO_SERVICE|MIHOMO_WORK_DIR) ;;
+      MIHOMO_BIN|MIHOMO_CONFIG|MIHOMO_SERVICE|MIHOMO_WORK_DIR|MANAGER_DATA_DIR) ;;
       *) die "管理配置第 ${line_number} 行包含未知配置项：$key" ;;
     esac
     [[ "$seen" != *"|${key}|"* ]] || die "管理配置第 ${line_number} 行重复设置：$key"
@@ -164,9 +181,17 @@ load_runtime_config() {
   : "${NFUSE_BIN:=/usr/local/bin/nfuse}"
   : "${NFUSE_SOCKET:=/run/nfuse.sock}"
   : "${NFUSE_DB:=/var/lib/nfuse/nfuse.db}"
-  : "${STATE_FILE:=/etc/sing-box/managed-users.json}"
+  # 管理器数据目录。既有部署与 sing-box 新装机器的管理配置里不写这一项，
+  # 取默认值后与历史版本一字不差；显式写了就以配置为准。
+  : "${MANAGER_DATA_DIR:=/etc/sing-box}"
+  # 相对路径会让用户资料、内部备份与证书落到脚本当时的工作目录里，
+  # 而这三样东西丢了就是丢了。宁可拒绝启动，不将就。
+  [[ "$MANAGER_DATA_DIR" == /* ]] ||
+    die "管理配置中的管理器数据目录必须是绝对路径：$MANAGER_DATA_DIR"
+  resolve_manager_data_paths
+  : "${STATE_FILE:=$MANAGER_DATA_DIR/managed-users.json}"
   : "${LOCK_FILE:=/run/lock/sb-user-manager.lock}"
-  : "${BACKUP_DIR:=/etc/sing-box/backups}"
+  : "${BACKUP_DIR:=$MANAGER_DATA_DIR/backups}"
   : "${TRANSACTION_DIR:=/var/lib/sb-user-manager/transactions}"
   : "${TRANSACTION_JOURNAL:=$TRANSACTION_DIR/active.json}"
   # 用户入站端口固定在管理器专用范围；不沿用旧版配置中的宽范围。
