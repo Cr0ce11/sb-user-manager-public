@@ -542,7 +542,7 @@ render_split_diagnostic_results() {
 }
 
 prompt_split_diagnostic() {
-  local split split_name scope user expected_outbound expected_outbound_display answer cursor_line cursor log_file log_level status
+  local split split_name scope user expected_outbound expected_outbound_display answer cursor_line cursor log_file log_level status kernel_service
   prepare_core
   need_cmd journalctl
   if legacy_split_cleanup_pending; then
@@ -582,7 +582,8 @@ prompt_split_diagnostic() {
 EOF
   read -r -p '按回车开始记录，输入 0 返回：' answer
   [[ "$answer" != 0 ]] || { MENU_RETURNED=true; return 0; }
-  cursor_line="$(journalctl -u "$SINGBOX_SERVICE" -n 0 --show-cursor --no-pager 2>/dev/null | tail -n1)"
+  kernel_service="$(kernel_service_name)" || return 1
+  cursor_line="$(journalctl -u "$kernel_service" -n 0 --show-cursor --no-pager 2>/dev/null | tail -n1)"
   cursor="${cursor_line#-- cursor: }"
   if [[ -z "$cursor" || "$cursor" == "$cursor_line" ]]; then
     echo "无法读取连接日志起点，请确认 systemd 日志服务正常。"
@@ -593,7 +594,7 @@ EOF
   [[ "$answer" != 0 ]] || { MENU_RETURNED=true; return 0; }
   log_file="$(mktemp /tmp/sb-split-diagnostic.XXXXXX)" || return 1
   register_temp_path "$log_file"
-  if ! journalctl -u "$SINGBOX_SERVICE" --after-cursor="$cursor" --no-pager -o cat > "$log_file" 2>/dev/null; then
+  if ! journalctl -u "$kernel_service" --after-cursor="$cursor" --no-pager -o cat > "$log_file" 2>/dev/null; then
     rm -f -- "$log_file"
     echo "读取新增连接日志失败，请确认 systemd 日志服务正常。"
     return 0

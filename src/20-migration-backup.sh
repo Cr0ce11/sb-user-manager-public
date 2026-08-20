@@ -1734,7 +1734,7 @@ restore_migration_backup() {
   fi
   read -r -p "确认继续？请输入 ${confirm_token}：" answer
   [[ "$answer" == "$confirm_token" ]] || { rm -f "$payload"; echo '已取消恢复。'; return 0; }
-  if ! ensure_safe_ssh_for_singbox_restart; then
+  if ! ensure_safe_ssh_for_kernel_restart; then
     rm -f -- "$payload"
     return 0
   fi

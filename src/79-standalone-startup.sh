@@ -29,20 +29,23 @@ run_standalone_interactive_startup() {
 
 standalone_environment_is_complete() {
   local logical rooted
-  for logical in \
-    /etc/sb-user-manager.conf \
-    /etc/sing-box/config.json \
-    /etc/sing-box/managed-users.json \
-    /usr/local/sbin/sb-user-manager \
-    /usr/local/bin/sing-box \
-    /usr/local/bin/nfuse \
-    /etc/systemd/system/sing-box.service \
-    /etc/systemd/system/nfuse.service \
-    /etc/systemd/system/sb-user-expiry.service \
-    /etc/systemd/system/sb-user-expiry.timer; do
+  # 内核相关的三项由适配层按当前内核给出：一台 mihomo 机器上没有 sing-box
+  # 是正常状态，写死 sing-box 会让到期任务在这类机器上永远拒绝运行。
+  while IFS= read -r logical; do
     rooted="$(system_path "$logical")" || return 1
     [[ -e "$rooted" || -L "$rooted" ]] || return 1
-  done
+  done < <(
+    kernel_core_paths
+    cat <<'EOF'
+/etc/sb-user-manager.conf
+/etc/sing-box/managed-users.json
+/usr/local/sbin/sb-user-manager
+/usr/local/bin/nfuse
+/etc/systemd/system/nfuse.service
+/etc/systemd/system/sb-user-expiry.service
+/etc/systemd/system/sb-user-expiry.timer
+EOF
+  )
 }
 
 run_standalone_internal_expire() {

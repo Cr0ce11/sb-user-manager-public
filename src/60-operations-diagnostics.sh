@@ -252,7 +252,7 @@ prompt_multi_account() {
 
 prompt_add_node() {
   local protocol_choice account_choice protocol method="" protocol_sni="" tls_sni=""
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   load_runtime_config
   while true; do
     echo
@@ -767,11 +767,13 @@ show_service_status() {
   while IFS='|' read -r service description; do
     state="$(service_state_label "$(systemctl is-active "$service" 2>/dev/null || true)")"
     printf '%-24s %-12s %s\n' "$service" "$state" "$description"
-  done <<'EOF'
-sing-box.service|负责用户连接和分流
+  done < <(
+    printf '%s.service|负责用户连接和分流\n' "$(kernel_service_name)"
+    cat <<'EOF'
 nfuse.service|负责流量统计和用量限制
 sb-user-expiry.timer|负责自动停用到期用户
 EOF
+  )
   printf '\n流量统计通信：%s\n' "$([[ -S /run/nfuse.sock ]] && echo '正常' || echo '未就绪，请检查 Nfuse 服务')"
   printf '管理脚本：%s\n' "$([[ -x /usr/local/sbin/sb-user-manager ]] && echo '已安装' || echo '未安装')"
 }
@@ -837,6 +839,16 @@ audit_consistency() {
   local preset_link_rows preset_kind preset_reason managed_tags legacy_cleanup legacy_count
   AUDIT_ISSUES=0
   AUDIT_REPAIRABLE=0
+  # 一致性检查按 sing-box 的入站标签比对托管内容，mihomo 侧的等价识别方式
+  # 还没有建立（第二步 2e）。这里明确说明并计为一个待处理项，而不是让下面的
+  # 流程去读一份读不出来的配置然后报一个看不懂的错。
+  # 计为待处理项是有意的：一台还不能自检的机器本来就不该被当作正常。
+  if [[ "$PROXY_KERNEL" != singbox ]]; then
+    printf '\n服务与配置检查结果\n\n'
+    printf '  [需要处理] 服务与配置一致性检查尚未支持 %s 部署，本项未执行。\n' "$(kernel_display_name)"
+    AUDIT_ISSUES=1
+    return 0
+  fi
   config_json="$(kernel_normalized_config)" || return 1
   nfuse_json="$(nfuse list --json)" || return 1
   # 类型校验与 inbound 还原折在同一次 jq 调用里：本函数的 jq 调用次数受单元测试的
@@ -984,7 +996,7 @@ repair_consistency() {
   jq -e 'type == "array"' <<<"$nfuse_json" >/dev/null || return 1
   user_rows="$(jq -c '.users[]' "$STATE_FILE")" || return 1
   split_rows="$(jq -c '.splits[]?' "$STATE_FILE")" || return 1
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   create_environment_backup || return 1
   environment_backup="$ENV_BACKUP"
   start_managed_operation "repair-consistency" || return 1
@@ -1366,7 +1378,7 @@ diagnostic_report_uid() {
 }
 
 create_diagnostic_report() {
-  local raw sanitized audit_file log_file report os_name singbox_version nfuse_version channel recorded_version
+  local raw sanitized audit_file log_file report os_name singbox_version nfuse_version channel recorded_version kernel_bin_path kernel_cfg_path
   local sing_state nfuse_state expiry_state config_result nfuse_result state_result audit_result transaction_result launcher_result overall
   local users_total=0 users_active=0 users_disabled=0 users_ss=0 users_ss_legacy=0 users_anytls=0 users_metered=0 users_self=0
   local splits_total=0 splits_active=0 splits_disabled=0 splits_all=0 splits_user=0
@@ -1406,10 +1418,12 @@ create_diagnostic_report() {
   else launcher_result='未发现可选的 root 启动副本'
   fi
 
-  sing_state="$(diagnostic_service_state sing-box.service)"
+  sing_state="$(diagnostic_service_state "$(kernel_service_name).service")"
   nfuse_state="$(diagnostic_service_state nfuse.service)"
   expiry_state="$(diagnostic_service_state sb-user-expiry.timer)"
-  if [[ -x "$SINGBOX_BIN" && -r "$SINGBOX_CONFIG" ]] && kernel_check_config "$SINGBOX_CONFIG" >/dev/null 2>&1; then config_result='通过'
+  kernel_bin_path="$(kernel_binary_path)" || return 1
+  kernel_cfg_path="$(kernel_config_path)" || return 1
+  if [[ -x "$kernel_bin_path" && -r "$kernel_cfg_path" ]] && kernel_check_config "$kernel_cfg_path" >/dev/null 2>&1; then config_result='通过'
   else config_result='未通过'; fi
   if diagnostic_nfuse_healthy; then nfuse_result='正常'
   else nfuse_result='异常'; fi
@@ -1496,7 +1510,7 @@ create_diagnostic_report() {
     echo
     echo '== 最近 24 小时的服务警告（每项最多 30 条） =='
     echo '说明：这里是历史记录；如果总体结果为“正常”，不代表这些问题当前仍在发生。'
-    append_diagnostic_service_log sing-box.service '连接服务（sing-box）' "$log_file"
+    append_diagnostic_service_log "$(kernel_service_name).service" "连接服务（$(kernel_display_name)）" "$log_file"
     append_diagnostic_service_log nfuse.service '流量统计（Nfuse）' "$log_file"
     append_diagnostic_service_log sb-user-expiry.service '到期自动检查' "$log_file"
   } > "$raw"
@@ -1654,7 +1668,7 @@ readonly_fail() {
 # 只做只读查询需要的最小准备：校验权限与依赖、加载运行配置。
 # 期间任何内部 die 都会因 SB_READONLY_EXIT_CODE 归为退出码 3。
 readonly_prepare() {
-  local cmd
+  local cmd readonly_kernel_bin
   # 单元测试会以普通用户加载隔离环境；真实运行必须是 root，否则读不到 600 权限的用户数据。
   # 与 runtime_config_expected_uid 采用同一判定方式。
   if [[ "${SB_USER_MANAGER_LIBRARY:-false}" != true ]]; then
@@ -1667,8 +1681,9 @@ readonly_prepare() {
     readonly_fail '尚未部署管理环境，请先在交互菜单中执行「系统管理 → 部署与卸载 → 安装或修复环境」。'
   load_runtime_config
   [[ -r "$STATE_FILE" ]] || readonly_fail "读不到用户数据：${STATE_FILE}"
-  command -v "$SINGBOX_BIN" >/dev/null 2>&1 || [[ -x "$SINGBOX_BIN" ]] ||
-    readonly_fail "读不到 sing-box 程序：${SINGBOX_BIN}"
+  readonly_kernel_bin="$(kernel_binary_path)" || readonly_fail '无法确认代理内核的可执行文件位置。'
+  command -v "$readonly_kernel_bin" >/dev/null 2>&1 || [[ -x "$readonly_kernel_bin" ]] ||
+    readonly_fail "读不到 $(kernel_display_name) 程序：${readonly_kernel_bin}"
   command -v nfuse >/dev/null 2>&1 || readonly_fail '读不到 nfuse 程序，无法查询流量。'
 }
 
@@ -1676,7 +1691,7 @@ readonly_prepare() {
 # 人读输出用中文说法，--json 保留原始状态作为机器契约。
 readonly_service_rows() {
   local service state
-  for service in sing-box.service nfuse.service sb-user-expiry.timer; do
+  for service in "$(kernel_service_name).service" nfuse.service sb-user-expiry.timer; do
     state="$(systemctl is-active "$service" 2>/dev/null || true)"
     # 空状态归一为 unknown：制表符分隔在中间字段为空时会被折叠，读取端会错位；
     # 同时也让 --json 里的 state 始终是个有意义的值而不是空串。

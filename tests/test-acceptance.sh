@@ -74,6 +74,13 @@ STATE_SCHEMA_VERSION=3
 CONF_FILE="$FAKE_ROOT/manager.conf"
 SINGBOX_BIN="$FAKE_ROOT/bin/sing-box"
 SINGBOX_CONFIG="$FAKE_ROOT/config.json"
+# 验收工具经适配层取内核身份；夹具按 FAKE_PROXY_KERNEL 提供同样的接口，
+# 用来验证工具确实跟着内核走，而不是写死 sing-box。
+PROXY_KERNEL="${FAKE_PROXY_KERNEL:-singbox}"
+kernel_service_name() { case "$PROXY_KERNEL" in mihomo) printf mihomo ;; *) printf sing-box ;; esac; }
+kernel_display_name() { kernel_service_name; }
+kernel_config_path() { printf '%s' "$SINGBOX_CONFIG"; }
+kernel_check_config() { "$SINGBOX_BIN" check -c "$1"; }
 NFUSE_SOCKET="$FAKE_ROOT/nfuse.sock"
 STATE_FILE="$FAKE_ROOT/state.json"
 LOCK_FILE="$FAKE_ROOT/manager.lock"
@@ -135,6 +142,29 @@ jq -e '
   ([.checks[].status] | all(. == "PASS"))
 ' "$report" >/dev/null
 grep -Fq '验收结果：success' "$work/output"
+# 只读验收必须跟着部署声明的内核走。写死 sing-box 会让 mihomo 机器上的
+# 「服务 active」永远查的是一个不存在的单元。
+jq -e '[.checks[].check] | any(. == "服务 sing-box.service")' "$report" >/dev/null
+jq -e '[.checks[].check] | any(. == "sing-box 配置校验")' "$report" >/dev/null
+
+rm -f "$work/reports"/*.json
+if ! PATH="$work/bin:$PATH" \
+  FAKE_ROOT="$work" \
+  FAKE_PROXY_KERNEL=mihomo \
+  SB_ACCEPTANCE_TEST_MODE=true \
+  SB_ACCEPTANCE_MANAGER="$work/manager.sh" \
+  SB_ACCEPTANCE_REPORT_DIR="$work/reports" \
+  SB_ACCEPTANCE_VERSIONS_FILE="$work/versions" \
+  SB_ACCEPTANCE_LAUNCHER_PATH="$work/manager.sh" \
+    bash tests/acceptance.sh audit > "$work/mihomo-output" 2>&1; then
+  cat "$work/mihomo-output" >&2
+  exit 1
+fi
+mihomo_report="$(find "$work/reports" -type f -name 'acceptance-audit-*.json' -print -quit)"
+[[ -n "$mihomo_report" ]]
+jq -e '[.checks[].check] | any(. == "服务 mihomo.service")' "$mihomo_report" >/dev/null
+jq -e '[.checks[].check] | any(. == "mihomo 配置校验")' "$mihomo_report" >/dev/null
+jq -e '[.checks[].check] | all(. != "服务 sing-box.service")' "$mihomo_report" >/dev/null
 
 rm -f "$work/reports"/*.json
 if ! PATH="$work/bin:$PATH" \
@@ -326,6 +356,9 @@ SB_ACCEPTANCE_LIBRARY=true ACCEPTANCE_TEST_ROOT="$handler_probe" bash -c '
   CURRENT_MUTATION_LABEL=恢复单文件迁移备份
   SINGBOX_BIN=true
   SINGBOX_CONFIG="$ACCEPTANCE_TEST_ROOT/config.json"
+  kernel_check_config() { "$SINGBOX_BIN" check -c "$1"; }
+  kernel_config_path() { printf '''%s''' "$SINGBOX_CONFIG"; }
+  kernel_service_name() { printf sing-box; }
   mkdir -p "$WORK"
   : > "$RESULTS"
   printf '\''diagnostic-sentinel\n'\'' > "$WORK/mutation.log"
@@ -366,6 +399,9 @@ SB_ACCEPTANCE_LIBRARY=true ACCEPTANCE_TEST_ROOT="$recheck_probe" bash -c '
   SNAPSHOT="$ACCEPTANCE_TEST_ROOT/snapshot"
   SINGBOX_BIN=true
   SINGBOX_CONFIG="$ACCEPTANCE_TEST_ROOT/config.json"
+  kernel_check_config() { "$SINGBOX_BIN" check -c "$1"; }
+  kernel_config_path() { printf '''%s''' "$SINGBOX_CONFIG"; }
+  kernel_service_name() { printf sing-box; }
   : > "$RESULTS"
   printf '\''{"schema_version":3,"users":[],"splits":[]}\n'\'' > "$STATE_FILE"
   restore_environment_backup() { :; }

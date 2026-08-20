@@ -18,6 +18,16 @@ STATE_SCHEMA_VERSION=7
 # 代理内核的文件级默认值。载入管理配置之前也可能被读到（例如只读查询的早期路径），
 # 因此这里先定义，具体取值与校验仍由 load_runtime_config 负责。
 PROXY_KERNEL="singbox"
+# 内核的位置与服务名同理需要文件级默认值：部署流程在管理配置写出之前就要
+# 用适配层写单元文件、校验配置，而 load_runtime_config 在那之前只在子进程里跑过。
+# load_runtime_config 中同名的 := 兜底保留不动，管理配置里的显式取值仍然覆盖这里。
+SINGBOX_BIN="/usr/local/bin/sing-box"
+SINGBOX_CONFIG="/etc/sing-box/config.json"
+SINGBOX_SERVICE="sing-box"
+MIHOMO_BIN="/usr/local/bin/mihomo"
+MIHOMO_CONFIG="/etc/mihomo/config.json"
+MIHOMO_SERVICE="mihomo"
+MIHOMO_WORK_DIR="/var/lib/mihomo"
 MIN_SUPPORTED_STATE_SCHEMA_VERSION=0
 MIGRATION_FORMAT_VERSION=1
 MIGRATION_BUNDLE_VERSION=1
@@ -38,6 +48,12 @@ MANAGER_ASSET="sb-user-manager.sh"
 : "$MANAGER_REPOSITORY" "$MANAGER_ASSET"
 SINGBOX_REPOSITORY="SagerNet/sing-box"
 SINGBOX_ARCH="linux-amd64"
+MIHOMO_REPOSITORY="MetaCubeX/mihomo"
+# 资产变体刻意选 compatible（GOAMD64=v1），不是不带后缀的那个。
+# 实测：mihomo 不带后缀的 linux-amd64 资产其实是 v3 构建，在不支持 v3 微架构的
+# CPU 上直接拒绝运行（退出码 1）。廉价 VPS 上只到 v2 的老 Xeon 仍然常见，
+# 本项目的测试机自己也跑不了 v3。详见公开 Issue #165。
+MIHOMO_ARCH="linux-amd64-compatible"
 SINGBOX_CHANNEL_STATE="${SB_SINGBOX_CHANNEL_STATE:-/var/lib/sb-user-manager/singbox-channel.json}"
 SINGBOX_VERSION_STORE="${SB_SINGBOX_VERSION_STORE:-/var/lib/sb-user-manager/singbox-versions}"
 DEPLOYED_VERSIONS_FILE="${SB_DEPLOYED_VERSIONS_FILE:-/var/lib/sb-user-manager/versions}"
@@ -93,7 +109,8 @@ parse_runtime_config() {
       SINGBOX_BIN|SINGBOX_CONFIG|SINGBOX_SERVICE|NFUSE_BIN|NFUSE_SOCKET|NFUSE_DB|\
       STATE_FILE|LOCK_FILE|BACKUP_DIR|TRANSACTION_DIR|TRANSACTION_JOURNAL|\
       CLIENT_SERVER_PORT_OVERRIDE|PUBLIC_SERVER_OVERRIDE|GITHUB_TOKEN|\
-      SS_METHOD|HANDSHAKE_SERVER|TLS_SERVER_NAME|PORT_MIN|PORT_MAX|PROXY_KERNEL) ;;
+      SS_METHOD|HANDSHAKE_SERVER|TLS_SERVER_NAME|PORT_MIN|PORT_MAX|PROXY_KERNEL|\
+      MIHOMO_BIN|MIHOMO_CONFIG|MIHOMO_SERVICE|MIHOMO_WORK_DIR) ;;
       *) die "管理配置第 ${line_number} 行包含未知配置项：$key" ;;
     esac
     [[ "$seen" != *"|${key}|"* ]] || die "管理配置第 ${line_number} 行重复设置：$key"
@@ -128,14 +145,22 @@ load_runtime_config() {
   # 只有 mihomo 部署才会写入该键，而那类机器本来就无法回退到不支持 mihomo 的脚本。
   : "${PROXY_KERNEL:=singbox}"
   case "$PROXY_KERNEL" in
-    singbox) ;;
+    singbox|mihomo) ;;
     # 不静默降级为 sing-box：那会让一台本该跑 mihomo 的机器悄悄跑成另一个内核，
     # 而使用者从界面上看不出任何异常。
-    *) die "管理配置中的内核名无法识别：${PROXY_KERNEL}。当前脚本支持：singbox" ;;
+    *) die "管理配置中的内核名无法识别：${PROXY_KERNEL}。当前脚本支持：singbox、mihomo" ;;
   esac
   : "${SINGBOX_BIN:=/usr/local/bin/sing-box}"
   : "${SINGBOX_CONFIG:=/etc/sing-box/config.json}"
   : "${SINGBOX_SERVICE:=sing-box}"
+  # mihomo 的位置与 sing-box 并列，互不覆盖：一台机器只跑其中一个，
+  # 但两套默认值都先备好，适配层按 PROXY_KERNEL 取用哪一套。
+  # 工作目录是 mihomo 特有的概念——它把 cache.db 一类运行期文件写在这里，
+  # 并且默认只允许加载工作目录之内的证书（见公开 Issue #154）。
+  : "${MIHOMO_BIN:=/usr/local/bin/mihomo}"
+  : "${MIHOMO_CONFIG:=/etc/mihomo/config.json}"
+  : "${MIHOMO_SERVICE:=mihomo}"
+  : "${MIHOMO_WORK_DIR:=/var/lib/mihomo}"
   : "${NFUSE_BIN:=/usr/local/bin/nfuse}"
   : "${NFUSE_SOCKET:=/run/nfuse.sock}"
   : "${NFUSE_DB:=/var/lib/nfuse/nfuse.db}"
@@ -394,39 +419,140 @@ install_runtime_traps() {
 # 其它模块只经由这里定义的函数与内核交互。
 # 这样做的原因：上游内核会在小版本之间修改配置规范与命令行接口，
 # 调用点散落在各模块时，每次跟进都要同时改多处；集中之后只改这里一处。
+#
+# 本模块按 $PROXY_KERNEL 分派。分派刻意只写在「取名字与路径」的存取函数和
+# 「命令行写法本来就不同」的少数函数里，其余函数经存取函数间接使用，
+# 因此不需要各自再写一遍 case——同一处判断写两遍才是分叉的来源。
+# tests/test-static.sh 据此检查：本模块中凡是直接提到某个内核的函数，
+# 都必须同时给出两个内核的分支。
+
+# 内核名无法识别时的统一出口。载入管理配置时已经拒绝过未知内核名，
+# 这里是防止将来有人绕开那条路径后静默走错分支。
+kernel_unknown() {
+  printf '内部错误：代理内核名无法识别：%s\n' "${PROXY_KERNEL:-未设置}" >&2
+  return 1
+}
+
+# 某个内核尚未实现的操作。刻意报错而不是回落到另一个内核的实现：
+# 回落会让一台 mihomo 机器按 sing-box 的结构改写配置，产生的是坏数据而不是错误。
+kernel_unsupported() {
+  printf '当前部署使用的代理内核（%s）尚不支持该操作：%s\n' "${PROXY_KERNEL:-未设置}" "$1" >&2
+  return 1
+}
+
+# 当前部署的内核可执行文件、配置文件、服务名与工作目录。
+# 工作目录是 mihomo 特有的概念：它把 cache.db 一类运行期文件写在这里，
+# 并且默认拒绝加载工作目录之外的证书（公开 Issue #154）。sing-box 没有对应物。
+kernel_binary_path() {
+  case "$PROXY_KERNEL" in
+    singbox) printf '%s' "$SINGBOX_BIN" ;;
+    mihomo) printf '%s' "$MIHOMO_BIN" ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+kernel_config_path() {
+  case "$PROXY_KERNEL" in
+    singbox) printf '%s' "$SINGBOX_CONFIG" ;;
+    mihomo) printf '%s' "$MIHOMO_CONFIG" ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+kernel_service_name() {
+  case "$PROXY_KERNEL" in
+    singbox) printf '%s' "$SINGBOX_SERVICE" ;;
+    mihomo) printf '%s' "$MIHOMO_SERVICE" ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+kernel_work_dir() {
+  case "$PROXY_KERNEL" in
+    singbox) printf '%s' /var/lib/sing-box ;;
+    mihomo) printf '%s' "$MIHOMO_WORK_DIR" ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 给使用者看的内核名称。界面上不出现 singbox / mihomo 这种内部标识。
+kernel_display_name() {
+  case "$PROXY_KERNEL" in
+    singbox) printf 'sing-box' ;;
+    mihomo) printf 'mihomo' ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 内核在 `ss -p` 一类输出里出现的进程名。刻意与展示名分成两个函数：
+# 两者当前取值相同纯属巧合，而「SSH 连接是不是走本机节点」这条护栏
+# 依赖的是进程名的精确匹配，不能跟着展示措辞一起改。
+kernel_process_name() {
+  case "$PROXY_KERNEL" in
+    singbox) printf 'sing-box' ;;
+    mihomo) printf 'mihomo' ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 按标准绝对路径读取既有安装的规范化配置。与 kernel_check_default_install 同理，
+# 调用发生在接管流程中，那时运行时配置尚未加载。
+kernel_normalized_default_install() {
+  case "$PROXY_KERNEL" in
+    singbox) /usr/local/bin/sing-box format -c /etc/sing-box/config.json || return 1 ;;
+    mihomo) kernel_unsupported '读取既有安装的规范化配置' ;;
+    *) kernel_unknown ;;
+  esac
+}
 
 # 读取当前部署的内核配置，输出内核自身规范化后的 JSON 到标准输出。
 # 调用方可以重定向到文件、用命令替换取值，或直接接管道，三种形态都适用。
 # 失败时按内核的退出码返回，由调用方决定如何处理。
+# mihomo 没有对应的子命令，且它的调用点全部属于用户与分流的配置生成，
+# 那些还没有 mihomo 实现，因此这里明确报错而不是给出一个半成品。
 kernel_normalized_config() {
-  "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG"
+  case "$PROXY_KERNEL" in
+    singbox) "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" ;;
+    mihomo) kernel_unsupported '读取规范化后的运行配置' ;;
+    *) kernel_unknown ;;
+  esac
 }
 
 # 用当前安装的内核校验指定的配置文件。
 # 不内建输出重定向：各调用点对错误输出的处理不同（向用户显示、静默、捕获），
 # 由调用点自行决定。
 kernel_check_config() {
-  kernel_check_config_with "$SINGBOX_BIN" "$1" || return 1
+  kernel_check_config_with "$(kernel_binary_path)" "$1" || return 1
 }
 
 # 用指定的内核可执行文件校验配置文件。
 # 切换正式版与测试版通道、以及接管既有安装时，需要用非当前的二进制校验。
+# 两个内核的写法不同：sing-box 是 `check -c 文件`，mihomo 是 `-t -d 工作目录 -f 文件`。
+# mihomo 必须带 -d：不带时它会按自己的默认目录找配置并在那里落下运行期文件。
 kernel_check_config_with() {
-  "$1" check -c "$2" || return 1
+  case "$PROXY_KERNEL" in
+    singbox) "$1" check -c "$2" || return 1 ;;
+    mihomo) "$1" -t -d "$MIHOMO_WORK_DIR" -f "$2" || return 1 ;;
+    *) kernel_unknown ;;
+  esac
 }
 
 # 按标准绝对路径校验既有安装的配置。
 # 这里刻意不使用运行时配置里的路径：调用发生在环境探测与部署流程中，
 # 那时运行时配置可能尚未加载，而且这里要确认的正是标准位置上的部署是否可用。
 kernel_check_default_install() {
-  /usr/local/bin/sing-box check -c /etc/sing-box/config.json || return 1
+  case "$PROXY_KERNEL" in
+    singbox) /usr/local/bin/sing-box check -c /etc/sing-box/config.json || return 1 ;;
+    mihomo) /usr/local/bin/mihomo -t -d /var/lib/mihomo -f /etc/mihomo/config.json || return 1 ;;
+    *) kernel_unknown ;;
+  esac
 }
 
 # 内核配置骨架的唯一定义。语义是「幂等补齐，不覆盖已有值」：
 # 对空对象应用它得到全新安装的初始配置，对既有配置应用它只补上缺的部分。
 # 全新安装、接管既有安装、一致性审计三处共用这一份，避免各写一套之后悄悄分叉——
 # v4.25.11 所修的缺陷正是同一份判断被写成两处而产生的。
-# 骨架属于内核特有的 schema 知识，因此放在适配层：接入第二内核时这里要各写一份。
+# 骨架属于内核特有的 schema 知识，因此放在适配层，每个内核各一份。
 SINGBOX_SKELETON_ENSURE_PROGRAM='
   if type != "object" then error("运行配置不是 JSON 对象") else . end
   | .log = (.log // {level:"info",timestamp:true})
@@ -446,37 +572,125 @@ SINGBOX_SKELETON_ENSURE_PROGRAM='
   | .experimental.cache_file = (.experimental.cache_file // {})
   | .experimental.cache_file.enabled = (.experimental.cache_file.enabled // true)'
 
-# 读取指定内核可执行文件的版本号。「版本号位于输出第 1 行第 3 列」是内核特有的
-# 输出约定，因此解析放在适配层；文件不可执行时返回空字符串而不是报错，
+# mihomo 的骨架。这里刻意**不写**用来重申默认值的配置项。
+# mihomo 对未知键完全静默（公开 Issue #154），写一个拼错的 external-controller
+# 只会带来虚假的安全感；真正起保护作用的是「服务起来之后名下监听套接字数为 0」
+# 这条可观测断言，它一条就同时证明了控制接口与所有通用入口都没有打开。
+# 实测：以 {"listeners":[]} 启动的 mihomo 不监听任何端口，也不下载任何 geo 数据库。
+# proxies / proxy-groups / rules 是分流要用的容器（第二步 2d），现在先以空数组占位，
+# 使骨架在后续分片中保持稳定，不必每加一片就改一次定义。
+MIHOMO_SKELETON_ENSURE_PROGRAM='
+  if type != "object" then error("运行配置不是 JSON 对象") else . end
+  | .["log-level"] = (.["log-level"] // "info")
+  | .mode = (.mode // "rule")
+  | .listeners = (.listeners // [])
+  | .proxies = (.proxies // [])
+  | .["proxy-groups"] = (.["proxy-groups"] // [])
+  | .rules = (.rules // [])'
+
+kernel_skeleton_ensure_program() {
+  case "$PROXY_KERNEL" in
+    singbox) printf '%s' "$SINGBOX_SKELETON_ENSURE_PROGRAM" ;;
+    mihomo) printf '%s' "$MIHOMO_SKELETON_ENSURE_PROGRAM" ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 读取指定内核可执行文件的版本号。版本号的位置是内核特有的输出约定，
+# 因此解析放在适配层；文件不可执行时返回空字符串而不是报错，
 # 调用点据此显示「未安装」或「未保存」。
+# 两个内核都把版本号放在第 1 行第 3 列，但子命令不同（sing-box 用 version，
+# mihomo 用 -v），且 mihomo 带 v 前缀，这里去掉以便与 Release 标签去 v 后的写法比较。
+# 顺带一层保护：微架构不匹配的 mihomo 二进制会拒绝运行并以退出码 1 结束，
+# 版本输出为空，安装流程中的「解压后版本与预期一致」比对因此当场失败。
 kernel_binary_version() {
   [[ -x "$1" ]] || return 0
-  "$1" version 2>/dev/null | awk 'NR==1 {print $3}' || true
+  case "$PROXY_KERNEL" in
+    singbox) "$1" version 2>/dev/null | awk 'NR==1 {print $3}' || true ;;
+    mihomo) "$1" -v 2>/dev/null | awk 'NR==1 {sub(/^v/, "", $3); print $3}' || true ;;
+    *) kernel_unknown ;;
+  esac
 }
 
 # 内核服务控制。刻意拆成三个动作而不是合成一个重启流程：
 # 两个调用点对失败的处理不同——恢复备份时要逐步记录严重错误，
 # 用户操作时直接返回由上层回滚——合成一个会抹掉这个差别。
 kernel_service_reset_failed() {
-  systemctl reset-failed "$SINGBOX_SERVICE" 2>/dev/null || true
+  local service
+  service="$(kernel_service_name)" || return 1
+  systemctl reset-failed "$service" 2>/dev/null || true
 }
 
 kernel_service_restart() {
-  systemctl restart "$SINGBOX_SERVICE" || return 1
+  local service
+  service="$(kernel_service_name)" || return 1
+  systemctl restart "$service" || return 1
 }
 
 kernel_service_is_active() {
-  systemctl is-active --quiet "$SINGBOX_SERVICE"
+  local service
+  service="$(kernel_service_name)" || return 1
+  systemctl is-active --quiet "$service"
 }
 
-# 规则集编译与反编译。这两个子命令是内核特有的，换内核时没有对应物，
-# 因此必须集中在这里而不是散在校验流程里。
+# 规则集编译与反编译。这两个子命令是 sing-box 特有的，mihomo 的规则集格式与
+# .srs 不通用，需要另行决定来源（第二步 2d），因此这里明确报错而不是给出等价物。
 kernel_rule_set_compile() {
-  "$1" rule-set compile --output "$3" "$2" >/dev/null || return 1
+  case "$PROXY_KERNEL" in
+    singbox) "$1" rule-set compile --output "$3" "$2" >/dev/null || return 1 ;;
+    mihomo) kernel_unsupported '编译规则集' ;;
+    *) kernel_unknown ;;
+  esac
 }
 
 kernel_rule_set_decompile() {
-  "$1" rule-set decompile --output "$3" "$2" >/dev/null || return 1
+  case "$PROXY_KERNEL" in
+    singbox) "$1" rule-set decompile --output "$3" "$2" >/dev/null || return 1 ;;
+    mihomo) kernel_unsupported '反编译规则集' ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 当前内核的核心文件：配置、可执行文件、systemd 单元。
+# 环境分类与完整性判断用这一组——它们问的是「这台机器的内核装好了没有」，
+# 因此必须只看当前内核：一台 mihomo 机器缺少 sing-box 不是损坏。
+kernel_core_paths() {
+  case "$PROXY_KERNEL" in
+    singbox)
+      cat <<'EOF'
+/etc/sing-box/config.json
+/usr/local/bin/sing-box
+/etc/systemd/system/sing-box.service
+EOF
+      ;;
+    mihomo)
+      cat <<'EOF'
+/etc/mihomo/config.json
+/usr/local/bin/mihomo
+/etc/systemd/system/mihomo.service
+EOF
+      ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 两个内核的全部部署路径。备份、卸载与事务白名单用这一组——
+# 它们问的是「哪些路径属于本项目」，与这台机器当前用哪个内核无关。
+# 取并集而不是按内核分派：不存在的路径在这三处都被跳过，多列几条没有代价；
+# 而按内核分派会让「这台机器上还留着另一个内核的残留」变成清不掉的东西。
+all_kernel_deployment_paths() {
+  cat <<'EOF'
+/etc/sing-box
+/var/lib/sing-box
+/usr/local/bin/sing-box
+/etc/systemd/system/sing-box.service
+/etc/systemd/system/multi-user.target.wants/sing-box.service
+/etc/mihomo
+/var/lib/mihomo
+/usr/local/bin/mihomo
+/etc/systemd/system/mihomo.service
+/etc/systemd/system/multi-user.target.wants/mihomo.service
+EOF
 }
 
 is_ipv4_address() {
@@ -600,8 +814,12 @@ check_config_vars() {
   if ! PUBLIC_SERVER="$(detect_public_server)"; then
     die "无法识别公网 IPv4，已停止导出以避免生成内网地址。请检查服务器能否访问 HTTPS；特殊网络可在 ${CONF_FILE} 设置 PUBLIC_SERVER_OVERRIDE=\"公网IPv4\""
   fi
-  [[ -f "$SINGBOX_CONFIG" ]] || die "sing-box 配置不存在：$SINGBOX_CONFIG"
-  [[ -x "$SINGBOX_BIN" ]] || die "sing-box 不可执行：$SINGBOX_BIN"
+  local kernel_config kernel_bin kernel_label
+  kernel_config="$(kernel_config_path)" || die "无法确认代理内核的配置位置"
+  kernel_bin="$(kernel_binary_path)" || die "无法确认代理内核的可执行文件位置"
+  kernel_label="$(kernel_display_name)" || die "无法确认代理内核名称"
+  [[ -f "$kernel_config" ]] || die "${kernel_label} 配置不存在：$kernel_config"
+  [[ -x "$kernel_bin" ]] || die "${kernel_label} 不可执行：$kernel_bin"
   [[ -x "$NFUSE_BIN" ]] || die "nfuse 不可执行：$NFUSE_BIN"
   [[ -S "$NFUSE_SOCKET" ]] || die "流量统计服务尚未就绪（Nfuse 通信文件不存在：${NFUSE_SOCKET}）。请先查看服务状态"
   validate_runtime_config_file
@@ -1489,6 +1707,10 @@ recover_pending_transaction() {
 is_environment_recovery_path() {
   case "$1" in
     /etc/sb-user-manager.conf|/etc/sing-box|/etc/sing-box/*|/etc/systemd/system/sing-box.service|/etc/systemd/system/nfuse.service|/etc/systemd/system/sb-user-expiry.service|/etc/systemd/system/sb-user-expiry.timer|/etc/systemd/system/multi-user.target.wants/sing-box.service|/etc/systemd/system/multi-user.target.wants/nfuse.service|/etc/systemd/system/timers.target.wants/sb-user-expiry.timer|/var/lib/nfuse|/var/lib/nfuse/*|/var/lib/sing-box|/var/lib/sing-box/*|/var/lib/sb-user-manager|/var/lib/sb-user-manager/*|/usr/local/sbin/sb-user-manager|/usr/local/bin/sbm|/usr/local/bin/sing-box|/usr/local/bin/nfuse|/run/nfuse.sock) return 0;;
+    # mihomo 部署的路径。两个内核的路径同时列在白名单里而不是按内核分派：
+    # 白名单只决定「这条路径允不允许出现在事务里」，多列几条不会让不存在的文件
+    # 被创建，而按内核分派会让一台机器换内核后旧路径突然不被允许清理。
+    /etc/mihomo|/etc/mihomo/*|/etc/systemd/system/mihomo.service|/etc/systemd/system/multi-user.target.wants/mihomo.service|/var/lib/mihomo|/var/lib/mihomo/*|/usr/local/bin/mihomo) return 0;;
     *) return 1;;
   esac
 }
@@ -1661,33 +1883,36 @@ write_command_output() {
   "$@" > "$output"
 }
 
-list_singbox_owned_ssh_sockets() {
+list_kernel_owned_ssh_sockets() {
   local client_port="$1" server_port="$2"
   command -v ss >/dev/null 2>&1 || return 1
   ss -Htnp state established \
     "( sport = :${client_port} and dport = :${server_port} )" 2>/dev/null
 }
 
-ssh_connection_uses_local_singbox() {
-  local client_ip client_port server_ip server_port extra socket_rows
+ssh_connection_uses_local_kernel() {
+  local client_ip client_port server_ip server_port extra socket_rows process
   [[ -n "${SSH_CONNECTION:-}" ]] || return 1
   read -r client_ip client_port server_ip server_port extra <<<"$SSH_CONNECTION"
   [[ -n "$client_ip" && -n "$server_ip" && -z "${extra:-}" ]] || return 1
   [[ "$client_port" =~ ^[1-9][0-9]{0,4}$ && "$server_port" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
   ((client_port <= 65535 && server_port <= 65535)) || return 1
-  socket_rows="$(list_singbox_owned_ssh_sockets "$client_port" "$server_port")" || return 1
-  grep -Fq '"sing-box"' <<<"$socket_rows"
+  socket_rows="$(list_kernel_owned_ssh_sockets "$client_port" "$server_port")" || return 1
+  # 按当前内核的进程名匹配。写死 sing-box 会让这条护栏在 mihomo 机器上
+  # 永远判为「不是本机节点」——一条恒假的安全检查比没有更糟，
+  # 因为它看起来还在。
+  process="$(kernel_process_name)" || return 1
+  grep -Fq "\"${process}\"" <<<"$socket_rows"
 }
 
-ensure_safe_ssh_for_singbox_restart() {
-  local phase="${1:-preflight}"
-  ssh_connection_uses_local_singbox || return 0
-  cat <<'EOF'
-检测到当前 SSH 连接正通过这台服务器自己的 sing-box 节点。
-接下来的操作需要重启 sing-box；继续会中断当前连接，并使本次操作等待下次运行脚本时自动恢复。
-EOF
+ensure_safe_ssh_for_kernel_restart() {
+  local phase="${1:-preflight}" label
+  ssh_connection_uses_local_kernel || return 0
+  label="$(kernel_display_name)" || return 1
+  printf '检测到当前 SSH 连接正通过这台服务器自己的 %s 节点。\n' "$label"
+  printf '接下来的操作需要重启 %s；继续会中断当前连接，并使本次操作等待下次运行脚本时自动恢复。\n' "$label"
   if [[ "$phase" == rollback ]]; then
-    echo '为避免连接中断，sing-box 尚未重启；脚本正在撤销本次尚未完成的修改。'
+    printf '为避免连接中断，%s 尚未重启；脚本正在撤销本次尚未完成的修改。\n' "$label"
   else
     echo '为避免连接中断，本次操作已经停止，服务器数据尚未修改。'
   fi
@@ -3455,7 +3680,7 @@ restore_migration_backup() {
   fi
   read -r -p "确认继续？请输入 ${confirm_token}：" answer
   [[ "$answer" == "$confirm_token" ]] || { rm -f "$payload"; echo '已取消恢复。'; return 0; }
-  if ! ensure_safe_ssh_for_singbox_restart; then
+  if ! ensure_safe_ssh_for_kernel_restart; then
     rm -f -- "$payload"
     return 0
   fi
@@ -3629,7 +3854,7 @@ cleanup_backup_retention() {
 }
 
 check_singbox_and_restart() {
-  ensure_safe_ssh_for_singbox_restart rollback || return 1
+  ensure_safe_ssh_for_kernel_restart rollback || return 1
   kernel_check_config "$SINGBOX_CONFIG" || return 1
   kernel_service_reset_failed
   kernel_service_restart || return 1
@@ -4089,6 +4314,10 @@ migrate_legacy_ss2022_udp_inbounds() {
   command -v jq >/dev/null || return 0
   command -v flock >/dev/null || return 0
   load_runtime_config || return 1
+  # 这是一次性整理历史 sing-box 数据的流程，其它内核的部署里没有对应的历史包袱。
+  # 显式判断而不是依赖「sing-box 文件恰好不存在」——那种依赖在一台两个内核
+  # 的二进制都还留着的机器上会失效。
+  [[ "$PROXY_KERNEL" == singbox ]] || return 0
   [[ -f "$STATE_FILE" && -f "$SINGBOX_CONFIG" && -x "$SINGBOX_BIN" && -x "$NFUSE_BIN" && -S "$NFUSE_SOCKET" ]] || return 0
   ss2022_udp_inbounds_are_current && return 0
 
@@ -4105,7 +4334,7 @@ migrate_legacy_ss2022_udp_inbounds() {
     release_operation_lock
     return 0
   fi
-  if ! ensure_safe_ssh_for_singbox_restart; then
+  if ! ensure_safe_ssh_for_kernel_restart; then
     release_operation_lock
     return 0
   fi
@@ -4525,7 +4754,7 @@ cmd_add() {
   local ss_password fragment
   ss_password="$(generate_ss_password "$method")" || return 1
   fragment="$(make_ss2022_inbound "$name" "$port" "$ss_password" "$method")" || return 1
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "add-user:$name" || return 1
 
   run_managed_step state_add_user "$name" "$port" "$ss_password" "$limit" "$anchor" "$metered" "$expires_at" "$method" || return 1
@@ -4555,7 +4784,7 @@ cmd_add_anytls() {
   local password fragment
   password="$(generate_st_password)"
   fragment="$(make_anytls_inbound "$name" "$port" "$password")"
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "add-anytls-user:$name" || return 1
   run_managed_step state_add_anytls "$name" "$port" "$password" "$limit" "$anchor" "$metered" "$expires_at" "$tls_sni" || return 1
   register_new_user_nfuse "$name" "$port" "$metered" "$limit" "$anchor" || return 1
@@ -4608,7 +4837,7 @@ cmd_add_multi() {
         {protocol:"anytls",port:$anytls_port,anytls_password:$ENV.SB_JQ_ANYTLS_PASSWORD,tls_sni:$tls_sni}
       ]}')" || return 1
   fragment="$(make_user_inbounds_from_state "$prospective")" || return 1
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "add-multi-user:$name" || return 1
 
   # 先登记可回滚的账户状态，再把两个端口纳入同一流量账户，最后才开放认证入口。
@@ -4701,7 +4930,7 @@ cmd_add_user_endpoint() {
   prospective="$(SB_JQ_ENDPOINT="$endpoint" jq -c '.endpoints += [($ENV.SB_JQ_ENDPOINT | fromjson)]' <<<"$user")" || return 1
   if [[ "$status" == active ]]; then
     fragment="$(make_user_inbounds_from_state "$prospective")" || return 1
-    ensure_safe_ssh_for_singbox_restart || return 0
+    ensure_safe_ssh_for_kernel_restart || return 0
   fi
   start_managed_operation "add-user-endpoint:$name:$kind" || return 1
   run_managed_step nfuse port add "$name" "$port" || return 1
@@ -4760,7 +4989,7 @@ cmd_remove_user_endpoint() {
   status="$(jq -er '.status | select(. == "active" or . == "disabled")' <<<"$user")" || return 1
   if [[ "$status" == active ]]; then
     fragment="$(make_user_inbounds_from_state "$prospective")" || return 1
-    ensure_safe_ssh_for_singbox_restart || return 0
+    ensure_safe_ssh_for_kernel_restart || return 0
   fi
   start_managed_operation "remove-user-endpoint:$name:$kind" || return 1
   run_managed_step state_remove_user_endpoint "$name" "$kind" || return 1
@@ -4800,7 +5029,7 @@ cmd_disable() {
   local status
   status="$(get_user_json "$name" | jq -r '.status')"
   [[ "$status" != "disabled" ]] || die "用户已经停用：$name"
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "disable-user:$name" || return 1
 
   run_managed_step remove_user_inbounds "$name" || return 1
@@ -4858,7 +5087,7 @@ prepare_user_enable() {
       return 1
     fi
   done < <(jq -r 'if (.endpoints | type) == "array" then .endpoints[].port else .port end' <<<"$user")
-  if ! ensure_safe_ssh_for_singbox_restart; then
+  if ! ensure_safe_ssh_for_kernel_restart; then
     printf '错误：为保护当前 SSH 连接，用户没有启用：%s\n' "$name" >&2
     return 1
   fi
@@ -5147,7 +5376,7 @@ cmd_edit_user() {
     fragment="$(make_user_inbounds_from_state "$new_user")" || return 1
   fi
 
-  if [[ "$config_changed" == true ]]; then ensure_safe_ssh_for_singbox_restart || return 0; fi
+  if [[ "$config_changed" == true ]]; then ensure_safe_ssh_for_kernel_restart || return 0; fi
   start_managed_operation "edit-user:$name" || return 1
   if [[ "$new_port" != "$old_port" ]]; then
     # 先持久化新端口的流量统计，再开放新监听；旧端口在服务切换完成前继续受控。
@@ -5206,7 +5435,7 @@ cmd_set_global_sni() {
     return 0
   fi
 
-  if [[ "$protocol" == ss2022 ]] && ((active_count > 0)); then ensure_safe_ssh_for_singbox_restart || return 0; fi
+  if [[ "$protocol" == ss2022 ]] && ((active_count > 0)); then ensure_safe_ssh_for_kernel_restart || return 0; fi
   start_managed_operation "set-global-sni:$protocol" || return 1
   if [[ "$protocol" == ss2022 ]]; then
     run_managed_step write_global_sni_config "$new_sni" "$ANYTLS_SNI" update || return 1
@@ -5231,7 +5460,7 @@ cmd_remove() {
   user_exists "$name" || die "用户不存在：$name"
 
   local split_name split_names split_count=0 nfuse_json
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "remove-user:$name" || return 1
 
   if ! split_names="$(jq -r --arg name "$name" '.splits[]? | select(.scope == "user" and .user == $name) | .name' "$STATE_FILE")"; then
@@ -5330,7 +5559,7 @@ cmd_expire() {
     fi
     if ((expires_epoch <= now)); then
       log "用户已到期，正在停用：$name"
-      ensure_safe_ssh_for_singbox_restart || return 0
+      ensure_safe_ssh_for_kernel_restart || return 0
       start_managed_operation "expire-user:$name" || return 1
       if nfuse_account_exists "$name"; then
         local limit_bytes
@@ -6229,6 +6458,10 @@ migrate_empty_split_preset_fields() {
   command -v jq >/dev/null || return 0
   command -v flock >/dev/null || return 0
   load_runtime_config || return 1
+  # 这是一次性整理历史 sing-box 数据的流程，其它内核的部署里没有对应的历史包袱。
+  # 显式判断而不是依赖「sing-box 文件恰好不存在」——那种依赖在一台两个内核
+  # 的二进制都还留着的机器上会失效。
+  [[ "$PROXY_KERNEL" == singbox ]] || return 0
   [[ -f "$STATE_FILE" && -f "$SINGBOX_CONFIG" && -x "$SINGBOX_BIN" && -x "$NFUSE_BIN" && -S "$NFUSE_SOCKET" ]] || return 0
   split_preset_fields_are_current && return 0
   exec 9>"$LOCK_FILE" || return 1
@@ -6251,6 +6484,10 @@ migrate_shared_preset_runtime_configs() {
   command -v jq >/dev/null || return 0
   command -v flock >/dev/null || return 0
   load_runtime_config || return 1
+  # 这是一次性整理历史 sing-box 数据的流程，其它内核的部署里没有对应的历史包袱。
+  # 显式判断而不是依赖「sing-box 文件恰好不存在」——那种依赖在一台两个内核
+  # 的二进制都还留着的机器上会失效。
+  [[ "$PROXY_KERNEL" == singbox ]] || return 0
   [[ -f "$STATE_FILE" && -f "$SINGBOX_CONFIG" && -x "$SINGBOX_BIN" && -x "$NFUSE_BIN" && -S "$NFUSE_SOCKET" ]] || return 0
   shared_preset_runtime_marker_matches && return 0
   if shared_preset_runtime_is_current; then
@@ -6265,7 +6502,7 @@ migrate_shared_preset_runtime_configs() {
     release_operation_lock
     return 0
   fi
-  if ! ensure_safe_ssh_for_singbox_restart; then release_operation_lock; return 0; fi
+  if ! ensure_safe_ssh_for_kernel_restart; then release_operation_lock; return 0; fi
   if ! start_managed_operation migrate-shared-presets; then release_operation_lock; return 1; fi
   if ! rebuild_and_finish_split_operation; then
     release_operation_lock
@@ -6482,7 +6719,7 @@ cmd_outbound_preset_edit() {
   if ((active == 0)); then
     state_replace_outbound_preset "$name" "$upstream" || return 1
   else
-    ensure_safe_ssh_for_singbox_restart || return 0
+    ensure_safe_ssh_for_kernel_restart || return 0
     start_managed_operation "edit-outbound-preset:$name" || return 1
     run_managed_step state_replace_outbound_preset "$name" "$upstream" || return 1
     rebuild_and_finish_split_operation || return 1
@@ -6520,7 +6757,7 @@ cmd_rule_preset_edit() {
   if ((active == 0)); then
     state_replace_rule_preset "$name" "$url" || return 1
   else
-    ensure_safe_ssh_for_singbox_restart || return 0
+    ensure_safe_ssh_for_kernel_restart || return 0
     start_managed_operation "edit-rule-preset:$name" || return 1
     run_managed_step state_replace_rule_preset "$name" "$url" || return 1
     rebuild_and_finish_split_operation || return 1
@@ -6610,7 +6847,7 @@ cmd_split_add() {
   fi
   validate_split_relationships "$name" "$runtime_rule_tag" "$runtime_outbound_tag" "$scope" "$user" false || return 1
   validate_remote_rule_set "$url"
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "add-split:$name" || return 1
   run_managed_step state_add_split "$name" "$url" "$scope" "$user" "$upstream" "$out_tag" "$rule_tag" "$rule_preset" "$outbound_preset" \
     "$runtime_rule_tag" "$runtime_outbound_tag" "$runtime_transport_tag" || return 1
@@ -6622,7 +6859,7 @@ cmd_split_disable() {
   local name="$1" split
   split_exists "$name" || die "分流不存在：$name"; split="$(jq -c --arg name "$name" '.splits[] | select(.name == $name)' "$STATE_FILE")"
   [[ "$(jq -r '.status' <<<"$split")" == active ]] || die "分流已经停用"
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "disable-split:$name" || return 1
   run_managed_step state_set_split_status "$name" disabled || return 1
   rebuild_and_finish_split_operation || return 1
@@ -6644,7 +6881,7 @@ cmd_split_enable() {
   validate_outbound_tag "$out_tag"
   jq -e --arg out "$out_tag" --arg transport "$(split_transport_tag "$name")" '.outbounds[]? | select(.tag == $out or .tag == $transport)' "$SINGBOX_CONFIG" >/dev/null && die "sing-box 已存在同名分流出站标签"
   jq -e --arg tag "$rule_tag" '.route.rule_set[]? | select(.tag == $tag)' "$SINGBOX_CONFIG" >/dev/null && die "sing-box 已存在同名规则集标签"
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "enable-split:$name" || return 1
   run_managed_step state_set_split_status "$name" active || return 1
   rebuild_and_finish_split_operation || return 1
@@ -6654,7 +6891,7 @@ cmd_split_enable() {
 cmd_split_remove() {
   local name="$1"
   split_exists "$name" || die "分流不存在：$name"
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "remove-split:$name" || return 1
   run_managed_step remove_split_config "$name" || return 1
   run_managed_step state_remove_split "$name" || return 1
@@ -6692,7 +6929,7 @@ cmd_split_edit() {
   fi
   validate_split_relationships "$name" "$runtime_rule_tag" "$runtime_outbound_tag" "$scope" "$user" false || return 1
   validate_remote_rule_set "$url"
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "edit-split:$name" || return 1
   run_managed_step remove_split_config "$name" || return 1
   run_managed_step state_replace_split "$name" "$url" "$scope" "$user" "$upstream" "$out_tag" "$rule_preset" "$outbound_preset" \
@@ -6712,7 +6949,7 @@ cmd_split_move() {
   group="$(split_merge_group_names "$name")" || return 1
   group_size="$(jq 'length' <<<"$group")" || return 1
   if [[ "$current" == "$position" && "$group_size" == 1 ]]; then echo "优先级未变化。"; return 0; fi
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "move-split:$name" || return 1
   run_managed_step state_move_split "$group" "$position" || return 1
   rebuild_and_finish_split_operation || return 1
@@ -6774,7 +7011,10 @@ cmd_split_show() {
   ' "$STATE_FILE"
 }
 
-write_manager_config() {
+# sing-box 部署的管理配置。内容与历史版本一字不变，**不写 PROXY_KERNEL**：
+# 管理配置的解析对未知键直接报错退出，写进去会让回退到旧脚本时启动不了。
+# 详见公开 Issue #158。
+write_singbox_manager_config() {
   cat > "$CONF_FILE" <<EOF || return 1
 HANDSHAKE_PORT=443
 SHADOWTLS_STRICT_MODE=true
@@ -6791,14 +7031,54 @@ LOCK_FILE="/run/lock/sb-user-manager.lock"
 CLIENT_SERVER_PORT_OVERRIDE=""
 PUBLIC_SERVER_OVERRIDE=""
 EOF
+}
+
+# mihomo 部署的管理配置。这类机器本来就退不回不支持 mihomo 的脚本，
+# 因此写 PROXY_KERNEL 不构成新的回退障碍。
+# 管理器自身的数据（用户资料、内部备份、AnyTLS 证书）仍然放在 /etc/sing-box 下：
+# 那些路径是管理器的，不是 sing-box 的，改动它们会牵动迁移与备份子系统——
+# 本片不动那里。代价是 mihomo 机器上会出现一个名字容易误解的 /etc/sing-box 目录。
+# 退路：若在 2f 开放菜单选择之前认为这个名字不可接受，把管理器数据整体迁到
+# /etc/sb-user-manager 是一片独立的工作；此刻还没有任何 mihomo 正式部署，
+# 迁移成本为零，越往后越贵。
+write_mihomo_manager_config() {
+  cat > "$CONF_FILE" <<EOF || return 1
+HANDSHAKE_PORT=443
+SHADOWTLS_STRICT_MODE=true
+SS2022_SHADOWTLS_SNI="$DEFAULT_SS2022_SHADOWTLS_SNI"
+ANYTLS_SNI="$DEFAULT_ANYTLS_SNI"
+PROXY_KERNEL="mihomo"
+MIHOMO_BIN="/usr/local/bin/mihomo"
+MIHOMO_CONFIG="/etc/mihomo/config.json"
+MIHOMO_SERVICE="mihomo"
+MIHOMO_WORK_DIR="/var/lib/mihomo"
+NFUSE_BIN="/usr/local/bin/nfuse"
+NFUSE_SOCKET="/run/nfuse.sock"
+STATE_FILE="/etc/sing-box/managed-users.json"
+BACKUP_DIR="/etc/sing-box/backups"
+LOCK_FILE="/run/lock/sb-user-manager.lock"
+CLIENT_SERVER_PORT_OVERRIDE=""
+PUBLIC_SERVER_OVERRIDE=""
+EOF
+}
+
+write_manager_config() {
+  case "$PROXY_KERNEL" in
+    singbox) write_singbox_manager_config || return 1 ;;
+    mihomo) write_mihomo_manager_config || return 1 ;;
+    *) kernel_unknown || return 1 ;;
+  esac
   chmod 600 "$CONF_FILE" || return 1
   chown root:root "$CONF_FILE" || return 1
 }
 
 write_base_config() {
+  local config skeleton
+  config="$(kernel_config_path)" || return 1
+  skeleton="$(kernel_skeleton_ensure_program)" || return 1
   # 骨架只在 src/05-kernel.sh 定义一处；这里对空对象应用它得到初始配置。
-  jq -n "{} | $SINGBOX_SKELETON_ENSURE_PROGRAM" > /etc/sing-box/config.json || return 1
-  chmod 600 /etc/sing-box/config.json || return 1
+  jq -n "{} | $skeleton" > "$config" || return 1
+  chmod 600 "$config" || return 1
 }
 
 deployed_state_path() {
@@ -6835,7 +7115,7 @@ cleanup_deploy_created_paths() {
 }
 
 write_singbox_unit() {
-  cat > /etc/systemd/system/sing-box.service <<'EOF' || return 1
+  cat > "$(system_path /etc/systemd/system/sing-box.service)" <<'EOF' || return 1
 [Unit]
 Description=sing-box service
 After=network-online.target nss-lookup.target
@@ -6854,9 +7134,44 @@ WantedBy=multi-user.target
 EOF
 }
 
+# mihomo 的服务单元。与 sing-box 单元的三处实质差别：
+# 1. 命令行是 `-d 工作目录 -f 配置`，不是 `-c 配置`。
+# 2. 需要 SAFE_PATHS：mihomo 默认拒绝加载工作目录之外的证书，而管理器的
+#    AnyTLS 证书目录早于 mihomo 支持存在（公开 Issue #154 实测确认，
+#    且该限制在 `mihomo -t` 阶段完全不暴露，只有真正启动监听器时才报错）。
+# 3. 不写 ExecReload：本项目从不执行 systemctl reload，写一条未经验证的重载
+#    命令等于给出一个没验过的承诺。
+write_mihomo_unit() {
+  cat > "$(system_path /etc/systemd/system/mihomo.service)" <<'EOF' || return 1
+[Unit]
+Description=mihomo service
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=root
+StateDirectory=mihomo
+Environment=SAFE_PATHS=/etc/sing-box/cert
+ExecStart=/usr/local/bin/mihomo -d /var/lib/mihomo -f /etc/mihomo/config.json
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+write_kernel_unit() {
+  case "$PROXY_KERNEL" in
+    singbox) write_singbox_unit || return 1 ;;
+    mihomo) write_mihomo_unit || return 1 ;;
+    *) kernel_unknown || return 1 ;;
+  esac
+}
+
 write_nfuse_unit() {
   local iface="$1"
-  cat > /etc/systemd/system/nfuse.service <<EOF || return 1
+  cat > "$(system_path /etc/systemd/system/nfuse.service)" <<EOF || return 1
 [Unit]
 Description=Nfuse per-port traffic accounting and quota service
 After=network-online.target nftables.service
@@ -6879,15 +7194,17 @@ EOF
 }
 
 write_expiry_units() {
-  cat > /etc/systemd/system/sb-user-expiry.service <<'EOF' || return 1
+  local kernel_unit
+  kernel_unit="$(kernel_service_name)" || return 1
+  cat > "$(system_path /etc/systemd/system/sb-user-expiry.service)" <<EOF || return 1
 [Unit]
 Description=Expire sing-box managed users
-After=sing-box.service nfuse.service
+After=${kernel_unit}.service nfuse.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/sb-user-manager --internal-expire
 EOF
-  cat > /etc/systemd/system/sb-user-expiry.timer <<'EOF' || return 1
+  cat > "$(system_path /etc/systemd/system/sb-user-expiry.timer)" <<'EOF' || return 1
 [Unit]
 Description=Check sing-box user expiry
 [Timer]
@@ -6900,7 +7217,7 @@ EOF
 }
 
 write_systemd_units() {
-  write_singbox_unit || return 1
+  write_kernel_unit || return 1
   write_nfuse_unit "$1" || return 1
   write_expiry_units || return 1
 }
@@ -6908,11 +7225,18 @@ write_systemd_units() {
 install_prerequisites() {
   log "检查并安装系统依赖"
   apt-get update || return 1
-  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl jq nftables iproute2 util-linux bsdextrautils tar openssl python3 qrencode || return 1
+  # gzip 与 tar 并列声明：mihomo 的发行资产是单个 gz 压缩的可执行文件，
+  # 不经 tar。Debian 上 gzip 属于必备包，这里写出来是为了把依赖记在一处。
+  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl jq nftables iproute2 util-linux bsdextrautils tar gzip openssl python3 qrencode || return 1
 }
 
 environment_is_deployed() {
-  [[ -f /etc/sing-box/config.json && -f "$CONF_FILE" && -x /usr/local/bin/sing-box && -x /usr/local/bin/nfuse ]]
+  local path
+  [[ -f "$CONF_FILE" && -x /usr/local/bin/nfuse ]] || return 1
+  # 只看当前内核的核心文件：一台 mihomo 机器上没有 sing-box 是正常状态，不是未部署。
+  while IFS= read -r path; do
+    [[ -e "$path" ]] || return 1
+  done < <(kernel_core_paths)
 }
 
 system_path() {
@@ -6920,22 +7244,29 @@ system_path() {
 }
 
 classify_environment() {
-  local managed=0 core=0 complete=true runtime_ok=true path
+  local managed=0 core=0 complete=true runtime_ok=true path kernel_paths
+  kernel_paths="$(kernel_core_paths)" || return 1
   for path in /etc/sb-user-manager.conf /etc/sing-box/managed-users.json /usr/local/sbin/sb-user-manager /etc/systemd/system/sb-user-expiry.timer; do
     [[ -e "$(system_path "$path")" ]] && ((managed+=1))
   done
-  for path in /etc/sing-box/config.json /usr/local/bin/sing-box /etc/systemd/system/sing-box.service /usr/local/bin/nfuse /etc/systemd/system/nfuse.service /var/lib/nfuse/nfuse.db; do
+  for path in /usr/local/bin/nfuse /etc/systemd/system/nfuse.service /var/lib/nfuse/nfuse.db; do
     [[ -e "$(system_path "$path")" ]] && ((core+=1))
   done
-  for path in /etc/sb-user-manager.conf /etc/sing-box/config.json /etc/sing-box/managed-users.json /usr/local/sbin/sb-user-manager /usr/local/bin/sing-box /usr/local/bin/nfuse /etc/systemd/system/sing-box.service /etc/systemd/system/nfuse.service /etc/systemd/system/sb-user-expiry.service /etc/systemd/system/sb-user-expiry.timer; do
+  while IFS= read -r path; do
+    [[ -e "$(system_path "$path")" ]] && ((core+=1))
+  done <<<"$kernel_paths"
+  for path in /etc/sb-user-manager.conf /etc/sing-box/managed-users.json /usr/local/sbin/sb-user-manager /usr/local/bin/nfuse /etc/systemd/system/nfuse.service /etc/systemd/system/sb-user-expiry.service /etc/systemd/system/sb-user-expiry.timer; do
     [[ -e "$(system_path "$path")" ]] || complete=false
   done
+  while IFS= read -r path; do
+    [[ -e "$(system_path "$path")" ]] || complete=false
+  done <<<"$kernel_paths"
 
   if ((managed==0 && core==0)); then ENVIRONMENT_CLASS=fresh
   elif [[ "$complete" == true ]]; then
     if [[ -z "${SB_SYSTEM_ROOT:-}" ]]; then
       kernel_check_default_install >/dev/null 2>&1 || runtime_ok=false
-      systemctl is-active --quiet sing-box || runtime_ok=false
+      kernel_service_is_active || runtime_ok=false
       systemctl is-active --quiet nfuse || runtime_ok=false
       [[ -S /run/nfuse.sock ]] || runtime_ok=false
     fi
@@ -6965,20 +7296,20 @@ show_environment_diagnostics() {
   while IFS= read -r path; do
     [[ -e "$(system_path "$path")" ]] && status='存在' || status='缺失'
     printf '%-34s %s\n' "$path" "$status"
-  done <<'EOF'
-/etc/sing-box/config.json
+  done < <(
+    kernel_core_paths
+    cat <<'EOF'
 /etc/sing-box/managed-users.json
 /etc/sb-user-manager.conf
-/usr/local/bin/sing-box
 /usr/local/bin/nfuse
 /usr/local/sbin/sb-user-manager
-/etc/systemd/system/sing-box.service
 /etc/systemd/system/nfuse.service
 /etc/systemd/system/sb-user-expiry.timer
 EOF
+  )
   if [[ -z "${SB_SYSTEM_ROOT:-}" ]]; then
-    service_state="$(systemctl is-active sing-box 2>/dev/null || true)"
-    printf '\n%-24s %s\n' '节点服务（sing-box）' "${service_state:-未安装}"
+    service_state="$(systemctl is-active "$(kernel_service_name)" 2>/dev/null || true)"
+    printf '\n%-24s %s\n' "节点服务（$(kernel_display_name)）" "${service_state:-未安装}"
     service_state="$(systemctl is-active nfuse 2>/dev/null || true)"
     printf '%-24s %s\n' '流量统计（Nfuse）' "${service_state:-未安装}"
     printf '%-24s %s\n' '流量统计通信' "$([[ -S /run/nfuse.sock ]] && echo 正常 || echo 未就绪)"
@@ -7292,7 +7623,7 @@ check_singbox_release_compatibility() {
 perform_singbox_channel_switch() {
   local channel="$1" version="$2" asset="$3" url="$4" sha256="$5"
   local work binary current_channel current_version previous_dir current_dir target_dir
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   work="$(mktemp -d /tmp/sb-channel-switch.XXXXXX)" || return 1
   register_temp_path "$work"
   if ! prepare_singbox_release_binary "$version" "$asset" "$url" "$sha256" "$work" target; then
@@ -7386,6 +7717,14 @@ update_current_singbox_channel() {
 
 singbox_channel_menu() {
   local choice
+  # 正式版／测试版通道是 sing-box 特有的发布形态。其它内核没有对应物，
+  # 这里明确说明并返回，而不是让下面的流程按 sing-box 的资产名去查一个不存在的东西。
+  if [[ "$PROXY_KERNEL" != singbox ]]; then
+    printf '当前部署使用的代理内核是 %s，没有正式版／测试版通道之分。\n' "$(kernel_display_name)"
+    printf '内核版本随「检查更新」一并更新。\n'
+    pause_menu
+    return 0
+  fi
   while true; do
     prepare_menu_screen
     cat <<'EOF'
@@ -7421,29 +7760,55 @@ fetch_latest_manager_release() {
   LATEST_MANAGER_SHA256="$(jq -r --arg name "$MANAGER_ASSET" '.assets[] | select(.name == $name) | (.digest // "") | sub("^sha256:"; "")' <<<"$manager_json")"
 }
 
+# 查询当前内核的最新正式版，填入 LATEST_KERNEL_VERSION / _ASSET / _URL / _SHA256。
+# 资产名的构成规则是内核特有的，因此两个内核各写一份而不是拼一个通用模板：
+# sing-box 是 tar.gz 内含目录，mihomo 是单文件 gz，连解包方式都不同。
+fetch_latest_kernel_release() {
+  local release_json asset
+  case "$PROXY_KERNEL" in
+    singbox)
+      release_json="$(github_api_get "https://api.github.com/repos/${SINGBOX_REPOSITORY}/releases/latest")" ||
+        die "无法查询 sing-box 最新版本"
+      LATEST_KERNEL_VERSION="$(jq -r '.tag_name // empty | sub("^v"; "")' <<<"$release_json")"
+      [[ -n "$LATEST_KERNEL_VERSION" ]] || die "GitHub Release 返回的版本信息无效"
+      asset="sing-box-${LATEST_KERNEL_VERSION}-${SINGBOX_ARCH}.tar.gz"
+      ;;
+    mihomo)
+      release_json="$(github_api_get "https://api.github.com/repos/${MIHOMO_REPOSITORY}/releases/latest")" ||
+        die "无法查询 mihomo 最新版本"
+      LATEST_KERNEL_VERSION="$(jq -r '.tag_name // empty | sub("^v"; "")' <<<"$release_json")"
+      [[ -n "$LATEST_KERNEL_VERSION" ]] || die "GitHub Release 返回的版本信息无效"
+      # 资产名里的版本号带 v 前缀，与标签一致；这里刻意重新拼上而不是复用标签原文，
+      # 使「去掉 v 的版本号」在整个流程里只有一处来源。
+      asset="mihomo-${MIHOMO_ARCH}-v${LATEST_KERNEL_VERSION}.gz"
+      ;;
+    *) kernel_unknown || return 1 ;;
+  esac
+  LATEST_KERNEL_ASSET="$asset"
+  LATEST_KERNEL_URL="$(jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$release_json")"
+  LATEST_KERNEL_SHA256="$(jq -r --arg name "$asset" '.assets[] | select(.name == $name) | (.digest // "") | sub("^sha256:"; "")' <<<"$release_json")"
+}
+
 fetch_latest_releases() {
-  local include_manager="${1:-true}" sing_json nfuse_json sing_asset nfuse_asset
-  sing_json="$(github_api_get https://api.github.com/repos/SagerNet/sing-box/releases/latest)" || die "无法查询 sing-box 最新版本"
+  local include_manager="${1:-true}" nfuse_json nfuse_asset kernel_label
+  kernel_label="$(kernel_display_name)" || return 1
+  fetch_latest_kernel_release || return 1
   nfuse_json="$(github_api_get https://api.github.com/repos/sketchain/Nfuse/releases/latest)" || die "无法查询 Nfuse 最新版本"
-  LATEST_SINGBOX_VERSION="$(jq -r '.tag_name // empty | sub("^v"; "")' <<<"$sing_json")"
   LATEST_NFUSE_VERSION="$(jq -r '.tag_name // empty | sub("^v"; "")' <<<"$nfuse_json")"
-  [[ -n "$LATEST_SINGBOX_VERSION" && -n "$LATEST_NFUSE_VERSION" ]] || die "GitHub Release 返回的版本信息无效"
+  [[ -n "$LATEST_NFUSE_VERSION" ]] || die "GitHub Release 返回的版本信息无效"
   if [[ "$include_manager" == true ]]; then
     fetch_latest_manager_release
   else
     LATEST_MANAGER_VERSION="$SCRIPT_VERSION"
   fi
-  sing_asset="sing-box-${LATEST_SINGBOX_VERSION}-linux-amd64.tar.gz"
   nfuse_asset="nfuse-amd64.tar.gz"
-  LATEST_SINGBOX_URL="$(jq -r --arg name "$sing_asset" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$sing_json")"
   LATEST_NFUSE_URL="$(jq -r --arg name "$nfuse_asset" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$nfuse_json")"
-  LATEST_SINGBOX_SHA256="$(jq -r --arg name "$sing_asset" '.assets[] | select(.name == $name) | (.digest // "") | sub("^sha256:"; "")' <<<"$sing_json")"
   LATEST_NFUSE_SHA256="$(jq -r --arg name "$nfuse_asset" '.assets[] | select(.name == $name) | (.digest // "") | sub("^sha256:"; "")' <<<"$nfuse_json")"
   if [[ "$include_manager" != true ]]; then
     LATEST_MANAGER_URL=""; LATEST_MANAGER_SHA256=""
   fi
-  [[ "$LATEST_SINGBOX_URL" == https://* && "$LATEST_NFUSE_URL" == https://* ]] || die "未找到适用于 linux-amd64 的发行资产"
-  [[ "$LATEST_SINGBOX_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || die "sing-box 发行资产缺少可信 SHA-256 digest，停止更新"
+  [[ "$LATEST_KERNEL_URL" == https://* && "$LATEST_NFUSE_URL" == https://* ]] || die "未找到适用于 linux-amd64 的发行资产"
+  [[ "$LATEST_KERNEL_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || die "${kernel_label} 发行资产缺少可信 SHA-256 digest，停止更新"
   [[ "$LATEST_NFUSE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || die "Nfuse 发行资产缺少可信 SHA-256 digest，停止更新"
   if [[ -n "$LATEST_MANAGER_URL" ]]; then
     [[ "$LATEST_MANAGER_URL" == https://* ]] || die "管理脚本发行资产地址无效"
@@ -7887,6 +8252,13 @@ take_over_installed_manager() {
 # <<< manager_channel_handoff
 
 installed_singbox_version() { kernel_binary_version "${SINGBOX_BIN:-/usr/local/bin/sing-box}"; }
+# 当前部署实际使用的内核版本。sing-box 通道管理仍用上面那个专用入口，
+# 因为通道是 sing-box 独有的概念，换内核后不存在对应物。
+installed_kernel_version() {
+  local binary
+  binary="$(kernel_binary_path)" || return 1
+  kernel_binary_version "$binary"
+}
 installed_nfuse_version() {
   local bin="${NFUSE_BIN:-/usr/local/bin/nfuse}" reported rc=0
   # 二进制缺失、丢执行位或根本跑不起来时版本记录都不可信；返回空串让部署流程重新下载。
@@ -7999,19 +8371,53 @@ atomic_install_file() {
   sync_transaction_path "$parent" || return 1
 }
 
+# 下载并安装 sing-box。资产是 tar.gz，内含一个以「名字-版本-架构」命名的目录。
+download_singbox_binary() {
+  local work="$1" archive member
+  archive="$LATEST_KERNEL_ASSET"
+  member="sing-box-${LATEST_KERNEL_VERSION}-${SINGBOX_ARCH}/sing-box"
+  github_download_to "$work/$archive" "$LATEST_KERNEL_URL" || return 1
+  printf '%s  %s\n' "$LATEST_KERNEL_SHA256" "$work/$archive" | sha256sum -c - >/dev/null || return 1
+  tar -xzf "$work/$archive" -C "$work" --no-same-owner "$member" || return 1
+  [[ -f "$work/$member" && ! -L "$work/$member" ]] || return 1
+  atomic_install_file "$work/$member" /usr/local/bin/sing-box 755 || return 1
+}
+
+# 下载并安装 mihomo。资产是**单个 gz 压缩的可执行文件**，不是 tar 包，
+# 因此用 gzip -dc 定向写出，文件名由我们决定，不依赖压缩包内记录的原名。
+# 解压后核对版本：这一步顺带挡住选错微架构的资产——不匹配时二进制拒绝运行，
+# 版本读出来是空字符串，比对当场失败（见公开 Issue #165）。
+download_mihomo_binary() {
+  local work="$1" archive binary detected
+  archive="$LATEST_KERNEL_ASSET"
+  binary="$work/mihomo"
+  github_download_to "$work/$archive" "$LATEST_KERNEL_URL" || return 1
+  printf '%s  %s\n' "$LATEST_KERNEL_SHA256" "$work/$archive" | sha256sum -c - >/dev/null || return 1
+  gzip -dc -- "$work/$archive" > "$binary" || return 1
+  [[ -f "$binary" && ! -L "$binary" ]] || return 1
+  chmod 755 "$binary" || return 1
+  detected="$(kernel_binary_version "$binary")" || return 1
+  [[ "$detected" == "$LATEST_KERNEL_VERSION" ]] || {
+    echo "下载到的 mihomo 无法报告预期版本（期望 ${LATEST_KERNEL_VERSION}，实际「${detected:-空}」）；可能是该资产与本机 CPU 微架构不匹配。" >&2
+    return 1
+  }
+  atomic_install_file "$binary" /usr/local/bin/mihomo 755 || return 1
+}
+
+download_kernel_binary() {
+  case "$PROXY_KERNEL" in
+    singbox) download_singbox_binary "$1" || return 1 ;;
+    mihomo) download_mihomo_binary "$1" || return 1 ;;
+    *) kernel_unknown || return 1 ;;
+  esac
+}
+
 download_binaries() {
-  local work="$1" sing_current nfuse_current archive
-  sing_current="$(installed_singbox_version)"; nfuse_current="$(installed_nfuse_version)"
-  if [[ "$sing_current" != "$LATEST_SINGBOX_VERSION" ]]; then
-    [[ "$LATEST_SINGBOX_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || return 1
-    archive="sing-box-${LATEST_SINGBOX_VERSION}-linux-amd64.tar.gz"
-    github_download_to "$work/$archive" "$LATEST_SINGBOX_URL" || return 1
-    printf '%s  %s\n' "$LATEST_SINGBOX_SHA256" "$work/$archive" | sha256sum -c - >/dev/null || return 1
-    tar -xzf "$work/$archive" -C "$work" --no-same-owner \
-      "sing-box-${LATEST_SINGBOX_VERSION}-linux-amd64/sing-box" || return 1
-    [[ -f "$work/sing-box-${LATEST_SINGBOX_VERSION}-linux-amd64/sing-box" &&
-      ! -L "$work/sing-box-${LATEST_SINGBOX_VERSION}-linux-amd64/sing-box" ]] || return 1
-    atomic_install_file "$work/sing-box-${LATEST_SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box 755 || return 1
+  local work="$1" kernel_current nfuse_current
+  kernel_current="$(installed_kernel_version)"; nfuse_current="$(installed_nfuse_version)"
+  if [[ "$kernel_current" != "$LATEST_KERNEL_VERSION" ]]; then
+    [[ "$LATEST_KERNEL_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || return 1
+    download_kernel_binary "$work" || return 1
   fi
   if [[ "$nfuse_current" != "$LATEST_NFUSE_VERSION" ]]; then
     [[ "$LATEST_NFUSE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || return 1
@@ -8099,22 +8505,31 @@ ensure_manager_shortcut_for_interactive_startup() {
 }
 
 write_deployed_versions() {
-  local manager_version="$1" state_dir
+  local manager_version="$1" state_dir kernel_key
+  # 版本记录里的内核字段按内核命名。sing-box 部署保持 SINGBOX_VERSION 不变——
+  # 该文件的内容在管理脚本接管流程中被逐字节比对，改名会影响既有部署。
+  case "$PROXY_KERNEL" in
+    singbox) kernel_key=SINGBOX_VERSION ;;
+    mihomo) kernel_key=MIHOMO_VERSION ;;
+    *) kernel_unknown || return 1 ;;
+  esac
   state_dir="$(system_path /var/lib/sb-user-manager)" || return 1
   install -d -m 700 "$state_dir" || return 1
-  printf 'SCRIPT_VERSION=%s\nSINGBOX_VERSION=%s\nNFUSE_VERSION=%s\n' \
-    "$manager_version" "$LATEST_SINGBOX_VERSION" "$LATEST_NFUSE_VERSION" > "$state_dir/versions" || return 1
+  printf 'SCRIPT_VERSION=%s\n%s=%s\nNFUSE_VERSION=%s\n' \
+    "$manager_version" "$kernel_key" "$LATEST_KERNEL_VERSION" "$LATEST_NFUSE_VERSION" > "$state_dir/versions" || return 1
   chmod 600 "$state_dir/versions" || return 1
 }
 
 activate_managed_services() {
+  local kernel_service
+  kernel_service="$(kernel_service_name)" || return 1
   systemctl daemon-reload || return 1
-  systemctl enable nfuse sing-box sb-user-expiry.timer >/dev/null || return 1
-  systemctl restart nfuse sing-box || return 1
+  systemctl enable nfuse "$kernel_service" sb-user-expiry.timer >/dev/null || return 1
+  systemctl restart nfuse "$kernel_service" || return 1
   wait_for_nfuse_ready || return 1
   systemctl start sb-user-expiry.timer || return 1
   systemctl is-active --quiet nfuse || return 1
-  systemctl is-active --quiet sing-box || return 1
+  kernel_service_is_active || return 1
 }
 
 restore_failed_environment_change() {
@@ -8554,7 +8969,7 @@ create_environment_backup() {
 
 restore_environment_backup() {
   local backup="$1" destination nfuse_snapshot_dir nfuse_snapshot_wal nfuse_snapshot_shm
-  local nfuse_target_dir nfuse_target_wal nfuse_target_shm path source target_parent copy_ok=true
+  local nfuse_target_dir nfuse_target_wal nfuse_target_shm path source target_parent copy_ok=true restored_kernel
   prepare_environment_backup_for_restore "$backup" || return 1
   destination="${SB_SYSTEM_ROOT:-/}"
   nfuse_snapshot_dir="$backup/root/var/lib/nfuse"
@@ -8565,7 +8980,7 @@ restore_environment_backup() {
   nfuse_target_shm="$nfuse_target_dir/nfuse.db-shm"
   if [[ -z "${SB_SYSTEM_ROOT:-}" ]]; then
     systemctl stop sb-user-expiry.timer 2>/dev/null || true
-    systemctl stop sing-box 2>/dev/null || true
+    systemctl stop sing-box mihomo 2>/dev/null || true
     systemctl stop nfuse 2>/dev/null || true
   fi
   # 独立 SQLite 快照不保存 WAL/SHM；复制前移除目标机旧日志，避免覆盖刚恢复的数据。
@@ -8605,7 +9020,11 @@ restore_environment_backup() {
         log "警告：快照恢复后 Nfuse Socket 未在限定时间内就绪"; copy_ok=false
       fi
     fi
-    if [[ -f /etc/systemd/system/sing-box.service ]] && ! systemctl restart sing-box; then log "警告：快照恢复后 sing-box 启动失败"; copy_ok=false; fi
+    for restored_kernel in sing-box mihomo; do
+      if [[ -f "/etc/systemd/system/${restored_kernel}.service" ]] && ! systemctl restart "$restored_kernel"; then
+        log "警告：快照恢复后 ${restored_kernel} 启动失败"; copy_ok=false
+      fi
+    done
     if [[ -f /etc/systemd/system/sb-user-expiry.timer ]] && ! systemctl start sb-user-expiry.timer; then log "警告：快照恢复后到期检测定时器启动失败"; copy_ok=false; fi
   fi
   [[ "$copy_ok" == true ]] || { log "环境快照文件恢复失败"; return 1; }
@@ -8635,15 +9054,60 @@ ensure_deploy_loopback_ready() {
   return 1
 }
 
+# 部署过程中可能被创建的路径，顺序为「父目录在前」——
+# cleanup_deploy_created_paths 按倒序删除，靠这个顺序先清子项再清父目录。
+# 两个内核的路径都列出：已经存在的路径不会被记录为「本次创建」，
+# 因此对另一个内核的机器没有任何影响。
+deploy_tracked_paths() {
+  {
+    printf '%s\n' "$CONF_FILE"
+    all_kernel_deployment_paths
+    cat <<'EOF'
+/etc/sing-box/backups
+/etc/sing-box/cert
+/etc/sing-box/cert/anytls.crt
+/etc/sing-box/cert/anytls.key
+/etc/systemd/system/nfuse.service
+/etc/systemd/system/sb-user-expiry.service
+/etc/systemd/system/sb-user-expiry.timer
+/etc/systemd/system/multi-user.target.wants/nfuse.service
+/etc/systemd/system/timers.target.wants/sb-user-expiry.timer
+/var/lib/nfuse
+/var/lib/nfuse/nfuse.db
+/var/lib/sb-user-manager
+/var/lib/sb-user-manager/versions
+/usr/local/sbin/sb-user-manager
+/usr/local/bin/sbm
+/usr/local/bin/nfuse
+/run/nfuse.sock
+EOF
+  } | awk 'NF && !seen[$0]++'
+}
+
+# 全新部署失败时清空的路径。与 deploy_tracked_paths 的区别是这里无条件删除，
+# 用于「本次是从零开始装的，失败就不该留下任何东西」。
+purge_fresh_deploy_paths() {
+  local path
+  while IFS= read -r path; do
+    rm -rf -- "$path"
+  done < <(all_kernel_deployment_paths)
+  rm -f /etc/sb-user-manager.conf /etc/systemd/system/nfuse.service \
+    /etc/systemd/system/sb-user-expiry.service /etc/systemd/system/sb-user-expiry.timer \
+    /usr/local/sbin/sb-user-manager /usr/local/bin/sbm /usr/local/bin/nfuse
+  rm -rf /var/lib/sb-user-manager
+}
+
 deploy_environment() {
   local fresh="$1" update_manager="${2:-false}" iface work backup path deployed_state_file
   local -a deploy_created=()
   local deploy_created_count=0
+  # 再确认一次内核，使这个函数不依赖调用点是否记得先确定。
+  resolve_deployment_kernel || return 1
   if ! acquire_operation_lock; then
     log "错误：$OPERATION_LOCK_ERROR"
     return 1
   fi
-  ensure_safe_ssh_for_singbox_restart || { release_operation_lock; return 0; }
+  ensure_safe_ssh_for_kernel_restart || { release_operation_lock; return 0; }
   ensure_deploy_loopback_ready || { release_operation_lock; return 1; }
   validate_manager_shortcut_path || {
     release_operation_lock
@@ -8660,49 +9124,23 @@ deploy_environment() {
     local rc="${1:-$?}"
     trap - ERR
     clear_signal_rollback
-    systemctl stop sb-user-expiry.timer sing-box nfuse 2>/dev/null || true
+    systemctl stop sb-user-expiry.timer sing-box mihomo nfuse 2>/dev/null || true
     if ((deploy_created_count > 0)); then
       cleanup_deploy_created_paths "${deploy_created[@]}"
     fi
     if [[ "$fresh" == true ]]; then
-      rm -rf /etc/sing-box
-      rm -f /etc/sb-user-manager.conf /etc/systemd/system/sing-box.service /etc/systemd/system/nfuse.service /etc/systemd/system/sb-user-expiry.service /etc/systemd/system/sb-user-expiry.timer /usr/local/sbin/sb-user-manager /usr/local/bin/sbm
-      rm -f /usr/local/bin/sing-box /usr/local/bin/nfuse
-      rm -rf /var/lib/sb-user-manager
+      purge_fresh_deploy_paths
     fi
     restore_failed_environment_change 部署 "$backup" "$work"
     release_operation_lock
     return "$rc"
   }
-  for path in \
-    "$CONF_FILE" \
-    /etc/sing-box \
-    /etc/sing-box/backups \
-    /etc/sing-box/cert \
-    /etc/sing-box/cert/anytls.crt \
-    /etc/sing-box/cert/anytls.key \
-    /etc/systemd/system/sing-box.service \
-    /etc/systemd/system/nfuse.service \
-    /etc/systemd/system/sb-user-expiry.service \
-    /etc/systemd/system/sb-user-expiry.timer \
-    /etc/systemd/system/multi-user.target.wants/sing-box.service \
-    /etc/systemd/system/multi-user.target.wants/nfuse.service \
-    /etc/systemd/system/timers.target.wants/sb-user-expiry.timer \
-    /var/lib/nfuse \
-    /var/lib/nfuse/nfuse.db \
-    /var/lib/sing-box \
-    /var/lib/sb-user-manager \
-    /var/lib/sb-user-manager/versions \
-    /usr/local/sbin/sb-user-manager \
-    /usr/local/bin/sbm \
-    /usr/local/bin/sing-box \
-    /usr/local/bin/nfuse \
-    /run/nfuse.sock; do
+  while IFS= read -r path; do
     if [[ ! -e "$path" && ! -L "$path" ]]; then
       deploy_created[deploy_created_count]="$path"
       ((deploy_created_count+=1))
     fi
-  done
+  done < <(deploy_tracked_paths)
   if ! begin_environment_transaction "deploy-environment" "$backup" "${deploy_created[@]}"; then
     rm -rf -- "$work"
     release_operation_lock
@@ -8713,6 +9151,13 @@ deploy_environment() {
   run_step_or_rollback rollback_deploy download_binaries "$work" || return 1
   run_step_or_rollback rollback_deploy install -d -m 700 \
     /etc/sing-box /etc/sing-box/backups /etc/sing-box/cert /var/lib/nfuse /usr/local/sbin || return 1
+  if [[ "$PROXY_KERNEL" == mihomo ]]; then
+    # mihomo 的配置目录与工作目录。工作目录也由 systemd 的 StateDirectory 负责，
+    # 但配置校验发生在服务启动之前，那时它还不存在——不预先建好的话，
+    # 目录会由 `mihomo -t` 顺手创建，权限与创建时机都不在我们手里。
+    run_step_or_rollback rollback_deploy install -d -m 700 /etc/mihomo || return 1
+    run_step_or_rollback rollback_deploy install -d -m 755 "$MIHOMO_WORK_DIR" || return 1
+  fi
   if [[ "$fresh" == true ]]; then
     run_step_or_rollback rollback_deploy write_manager_config || return 1
     run_step_or_rollback rollback_deploy write_base_config || return 1
@@ -8757,10 +9202,16 @@ takeover_existing_environment() {
     log "错误：$OPERATION_LOCK_ERROR"
     return 1
   fi
-  ensure_safe_ssh_for_singbox_restart || { release_operation_lock; return 0; }
+  ensure_safe_ssh_for_kernel_restart || { release_operation_lock; return 0; }
   validate_manager_shortcut_path || {
     release_operation_lock
     die "检测到 /usr/local/bin/sbm 已被其他文件或链接占用；为避免覆盖现有程序，本次操作已停止"
+  }
+  # 接管既有安装按定义只针对既有的 sing-box 部署：它要读的就是现场那份
+  # sing-box 配置。选了别的内核还走这条路会得到一台内核与配置对不上的机器。
+  [[ "$PROXY_KERNEL" == singbox ]] || {
+    release_operation_lock
+    die "接管既有安装目前只支持 sing-box 部署"
   }
   existing_singbox_bin="$(command -v sing-box 2>/dev/null || true)"
   [[ -f /etc/sing-box/config.json && -n "$existing_singbox_bin" && -x "$existing_singbox_bin" ]] || {
@@ -8828,7 +9279,7 @@ takeover_existing_environment() {
   fi
   run_step_or_rollback rollback_takeover register_temp_path "$tmp" || return 1
   run_step_or_rollback rollback_takeover write_command_output "$normalized" \
-    /usr/local/bin/sing-box format -c /etc/sing-box/config.json || return 1
+    kernel_normalized_default_install || return 1
   # 与全新安装共用同一份骨架定义，避免接管出来的部署与全新安装不一致。
   run_step_or_rollback rollback_takeover write_command_output "$tmp" \
     jq "$SINGBOX_SKELETON_ENSURE_PROGRAM" "$normalized" || return 1
@@ -8864,8 +9315,41 @@ takeover_existing_environment() {
   log "原有节点和路由会继续保留，但不会自动出现在本脚本的用户或分流列表中"
 }
 
+# 仅供测试使用的内核选择。菜单里没有这个入口：内核选择要等第二步 2f，
+# 而 2f 必须排在 2e 的审计护栏之后——把一台无法自检的机器交出去是不行的。
+# 只对尚未部署的机器生效：已部署机器的内核由管理配置决定，部署后不允许更改，
+# 中途改会得到一台配置属于旧内核、服务属于新内核的半迁移机器。
+apply_test_only_kernel_selection() {
+  local requested="${SB_DEPLOY_PROXY_KERNEL:-}"
+  [[ -n "$requested" ]] || return 0
+  if [[ -f "$CONF_FILE" ]]; then
+    log "提示：本机已完成部署，代理内核由管理配置决定，SB_DEPLOY_PROXY_KERNEL 已忽略"
+    return 0
+  fi
+  case "$requested" in
+    singbox|mihomo) PROXY_KERNEL="$requested" ;;
+    *) die "SB_DEPLOY_PROXY_KERNEL 只能是 singbox 或 mihomo：$requested" ;;
+  esac
+  log "提示：本次部署使用测试用的内核选择：$(kernel_display_name)"
+}
+
+# 确定本次安装或更新按哪个内核进行。
+# 已部署的机器一律以管理配置里的声明为准；只有尚未部署的机器才看测试用的选择。
+# 必须在这里显式确定，不能依赖文件级默认值：deploy_environment 内那次
+# load_runtime_config 发生在子进程里，父进程拿不到结果，而写单元文件、
+# 校验配置、挑选下载资产都发生在父进程。真机上验到的后果是——
+# 一台 mihomo 机器执行「自动修复缺失内容」会去下载并部署 sing-box。
+resolve_deployment_kernel() {
+  if [[ -r "$CONF_FILE" ]]; then
+    load_runtime_config
+    return 0
+  fi
+  apply_test_only_kernel_selection || return 1
+}
+
 install_environment() {
   local choice answer config_path state_path
+  resolve_deployment_kernel || return 1
   show_environment_diagnostics
   case "$ENVIRONMENT_CLASS" in
     managed_complete)
@@ -8903,7 +9387,7 @@ EOF
           fetch_latest_releases false || return 1
           # 修复流程不得把测试通道静默替换为正式版；sing-box 由版本管理单独更新。
           if [[ "$(current_singbox_channel)" == preview ]]; then
-            LATEST_SINGBOX_VERSION="$(installed_singbox_version)"
+            LATEST_KERNEL_VERSION="$(installed_singbox_version)"
           fi
           deploy_environment false
           ;;
@@ -8949,25 +9433,23 @@ EOF
 }
 
 managed_uninstall_paths() {
-  cat <<'EOF'
-/etc/sing-box
+  {
+    all_kernel_deployment_paths
+    cat <<'EOF'
 /etc/sb-user-manager.conf
-/etc/systemd/system/sing-box.service
 /etc/systemd/system/nfuse.service
 /etc/systemd/system/sb-user-expiry.service
 /etc/systemd/system/sb-user-expiry.timer
-/etc/systemd/system/multi-user.target.wants/sing-box.service
 /etc/systemd/system/multi-user.target.wants/nfuse.service
 /etc/systemd/system/timers.target.wants/sb-user-expiry.timer
 /var/lib/nfuse
-/var/lib/sing-box
 /var/lib/sb-user-manager
 /usr/local/sbin/sb-user-manager
 /usr/local/bin/sbm
-/usr/local/bin/sing-box
 /usr/local/bin/nfuse
 /run/nfuse.sock
 EOF
+  } | awk 'NF && !seen[$0]++'
 }
 
 remove_managed_uninstall_paths() {
@@ -8994,7 +9476,9 @@ verify_managed_uninstall_paths_removed() {
 stop_managed_services_for_uninstall() {
   local unit state
   [[ -z "${SB_SYSTEM_ROOT:-}" ]] || return 0
-  for unit in sb-user-expiry.timer sing-box.service nfuse.service; do
+  # 两个内核的单元都停：不存在的单元 stop 会失败，is-active 报 inactive，
+  # 后面的判断照常通过；漏停一个还在跑的内核才是真的问题。
+  for unit in sb-user-expiry.timer sing-box.service mihomo.service nfuse.service; do
     systemctl stop "$unit" 2>/dev/null || true
     state="$(systemctl is-active "$unit" 2>/dev/null || true)"
     [[ "$state" != active && "$state" != activating ]] || return 1
@@ -9003,15 +9487,19 @@ stop_managed_services_for_uninstall() {
 }
 
 restore_managed_service_enablement() {
+  local kernel_service
   [[ -z "${SB_SYSTEM_ROOT:-}" ]] || return 0
-  systemctl enable nfuse.service sing-box.service sb-user-expiry.timer >/dev/null || return 1
+  kernel_service="$(kernel_service_name)" || return 1
+  systemctl enable nfuse.service "${kernel_service}.service" sb-user-expiry.timer >/dev/null || return 1
 }
 
 ensure_safe_ssh_for_complete_uninstall() {
-  ssh_connection_uses_local_singbox || return 0
+  local label
+  ssh_connection_uses_local_kernel || return 0
+  label="$(kernel_display_name)" || return 1
+  printf '检测到当前 SSH 连接正通过这台服务器自己的 %s 节点。\n' "$label"
+  printf '完整卸载需要停止 %s，继续会立即中断当前连接。\n' "$label"
   cat <<'EOF'
-检测到当前 SSH 连接正通过这台服务器自己的 sing-box 节点。
-完整卸载需要停止 sing-box，继续会立即中断当前连接。
 为避免连接中断，本次卸载已经停止，服务器数据尚未修改。
 请在当前 SSH 软件或本地代理中把这台服务器的 SSH 地址设为直连，然后重新运行。
 EOF
@@ -9214,7 +9702,7 @@ EOF
 
 # >>> check_updates
 check_updates() {
-  local current_singbox current_nfuse current_manager current_channel singbox_latest_label answer needs_update=false update_manager=false manager_latest_label
+  local current_kernel current_nfuse current_manager current_channel kernel_latest_label answer needs_update=false update_manager=false manager_latest_label kernel_label
   environment_is_deployed || { echo "检测结果：尚未安装，请先选择「安装或修复环境」。"; return 0; }
   load_runtime_config
   need_cmd curl; need_cmd jq
@@ -9224,18 +9712,20 @@ check_updates() {
   fi
   echo "正在查询稳定版更新…"
   fetch_latest_releases true || { release_operation_lock; return 1; }
-  current_singbox="$(installed_singbox_version)"; current_nfuse="$(installed_nfuse_version)"
+  kernel_label="$(kernel_display_name)" || { release_operation_lock; return 1; }
+  current_kernel="$(installed_kernel_version)"; current_nfuse="$(installed_nfuse_version)"
   current_manager="$(installed_manager_version)"
-  current_channel="$(current_singbox_channel)"
-  singbox_latest_label="$LATEST_SINGBOX_VERSION"
+  # 版本通道是 sing-box 独有的概念，其它内核没有对应物。
+  if [[ "$PROXY_KERNEL" == singbox ]]; then current_channel="$(current_singbox_channel)"; else current_channel=stable; fi
+  kernel_latest_label="$LATEST_KERNEL_VERSION"
   if [[ "$current_channel" == preview ]]; then
     if fetch_singbox_channel_releases; then
-      singbox_latest_label="${LATEST_PREVIEW_SINGBOX_VERSION}（测试通道）"
+      kernel_latest_label="${LATEST_PREVIEW_SINGBOX_VERSION}（测试通道）"
     else
-      singbox_latest_label="未知（请到版本管理检查）"
+      kernel_latest_label="未知（请到版本管理检查）"
     fi
     # 通用更新流程不得把测试通道静默替换为正式版；sing-box 由版本管理单独更新。
-    LATEST_SINGBOX_VERSION="$current_singbox"
+    LATEST_KERNEL_VERSION="$current_kernel"
   fi
   manager_latest_label="$LATEST_MANAGER_VERSION"
   if version_gt "$LATEST_MANAGER_VERSION" "${current_manager:-0}"; then
@@ -9249,12 +9739,12 @@ check_updates() {
     manager_latest_label="${SCRIPT_VERSION}（本地内容修订）"
   fi
   if [[ "$current_channel" == stable ]]; then
-    [[ "$current_singbox" == "$LATEST_SINGBOX_VERSION" ]] || needs_update=true
+    [[ "$current_kernel" == "$LATEST_KERNEL_VERSION" ]] || needs_update=true
   fi
   [[ "$current_nfuse" == "$LATEST_NFUSE_VERSION" ]] || needs_update=true
   printf '\n%-18s %-18s %-18s\n' '组件' '当前版本' '最新稳定版'
   printf '%-18s %-18s %-18s\n' '------------------' '------------------' '------------------'
-  printf '%-18s %-18s %-18s\n' 'sing-box' "${current_singbox:-未知}" "$singbox_latest_label"
+  printf '%-18s %-18s %-18s\n' "$kernel_label" "${current_kernel:-未知}" "$kernel_latest_label"
   printf '%-18s %-18s %-18s\n' 'Nfuse' "${current_nfuse:-未知}" "$LATEST_NFUSE_VERSION"
   printf '%-18s %-18s %-18s\n' '管理脚本' "${current_manager:-未知}" "$manager_latest_label"
   if [[ "$current_channel" == preview ]]; then
@@ -9543,7 +10033,7 @@ prompt_multi_account() {
 
 prompt_add_node() {
   local protocol_choice account_choice protocol method="" protocol_sni="" tls_sni=""
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   load_runtime_config
   while true; do
     echo
@@ -10058,11 +10548,13 @@ show_service_status() {
   while IFS='|' read -r service description; do
     state="$(service_state_label "$(systemctl is-active "$service" 2>/dev/null || true)")"
     printf '%-24s %-12s %s\n' "$service" "$state" "$description"
-  done <<'EOF'
-sing-box.service|负责用户连接和分流
+  done < <(
+    printf '%s.service|负责用户连接和分流\n' "$(kernel_service_name)"
+    cat <<'EOF'
 nfuse.service|负责流量统计和用量限制
 sb-user-expiry.timer|负责自动停用到期用户
 EOF
+  )
   printf '\n流量统计通信：%s\n' "$([[ -S /run/nfuse.sock ]] && echo '正常' || echo '未就绪，请检查 Nfuse 服务')"
   printf '管理脚本：%s\n' "$([[ -x /usr/local/sbin/sb-user-manager ]] && echo '已安装' || echo '未安装')"
 }
@@ -10128,6 +10620,16 @@ audit_consistency() {
   local preset_link_rows preset_kind preset_reason managed_tags legacy_cleanup legacy_count
   AUDIT_ISSUES=0
   AUDIT_REPAIRABLE=0
+  # 一致性检查按 sing-box 的入站标签比对托管内容，mihomo 侧的等价识别方式
+  # 还没有建立（第二步 2e）。这里明确说明并计为一个待处理项，而不是让下面的
+  # 流程去读一份读不出来的配置然后报一个看不懂的错。
+  # 计为待处理项是有意的：一台还不能自检的机器本来就不该被当作正常。
+  if [[ "$PROXY_KERNEL" != singbox ]]; then
+    printf '\n服务与配置检查结果\n\n'
+    printf '  [需要处理] 服务与配置一致性检查尚未支持 %s 部署，本项未执行。\n' "$(kernel_display_name)"
+    AUDIT_ISSUES=1
+    return 0
+  fi
   config_json="$(kernel_normalized_config)" || return 1
   nfuse_json="$(nfuse list --json)" || return 1
   # 类型校验与 inbound 还原折在同一次 jq 调用里：本函数的 jq 调用次数受单元测试的
@@ -10275,7 +10777,7 @@ repair_consistency() {
   jq -e 'type == "array"' <<<"$nfuse_json" >/dev/null || return 1
   user_rows="$(jq -c '.users[]' "$STATE_FILE")" || return 1
   split_rows="$(jq -c '.splits[]?' "$STATE_FILE")" || return 1
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   create_environment_backup || return 1
   environment_backup="$ENV_BACKUP"
   start_managed_operation "repair-consistency" || return 1
@@ -10657,7 +11159,7 @@ diagnostic_report_uid() {
 }
 
 create_diagnostic_report() {
-  local raw sanitized audit_file log_file report os_name singbox_version nfuse_version channel recorded_version
+  local raw sanitized audit_file log_file report os_name singbox_version nfuse_version channel recorded_version kernel_bin_path kernel_cfg_path
   local sing_state nfuse_state expiry_state config_result nfuse_result state_result audit_result transaction_result launcher_result overall
   local users_total=0 users_active=0 users_disabled=0 users_ss=0 users_ss_legacy=0 users_anytls=0 users_metered=0 users_self=0
   local splits_total=0 splits_active=0 splits_disabled=0 splits_all=0 splits_user=0
@@ -10697,10 +11199,12 @@ create_diagnostic_report() {
   else launcher_result='未发现可选的 root 启动副本'
   fi
 
-  sing_state="$(diagnostic_service_state sing-box.service)"
+  sing_state="$(diagnostic_service_state "$(kernel_service_name).service")"
   nfuse_state="$(diagnostic_service_state nfuse.service)"
   expiry_state="$(diagnostic_service_state sb-user-expiry.timer)"
-  if [[ -x "$SINGBOX_BIN" && -r "$SINGBOX_CONFIG" ]] && kernel_check_config "$SINGBOX_CONFIG" >/dev/null 2>&1; then config_result='通过'
+  kernel_bin_path="$(kernel_binary_path)" || return 1
+  kernel_cfg_path="$(kernel_config_path)" || return 1
+  if [[ -x "$kernel_bin_path" && -r "$kernel_cfg_path" ]] && kernel_check_config "$kernel_cfg_path" >/dev/null 2>&1; then config_result='通过'
   else config_result='未通过'; fi
   if diagnostic_nfuse_healthy; then nfuse_result='正常'
   else nfuse_result='异常'; fi
@@ -10787,7 +11291,7 @@ create_diagnostic_report() {
     echo
     echo '== 最近 24 小时的服务警告（每项最多 30 条） =='
     echo '说明：这里是历史记录；如果总体结果为“正常”，不代表这些问题当前仍在发生。'
-    append_diagnostic_service_log sing-box.service '连接服务（sing-box）' "$log_file"
+    append_diagnostic_service_log "$(kernel_service_name).service" "连接服务（$(kernel_display_name)）" "$log_file"
     append_diagnostic_service_log nfuse.service '流量统计（Nfuse）' "$log_file"
     append_diagnostic_service_log sb-user-expiry.service '到期自动检查' "$log_file"
   } > "$raw"
@@ -10945,7 +11449,7 @@ readonly_fail() {
 # 只做只读查询需要的最小准备：校验权限与依赖、加载运行配置。
 # 期间任何内部 die 都会因 SB_READONLY_EXIT_CODE 归为退出码 3。
 readonly_prepare() {
-  local cmd
+  local cmd readonly_kernel_bin
   # 单元测试会以普通用户加载隔离环境；真实运行必须是 root，否则读不到 600 权限的用户数据。
   # 与 runtime_config_expected_uid 采用同一判定方式。
   if [[ "${SB_USER_MANAGER_LIBRARY:-false}" != true ]]; then
@@ -10958,8 +11462,9 @@ readonly_prepare() {
     readonly_fail '尚未部署管理环境，请先在交互菜单中执行「系统管理 → 部署与卸载 → 安装或修复环境」。'
   load_runtime_config
   [[ -r "$STATE_FILE" ]] || readonly_fail "读不到用户数据：${STATE_FILE}"
-  command -v "$SINGBOX_BIN" >/dev/null 2>&1 || [[ -x "$SINGBOX_BIN" ]] ||
-    readonly_fail "读不到 sing-box 程序：${SINGBOX_BIN}"
+  readonly_kernel_bin="$(kernel_binary_path)" || readonly_fail '无法确认代理内核的可执行文件位置。'
+  command -v "$readonly_kernel_bin" >/dev/null 2>&1 || [[ -x "$readonly_kernel_bin" ]] ||
+    readonly_fail "读不到 $(kernel_display_name) 程序：${readonly_kernel_bin}"
   command -v nfuse >/dev/null 2>&1 || readonly_fail '读不到 nfuse 程序，无法查询流量。'
 }
 
@@ -10967,7 +11472,7 @@ readonly_prepare() {
 # 人读输出用中文说法，--json 保留原始状态作为机器契约。
 readonly_service_rows() {
   local service state
-  for service in sing-box.service nfuse.service sb-user-expiry.timer; do
+  for service in "$(kernel_service_name).service" nfuse.service sb-user-expiry.timer; do
     state="$(systemctl is-active "$service" 2>/dev/null || true)"
     # 空状态归一为 unknown：制表符分隔在中间字段为空时会被折叠，读取端会错位；
     # 同时也让 --json 里的 state 始终是个有意义的值而不是空串。
@@ -11731,7 +12236,7 @@ render_split_diagnostic_results() {
 }
 
 prompt_split_diagnostic() {
-  local split split_name scope user expected_outbound expected_outbound_display answer cursor_line cursor log_file log_level status
+  local split split_name scope user expected_outbound expected_outbound_display answer cursor_line cursor log_file log_level status kernel_service
   prepare_core
   need_cmd journalctl
   if legacy_split_cleanup_pending; then
@@ -11771,7 +12276,8 @@ prompt_split_diagnostic() {
 EOF
   read -r -p '按回车开始记录，输入 0 返回：' answer
   [[ "$answer" != 0 ]] || { MENU_RETURNED=true; return 0; }
-  cursor_line="$(journalctl -u "$SINGBOX_SERVICE" -n 0 --show-cursor --no-pager 2>/dev/null | tail -n1)"
+  kernel_service="$(kernel_service_name)" || return 1
+  cursor_line="$(journalctl -u "$kernel_service" -n 0 --show-cursor --no-pager 2>/dev/null | tail -n1)"
   cursor="${cursor_line#-- cursor: }"
   if [[ -z "$cursor" || "$cursor" == "$cursor_line" ]]; then
     echo "无法读取连接日志起点，请确认 systemd 日志服务正常。"
@@ -11782,7 +12288,7 @@ EOF
   [[ "$answer" != 0 ]] || { MENU_RETURNED=true; return 0; }
   log_file="$(mktemp /tmp/sb-split-diagnostic.XXXXXX)" || return 1
   register_temp_path "$log_file"
-  if ! journalctl -u "$SINGBOX_SERVICE" --after-cursor="$cursor" --no-pager -o cat > "$log_file" 2>/dev/null; then
+  if ! journalctl -u "$kernel_service" --after-cursor="$cursor" --no-pager -o cat > "$log_file" 2>/dev/null; then
     rm -f -- "$log_file"
     echo "读取新增连接日志失败，请确认 systemd 日志服务正常。"
     return 0
@@ -12041,20 +12547,23 @@ run_standalone_interactive_startup() {
 
 standalone_environment_is_complete() {
   local logical rooted
-  for logical in \
-    /etc/sb-user-manager.conf \
-    /etc/sing-box/config.json \
-    /etc/sing-box/managed-users.json \
-    /usr/local/sbin/sb-user-manager \
-    /usr/local/bin/sing-box \
-    /usr/local/bin/nfuse \
-    /etc/systemd/system/sing-box.service \
-    /etc/systemd/system/nfuse.service \
-    /etc/systemd/system/sb-user-expiry.service \
-    /etc/systemd/system/sb-user-expiry.timer; do
+  # 内核相关的三项由适配层按当前内核给出：一台 mihomo 机器上没有 sing-box
+  # 是正常状态，写死 sing-box 会让到期任务在这类机器上永远拒绝运行。
+  while IFS= read -r logical; do
     rooted="$(system_path "$logical")" || return 1
     [[ -e "$rooted" || -L "$rooted" ]] || return 1
-  done
+  done < <(
+    kernel_core_paths
+    cat <<'EOF'
+/etc/sb-user-manager.conf
+/etc/sing-box/managed-users.json
+/usr/local/sbin/sb-user-manager
+/usr/local/bin/nfuse
+/etc/systemd/system/nfuse.service
+/etc/systemd/system/sb-user-expiry.service
+/etc/systemd/system/sb-user-expiry.timer
+EOF
+  )
 }
 
 run_standalone_internal_expire() {

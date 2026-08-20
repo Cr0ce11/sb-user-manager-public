@@ -117,8 +117,10 @@ SHELL_TARGETS = {
 # External commands are limited to Debian base utilities (coreutils, findutils,
 # grep, sed, gawk, systemd and ncurses-bin), packages installed by
 # install_prerequisites() (ca-certificates, curl, jq, nftables, iproute2,
-# util-linux, bsdextrautils, tar, openssl, python3 and qrencode), plus sing-box
-# and nfuse which the manager itself installs before their use.
+# util-linux, bsdextrautils, tar, openssl, python3 and qrencode), plus the proxy
+# kernels (sing-box, mihomo) and nfuse which the manager itself installs before
+# their use.  gzip is Essential on Debian; mihomo ships its release asset as a
+# single gzip-compressed executable rather than a tar archive.
 EXTERNAL_TARGETS = {
     "apt-get",
     "awk",
@@ -144,6 +146,7 @@ EXTERNAL_TARGETS = {
     "flock",
     "getent",
     "grep",
+    "gzip",
     "head",
     "hostname",
     "id",
@@ -155,6 +158,7 @@ EXTERNAL_TARGETS = {
     "ls",
     "mkdir",
     "mktemp",
+    "mihomo",
     "mv",
     "nfuse",
     "nft",
