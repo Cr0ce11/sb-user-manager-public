@@ -15,6 +15,9 @@ SELF_PATH="$(readlink -f -- "$SELF_SOURCE_PATH")"
 SCRIPT_VERSION="4.25.15"
 SCRIPT_EDITION_LABEL="公开版"
 STATE_SCHEMA_VERSION=7
+# 代理内核的文件级默认值。载入管理配置之前也可能被读到（例如只读查询的早期路径），
+# 因此这里先定义，具体取值与校验仍由 load_runtime_config 负责。
+PROXY_KERNEL="singbox"
 MIN_SUPPORTED_STATE_SCHEMA_VERSION=0
 MIGRATION_FORMAT_VERSION=1
 MIGRATION_BUNDLE_VERSION=1
@@ -90,7 +93,7 @@ parse_runtime_config() {
       SINGBOX_BIN|SINGBOX_CONFIG|SINGBOX_SERVICE|NFUSE_BIN|NFUSE_SOCKET|NFUSE_DB|\
       STATE_FILE|LOCK_FILE|BACKUP_DIR|TRANSACTION_DIR|TRANSACTION_JOURNAL|\
       CLIENT_SERVER_PORT_OVERRIDE|PUBLIC_SERVER_OVERRIDE|GITHUB_TOKEN|\
-      SS_METHOD|HANDSHAKE_SERVER|TLS_SERVER_NAME|PORT_MIN|PORT_MAX) ;;
+      SS_METHOD|HANDSHAKE_SERVER|TLS_SERVER_NAME|PORT_MIN|PORT_MAX|PROXY_KERNEL) ;;
       *) die "管理配置第 ${line_number} 行包含未知配置项：$key" ;;
     esac
     [[ "$seen" != *"|${key}|"* ]] || die "管理配置第 ${line_number} 行重复设置：$key"
@@ -120,6 +123,16 @@ load_runtime_config() {
   unset GITHUB_TOKEN SB_GITHUB_TOKEN
   # 配置按白名单解析，不能作为 root shell 代码执行。
   parse_runtime_config
+  # 本机使用哪个代理内核。缺失即 sing-box：既有部署与 sing-box 新装机器的
+  # 管理配置里不写这一项，内容与历史版本一字不差，回退到旧脚本不受影响。
+  # 只有 mihomo 部署才会写入该键，而那类机器本来就无法回退到不支持 mihomo 的脚本。
+  : "${PROXY_KERNEL:=singbox}"
+  case "$PROXY_KERNEL" in
+    singbox) ;;
+    # 不静默降级为 sing-box：那会让一台本该跑 mihomo 的机器悄悄跑成另一个内核，
+    # 而使用者从界面上看不出任何异常。
+    *) die "管理配置中的内核名无法识别：${PROXY_KERNEL}。当前脚本支持：singbox" ;;
+  esac
   : "${SINGBOX_BIN:=/usr/local/bin/sing-box}"
   : "${SINGBOX_CONFIG:=/etc/sing-box/config.json}"
   : "${SINGBOX_SERVICE:=sing-box}"
