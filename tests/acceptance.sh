@@ -188,15 +188,18 @@ run_audit() {
   release_operation_lock
 }
 
+# --retry-all-errors 与管理脚本中的 github_api_get 同理：curl 的 --retry 不覆盖
+# 退出码 35 一类的 TLS 握手失败，一次抖动会把整份验收报告标记为 failed，
+# 迫使人工分辨是真问题还是瞬时错误。
 fetch_release_json() {
   local url="$1" output="$2"
-  curl -fsSL --retry 3 -H 'Accept: application/vnd.github+json' \
+  curl -fsSL --retry 3 --retry-all-errors -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' "$url" > "$output"
 }
 
 download_release_asset() {
   local url="$1" output="$2"
-  curl -fsSL --retry 3 --proto '=https' --max-redirs 5 -o "$output" "$url"
+  curl -fsSL --retry 3 --retry-all-errors --proto '=https' --max-redirs 5 -o "$output" "$url"
 }
 
 latest_environment_snapshot() {
