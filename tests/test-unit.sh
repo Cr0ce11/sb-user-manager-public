@@ -2292,7 +2292,7 @@ printf '%s\n' 'SCRIPT_VERSION=4.12.0' 'SINGBOX_VERSION=1.13.14' 'NFUSE_VERSION=0
   SINGBOX_CHANNEL_STATE="$channel_switch_root/state/channel.json"
   SINGBOX_VERSION_STORE="$channel_switch_root/state/versions"
   DEPLOYED_VERSIONS_FILE="$channel_switch_root/versions"
-  installed_singbox_version() { singbox_binary_version "$SINGBOX_BIN"; }
+  installed_singbox_version() { kernel_binary_version "$SINGBOX_BIN"; }
   prepare_singbox_release_binary() { PREPARED_SINGBOX_BINARY="$channel_candidate_bin"; }
   prepare_core() { :; }
   create_environment_backup() { ENV_BACKUP="$channel_switch_root/snapshot"; }
@@ -2305,8 +2305,8 @@ printf '%s\n' 'SCRIPT_VERSION=4.12.0' 'SINGBOX_VERSION=1.13.14' 'NFUSE_VERSION=0
   complete_environment_change() { trap - ERR; rm -rf -- "$1"; }
   perform_singbox_channel_switch preview 1.14.0-alpha.44 preview.tar.gz https://example.com/preview.tar.gz "$(printf 'a%.0s' {1..64})"
   [[ "$(installed_singbox_version)" == 1.14.0-alpha.44 ]]
-  [[ "$(singbox_binary_version "$SINGBOX_VERSION_STORE/stable/sing-box")" == 1.13.14 ]]
-  [[ "$(singbox_binary_version "$SINGBOX_VERSION_STORE/previous/sing-box")" == 1.13.14 ]]
+  [[ "$(kernel_binary_version "$SINGBOX_VERSION_STORE/stable/sing-box")" == 1.13.14 ]]
+  [[ "$(kernel_binary_version "$SINGBOX_VERSION_STORE/previous/sing-box")" == 1.13.14 ]]
   jq -e '.channel == "preview" and .current_version == "1.14.0-alpha.44" and .previous.version == "1.13.14"' "$SINGBOX_CHANNEL_STATE" >/dev/null
   grep -Fxq 'SINGBOX_VERSION=1.14.0-alpha.44' "$DEPLOYED_VERSIONS_FILE"
 ) > "$work/channel-switch-output"
@@ -2321,7 +2321,7 @@ set +e
   SINGBOX_CHANNEL_STATE="$channel_switch_root/failed-state/channel.json"
   SINGBOX_VERSION_STORE="$channel_switch_root/failed-state/versions"
   DEPLOYED_VERSIONS_FILE="$channel_switch_root/versions"
-  installed_singbox_version() { singbox_binary_version "$SINGBOX_BIN"; }
+  installed_singbox_version() { kernel_binary_version "$SINGBOX_BIN"; }
   prepare_singbox_release_binary() { PREPARED_SINGBOX_BINARY="$channel_candidate_bin"; }
   prepare_core() { :; }
   create_environment_backup() { ENV_BACKUP="$channel_switch_root/failed-snapshot"; }
@@ -2341,7 +2341,7 @@ set +e
 failed_switch_rc=$?
 set -e
 [[ "$failed_switch_rc" != 0 ]]
-[[ "$(singbox_binary_version "$channel_failed_bin")" == 1.13.14 ]]
+[[ "$(kernel_binary_version "$channel_failed_bin")" == 1.13.14 ]]
 [[ "$(wc -l < "$channel_switch_root/rollback-marker" | tr -d ' ')" == 1 ]]
 
 STATE_FILE="$work/state.json"

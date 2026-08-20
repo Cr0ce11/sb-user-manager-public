@@ -433,6 +433,39 @@ SINGBOX_SKELETON_ENSURE_PROGRAM='
   | .experimental.cache_file = (.experimental.cache_file // {})
   | .experimental.cache_file.enabled = (.experimental.cache_file.enabled // true)'
 
+# 读取指定内核可执行文件的版本号。「版本号位于输出第 1 行第 3 列」是内核特有的
+# 输出约定，因此解析放在适配层；文件不可执行时返回空字符串而不是报错，
+# 调用点据此显示「未安装」或「未保存」。
+kernel_binary_version() {
+  [[ -x "$1" ]] || return 0
+  "$1" version 2>/dev/null | awk 'NR==1 {print $3}' || true
+}
+
+# 内核服务控制。刻意拆成三个动作而不是合成一个重启流程：
+# 两个调用点对失败的处理不同——恢复备份时要逐步记录严重错误，
+# 用户操作时直接返回由上层回滚——合成一个会抹掉这个差别。
+kernel_service_reset_failed() {
+  systemctl reset-failed "$SINGBOX_SERVICE" 2>/dev/null || true
+}
+
+kernel_service_restart() {
+  systemctl restart "$SINGBOX_SERVICE" || return 1
+}
+
+kernel_service_is_active() {
+  systemctl is-active --quiet "$SINGBOX_SERVICE"
+}
+
+# 规则集编译与反编译。这两个子命令是内核特有的，换内核时没有对应物，
+# 因此必须集中在这里而不是散在校验流程里。
+kernel_rule_set_compile() {
+  "$1" rule-set compile --output "$3" "$2" >/dev/null || return 1
+}
+
+kernel_rule_set_decompile() {
+  "$1" rule-set decompile --output "$3" "$2" >/dev/null || return 1
+}
+
 is_ipv4_address() {
   local a b c d extra
   IFS=. read -r a b c d extra <<<"$1"
@@ -1125,12 +1158,12 @@ restore_backup() {
     log "严重错误：备份已恢复，但备份配置校验失败"
     return 1
   fi
-  systemctl reset-failed "$SINGBOX_SERVICE" 2>/dev/null || true
-  if ! systemctl restart "$SINGBOX_SERVICE"; then
+  kernel_service_reset_failed
+  if ! kernel_service_restart; then
     log "严重错误：备份已恢复，但 sing-box 重启失败"
     return 1
   fi
-  if ! systemctl is-active --quiet "$SINGBOX_SERVICE"; then
+  if ! kernel_service_is_active; then
     log "严重错误：备份已恢复，但 sing-box 未处于 active 状态"
     return 1
   fi
@@ -3585,9 +3618,9 @@ cleanup_backup_retention() {
 check_singbox_and_restart() {
   ensure_safe_ssh_for_singbox_restart rollback || return 1
   kernel_check_config "$SINGBOX_CONFIG" || return 1
-  systemctl reset-failed "$SINGBOX_SERVICE" 2>/dev/null || true
-  systemctl restart "$SINGBOX_SERVICE" || return 1
-  if ! systemctl is-active --quiet "$SINGBOX_SERVICE"; then
+  kernel_service_reset_failed
+  kernel_service_restart || return 1
+  if ! kernel_service_is_active; then
     log "错误：sing-box 重启后未处于 active 状态"
     return 1
   fi
@@ -7036,11 +7069,6 @@ current_singbox_channel() {
   singbox_channel_name "${current:-0.0.0}"
 }
 
-singbox_binary_version() {
-  [[ -x "$1" ]] || return 0
-  "$1" version 2>/dev/null | awk 'NR==1 {print $3}' || true
-}
-
 write_singbox_channel_state() {
   local channel="$1" version="$2" previous_channel="$3" previous_version="$4"
   local dir tmp stable_version preview_version
@@ -7048,8 +7076,8 @@ write_singbox_channel_state() {
   install -d -m 700 "$dir" || return 1
   tmp="$(mktemp "$dir/.singbox-channel.XXXXXX")" || return 1
   register_temp_path "$tmp" || return 1
-  stable_version="$(singbox_binary_version "$SINGBOX_VERSION_STORE/stable/sing-box")"
-  preview_version="$(singbox_binary_version "$SINGBOX_VERSION_STORE/preview/sing-box")"
+  stable_version="$(kernel_binary_version "$SINGBOX_VERSION_STORE/stable/sing-box")"
+  preview_version="$(kernel_binary_version "$SINGBOX_VERSION_STORE/preview/sing-box")"
   if ! jq -n --arg channel "$channel" --arg version "$version" \
       --arg stable "$stable_version" --arg preview "$preview_version" \
       --arg previous_channel "$previous_channel" --arg previous_version "$previous_version" \
@@ -7090,8 +7118,8 @@ show_singbox_channel_versions() {
   current="$(installed_singbox_version)"
   [[ -z "$current" ]] || current_label="$(singbox_channel_label "$current")"
   current_channel="$(current_singbox_channel)"
-  cached_stable="$(singbox_binary_version "$SINGBOX_VERSION_STORE/stable/sing-box")"; cached_stable="${cached_stable:-未保存}"
-  cached_preview="$(singbox_binary_version "$SINGBOX_VERSION_STORE/preview/sing-box")"; cached_preview="${cached_preview:-未保存}"
+  cached_stable="$(kernel_binary_version "$SINGBOX_VERSION_STORE/stable/sing-box")"; cached_stable="${cached_stable:-未保存}"
+  cached_preview="$(kernel_binary_version "$SINGBOX_VERSION_STORE/preview/sing-box")"; cached_preview="${cached_preview:-未保存}"
   printf '\n%-16s %-26s\n' '项目' '版本'
   printf '%-16s %-26s\n' '----------------' '--------------------------'
   printf '%-16s %-26s\n' '当前版本' "${current:-未知}（${current_label}）"
@@ -7122,9 +7150,9 @@ check_rule_set_with_binary() {
   fi
   if [[ "$format" == source ]]; then
     jq -e 'type == "object" and (.version | type == "number") and (.rules | type == "array")' "$downloaded" >/dev/null &&
-      "$binary" rule-set compile --output "$decoded" "$downloaded" >/dev/null
+      kernel_rule_set_compile "$binary" "$downloaded" "$decoded"
   else
-    "$binary" rule-set decompile --output "$decoded" "$downloaded" >/dev/null &&
+    kernel_rule_set_decompile "$binary" "$downloaded" "$decoded" &&
       jq -e 'type == "object" and (.version | type == "number") and (.rules | type == "array")' "$decoded" >/dev/null
   fi
   local rc=$?
@@ -7154,7 +7182,7 @@ prepare_singbox_release_binary() {
      [[ ! -f "$binary" || -L "$binary" || ! -x "$binary" ]]; then
     return 1
   fi
-  detected="$($binary version 2>/dev/null | awk 'NR==1 {print $3}')"
+  detected="$(kernel_binary_version "$binary")"
   [[ "$detected" == "$version" ]] || return 1
   PREPARED_SINGBOX_BINARY="$binary"
 }
@@ -7845,7 +7873,7 @@ take_over_installed_manager() {
 }
 # <<< manager_channel_handoff
 
-installed_singbox_version() { "${SINGBOX_BIN:-/usr/local/bin/sing-box}" version 2>/dev/null | awk 'NR==1 {print $3}' || true; }
+installed_singbox_version() { kernel_binary_version "${SINGBOX_BIN:-/usr/local/bin/sing-box}"; }
 installed_nfuse_version() {
   local bin="${NFUSE_BIN:-/usr/local/bin/nfuse}" reported rc=0
   # 二进制缺失、丢执行位或根本跑不起来时版本记录都不可信；返回空串让部署流程重新下载。

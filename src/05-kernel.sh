@@ -53,3 +53,36 @@ SINGBOX_SKELETON_ENSURE_PROGRAM='
   | .experimental = (.experimental // {})
   | .experimental.cache_file = (.experimental.cache_file // {})
   | .experimental.cache_file.enabled = (.experimental.cache_file.enabled // true)'
+
+# 读取指定内核可执行文件的版本号。「版本号位于输出第 1 行第 3 列」是内核特有的
+# 输出约定，因此解析放在适配层；文件不可执行时返回空字符串而不是报错，
+# 调用点据此显示「未安装」或「未保存」。
+kernel_binary_version() {
+  [[ -x "$1" ]] || return 0
+  "$1" version 2>/dev/null | awk 'NR==1 {print $3}' || true
+}
+
+# 内核服务控制。刻意拆成三个动作而不是合成一个重启流程：
+# 两个调用点对失败的处理不同——恢复备份时要逐步记录严重错误，
+# 用户操作时直接返回由上层回滚——合成一个会抹掉这个差别。
+kernel_service_reset_failed() {
+  systemctl reset-failed "$SINGBOX_SERVICE" 2>/dev/null || true
+}
+
+kernel_service_restart() {
+  systemctl restart "$SINGBOX_SERVICE" || return 1
+}
+
+kernel_service_is_active() {
+  systemctl is-active --quiet "$SINGBOX_SERVICE"
+}
+
+# 规则集编译与反编译。这两个子命令是内核特有的，换内核时没有对应物，
+# 因此必须集中在这里而不是散在校验流程里。
+kernel_rule_set_compile() {
+  "$1" rule-set compile --output "$3" "$2" >/dev/null || return 1
+}
+
+kernel_rule_set_decompile() {
+  "$1" rule-set decompile --output "$3" "$2" >/dev/null || return 1
+}
