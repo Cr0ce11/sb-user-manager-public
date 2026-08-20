@@ -252,7 +252,7 @@ validate_upstream_candidate() {
   candidate="$(mktemp /tmp/sb-preset-outbound.XXXXXX.json)" || return 1
   register_temp_path "$candidate"
   if ! SB_JQ_OUTBOUNDS="$outbounds" jq '($ENV.SB_JQ_OUTBOUNDS | fromjson) as $outbounds | .outbounds += $outbounds' "$SINGBOX_CONFIG" > "$candidate" ||
-     ! "$SINGBOX_BIN" check -c "$candidate" >/dev/null 2>&1; then
+     ! kernel_check_config "$candidate" >/dev/null 2>&1; then
     rm -f -- "$candidate"
     die "预置出口无法通过当前 sing-box 检查，请确认协议和连接参数"
   fi

@@ -1388,7 +1388,7 @@ create_diagnostic_report() {
   sing_state="$(diagnostic_service_state sing-box.service)"
   nfuse_state="$(diagnostic_service_state nfuse.service)"
   expiry_state="$(diagnostic_service_state sb-user-expiry.timer)"
-  if [[ -x "$SINGBOX_BIN" && -r "$SINGBOX_CONFIG" ]] && "$SINGBOX_BIN" check -c "$SINGBOX_CONFIG" >/dev/null 2>&1; then config_result='通过'
+  if [[ -x "$SINGBOX_BIN" && -r "$SINGBOX_CONFIG" ]] && kernel_check_config "$SINGBOX_CONFIG" >/dev/null 2>&1; then config_result='通过'
   else config_result='未通过'; fi
   if diagnostic_nfuse_healthy; then nfuse_result='正常'
   else nfuse_result='异常'; fi

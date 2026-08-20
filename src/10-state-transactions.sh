@@ -655,7 +655,7 @@ restore_backup() {
     log "严重错误：无法阶段化管理配置备份"
     return 1
   fi
-  if ! "$SINGBOX_BIN" check -c "$config_tmp"; then
+  if ! kernel_check_config "$config_tmp"; then
     rm -f -- "$config_tmp" "$state_tmp" "$previous_state" "$manager_tmp"
     log "严重错误：备份中的 sing-box 配置校验失败"
     return 1
@@ -687,7 +687,7 @@ restore_backup() {
       return 1
     fi
   fi
-  if ! "$SINGBOX_BIN" check -c "$SINGBOX_CONFIG"; then
+  if ! kernel_check_config "$SINGBOX_CONFIG"; then
     log "严重错误：备份已恢复，但备份配置校验失败"
     return 1
   fi
