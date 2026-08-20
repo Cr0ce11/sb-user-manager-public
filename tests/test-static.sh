@@ -97,6 +97,25 @@ if ! grep -Fq -- '--retry-all-errors' <<<"$(sed -n '/^github_download_to() {/,/^
   echo 'github_download_to must retry transient TLS failures' >&2
   exit 1
 fi
+# 更一般的约定：凡是带 --retry 的 curl 都必须同时带 --retry-all-errors。
+# curl 的 --retry 不覆盖 TLS 握手失败，只写 --retry 会给人「已经重试过」的错觉。
+# 这条同时覆盖验收工具，Issue #140 的修复当初只改了 src/ 就漏掉了它。
+# 排除本文件：它按设计存放反面样本，其中就有一条故意只写 --retry 的 curl。
+retry_without_all_errors() {
+  grep -REn --include='*.sh' --exclude='test-static.sh' -- '--retry [0-9]' "$@" \
+    | grep -v -- '--retry-all-errors' || true
+}
+if [[ -n "$(retry_without_all_errors src tests tools)" ]]; then
+  retry_without_all_errors src tests tools >&2
+  echo 'curl --retry must be paired with --retry-all-errors; --retry alone does not cover TLS handshake failures' >&2
+  exit 1
+fi
+printf 'x() {\n  curl -fsSL --retry 3 "$1"\n}\n' > "$kernel_adapter_fixture/91-retry.sh"
+if [[ -z "$(retry_without_all_errors "$kernel_adapter_fixture")" ]]; then
+  echo 'retry pairing check must reject a bare --retry' >&2
+  exit 1
+fi
+rm -f -- "$kernel_adapter_fixture/91-retry.sh"
 
 sed '/^download_binaries() {/,/^}$/ {
   /LATEST_SINGBOX_URL/ s/ || return 1//
