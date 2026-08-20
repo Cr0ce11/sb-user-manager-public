@@ -851,10 +851,16 @@ audit_consistency() {
   # 此后从不复查；上游废弃或改写字段时，存量配置会悄悄过期而没有任何提示。
   # 这里不另写一份「期望骨架」，而是把 src/05-kernel.sh 那份补齐程序应用到当前
   # 配置上反推：被补上的就是缺项。两处共用同一定义，不会各自漂移。
+  # 期望值为空容器的路径必须排除：比对基准是 sing-box format 的输出，而它会把
+  # 空数组整个省略，读回来分不清「没有这个键」和「这个键是空数组」，而对内核
+  # 而言两者语义相同。不排除就会在没有分流的服务器上把 route.rules 与
+  # route.rule_set 误报成缺项。
   skeleton_missing_rows="$(jq -r '. as $orig | ($orig | '"$SINGBOX_SKELETON_ENSURE_PROGRAM"') as $full |
     [$full | paths]
     | map(. as $p | select(($orig | getpath($p)) == null))
     | map(. as $p | select(($p[:-1] | length) == 0 or ($orig | getpath($p[:-1])) != null))
+    | map(. as $p | ($full | getpath($p)) as $value | ($value | type) as $kind
+        | select(($kind != "array" and $kind != "object") or ($value | length) > 0))
     | map(map(tostring) | join("."))
     | .[]' <<<"$config_json")" || return 1
   printf '\n服务与配置检查结果\n\n'
