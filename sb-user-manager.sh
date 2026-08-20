@@ -409,6 +409,30 @@ kernel_check_default_install() {
   /usr/local/bin/sing-box check -c /etc/sing-box/config.json || return 1
 }
 
+# 内核配置骨架的唯一定义。语义是「幂等补齐，不覆盖已有值」：
+# 对空对象应用它得到全新安装的初始配置，对既有配置应用它只补上缺的部分。
+# 全新安装、接管既有安装、一致性审计三处共用这一份，避免各写一套之后悄悄分叉——
+# v4.25.11 所修的缺陷正是同一份判断被写成两处而产生的。
+# 骨架属于内核特有的 schema 知识，因此放在适配层：接入第二内核时这里要各写一份。
+SINGBOX_SKELETON_ENSURE_PROGRAM='
+  if type != "object" then error("运行配置不是 JSON 对象") else . end
+  | .log = (.log // {level:"info",timestamp:true})
+  | .dns = (.dns // {})
+  | .dns.servers = (.dns.servers // [])
+  | (if any(.dns.servers[]?; .tag == "local") then . else .dns.servers += [{type:"local",tag:"local"}] end)
+  | .dns.final = (.dns.final // "local")
+  | .inbounds = (.inbounds // [])
+  | .outbounds = (.outbounds // [])
+  | (if any(.outbounds[]?; .tag == "direct") then . else .outbounds += [{type:"direct",tag:"direct"}] end)
+  | .route = (.route // {})
+  | .route.rules = (.route.rules // [])
+  | .route.rule_set = (.route.rule_set // [])
+  | .route.final = (.route.final // "direct")
+  | .route.default_domain_resolver = (.route.default_domain_resolver // "local")
+  | .experimental = (.experimental // {})
+  | .experimental.cache_file = (.experimental.cache_file // {})
+  | .experimental.cache_file.enabled = (.experimental.cache_file.enabled // true)'
+
 is_ipv4_address() {
   local a b c d extra
   IFS=. read -r a b c d extra <<<"$1"
@@ -6726,14 +6750,8 @@ EOF
 }
 
 write_base_config() {
-  jq -n '{
-    log:{level:"info",timestamp:true},
-    dns:{servers:[{type:"local",tag:"local"}],final:"local"},
-    inbounds:[],
-    outbounds:[{type:"direct",tag:"direct"}],
-    route:{rules:[],rule_set:[],final:"direct",default_domain_resolver:"local"},
-    experimental:{cache_file:{enabled:true}}
-  }' > /etc/sing-box/config.json || return 1
+  # 骨架只在 src/05-kernel.sh 定义一处；这里对空对象应用它得到初始配置。
+  jq -n "{} | $SINGBOX_SKELETON_ENSURE_PROGRAM" > /etc/sing-box/config.json || return 1
   chmod 600 /etc/sing-box/config.json || return 1
 }
 
@@ -8765,18 +8783,9 @@ takeover_existing_environment() {
   run_step_or_rollback rollback_takeover register_temp_path "$tmp" || return 1
   run_step_or_rollback rollback_takeover write_command_output "$normalized" \
     /usr/local/bin/sing-box format -c /etc/sing-box/config.json || return 1
-  run_step_or_rollback rollback_takeover write_command_output "$tmp" jq '
-    .inbounds = (.inbounds // []) |
-    .outbounds = (.outbounds // []) |
-    if any(.outbounds[]?; .tag == "direct") then . else .outbounds += [{type:"direct",tag:"direct"}] end |
-    .dns = (.dns // {}) |
-    .dns.servers = (.dns.servers // []) |
-    if any(.dns.servers[]?; .tag == "local") then . else .dns.servers += [{type:"local",tag:"local"}] end |
-    .route = (.route // {}) |
-    .route.rules = (.route.rules // []) |
-    .route.rule_set = (.route.rule_set // []) |
-    .route.default_domain_resolver = (.route.default_domain_resolver // "local")
-  ' "$normalized" || return 1
+  # 与全新安装共用同一份骨架定义，避免接管出来的部署与全新安装不一致。
+  run_step_or_rollback rollback_takeover write_command_output "$tmp" \
+    jq "$SINGBOX_SKELETON_ENSURE_PROGRAM" "$normalized" || return 1
   run_step_or_rollback rollback_takeover rm -f -- "$normalized" || return 1
   if chmod --reference=/etc/sing-box/config.json "$tmp" 2>/dev/null || chmod 600 "$tmp"; then :; else
     rollback_takeover 1 || true

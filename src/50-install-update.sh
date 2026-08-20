@@ -21,14 +21,8 @@ EOF
 }
 
 write_base_config() {
-  jq -n '{
-    log:{level:"info",timestamp:true},
-    dns:{servers:[{type:"local",tag:"local"}],final:"local"},
-    inbounds:[],
-    outbounds:[{type:"direct",tag:"direct"}],
-    route:{rules:[],rule_set:[],final:"direct",default_domain_resolver:"local"},
-    experimental:{cache_file:{enabled:true}}
-  }' > /etc/sing-box/config.json || return 1
+  # 骨架只在 src/05-kernel.sh 定义一处；这里对空对象应用它得到初始配置。
+  jq -n "{} | $SINGBOX_SKELETON_ENSURE_PROGRAM" > /etc/sing-box/config.json || return 1
   chmod 600 /etc/sing-box/config.json || return 1
 }
 
@@ -2060,18 +2054,9 @@ takeover_existing_environment() {
   run_step_or_rollback rollback_takeover register_temp_path "$tmp" || return 1
   run_step_or_rollback rollback_takeover write_command_output "$normalized" \
     /usr/local/bin/sing-box format -c /etc/sing-box/config.json || return 1
-  run_step_or_rollback rollback_takeover write_command_output "$tmp" jq '
-    .inbounds = (.inbounds // []) |
-    .outbounds = (.outbounds // []) |
-    if any(.outbounds[]?; .tag == "direct") then . else .outbounds += [{type:"direct",tag:"direct"}] end |
-    .dns = (.dns // {}) |
-    .dns.servers = (.dns.servers // []) |
-    if any(.dns.servers[]?; .tag == "local") then . else .dns.servers += [{type:"local",tag:"local"}] end |
-    .route = (.route // {}) |
-    .route.rules = (.route.rules // []) |
-    .route.rule_set = (.route.rule_set // []) |
-    .route.default_domain_resolver = (.route.default_domain_resolver // "local")
-  ' "$normalized" || return 1
+  # 与全新安装共用同一份骨架定义，避免接管出来的部署与全新安装不一致。
+  run_step_or_rollback rollback_takeover write_command_output "$tmp" \
+    jq "$SINGBOX_SKELETON_ENSURE_PROGRAM" "$normalized" || return 1
   run_step_or_rollback rollback_takeover rm -f -- "$normalized" || return 1
   if chmod --reference=/etc/sing-box/config.json "$tmp" 2>/dev/null || chmod 600 "$tmp"; then :; else
     rollback_takeover 1 || true
