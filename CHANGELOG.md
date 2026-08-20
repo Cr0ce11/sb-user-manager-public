@@ -6,6 +6,25 @@
 - 新增重要功能、结构或数据模型发生重大变化：递增大版本号，例如 `4.2.x` → `4.3.0`。
 - 每次迭代必须保留上一版本作为回退点，在本文件顶部追加增量记录，并通过本地门禁与 GitHub CI 后再发布。
 
+## 4.25.19 - 2026-08-20
+
+- 脚本现在能在 mihomo 部署上生成三种入口的用户配置。做完这一片之后，一台 mihomo 机器可以真实承载原生 SS2022、SS2022 + ShadowTLS 与 AnyTLS 三种入口的用户，这是 [公开 Issue #157](https://github.com/Cr0ce11/sb-user-manager-public/issues/157) 所规划的接入第二内核的第三片，对应 [公开 Issue #180](https://github.com/Cr0ce11/sb-user-manager-public/issues/180)。
+
+  **sing-box 部署没有任何变化。** 生成出来的入站配置逐字节不变，由测试对比锁定；`audit` 与含分流的 `lifecycle` 验收失败项为 0。
+
+  内核选择仍然**没有菜单入口**，只能通过仅供测试的环境变量选择。开放选择要等到审计与一致性检查的 mihomo 侧就位。
+
+- 一条此前写下的实现指令被实测推翻：**ShadowTLS 严格模式在 mihomo 侧的键名是 `strict-mode`，不是记录里写的 `strictmode`**。mihomo 的监听器配置走的是另一套结构体标签，按原记录实现会让严格模式在每台 mihomo 机器上悄悄关闭，而配置测试与启动日志都不会有任何提示。本版本按实测更正，并加了一条门禁禁止写回错误的键名（[公开 Issue #154](https://github.com/Cr0ce11/sb-user-manager-public/issues/154)）。
+
+- 顺带改对两处在 mihomo 部署上会指错文件的地方：重启前的配置校验、以及每次用户操作的事务备份与恢复，此前都写死了 sing-box 的配置路径。这两处在 mihomo 机器还不能有用户时走不到，本版本让它们可达，因此一并改对。
+
+- 分流菜单在 mihomo 部署上明确说明「尚未支持这个内核」并返回，不再可能写到一个 mihomo 根本不读的文件里去。分流的 mihomo 侧是下一片的内容。
+
+- 「检查更新」「sing-box 版本管理」等四个入口改为先确定本机内核再判断，不再依赖调用它们之前是否有人载入过管理配置（[公开 Issue #171](https://github.com/Cr0ce11/sb-user-manager-public/issues/171)）。
+
+  本版本对 sing-box 使用者没有任何可感知的行为变化。
+
+
 ## 4.25.18 - 2026-08-20
 
 - 管理器自己的数据——用户资料、内部备份、AnyTLS 证书——收敛到一个来源。**使用者感知不到任何变化**：默认位置仍然是 `/etc/sing-box`，一个字没改。这是 [公开 Issue #172](https://github.com/Cr0ce11/sb-user-manager-public/issues/172) 三步走的第一步，对应 [公开 Issue #173](https://github.com/Cr0ce11/sb-user-manager-public/issues/173)。
