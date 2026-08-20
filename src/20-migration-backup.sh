@@ -985,7 +985,7 @@ build_merge_migration_payload() {
   jq -e 'type == "array"' <<<"$current_nfuse" >/dev/null || return 1
   normalized="$(mktemp /tmp/sb-migration-merge-config.XXXXXX)" || return 1
   register_temp_path "$normalized"
-  "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" > "$normalized" || { rm -f -- "$normalized"; return 1; }
+  kernel_normalized_config > "$normalized" || { rm -f -- "$normalized"; return 1; }
   jq --slurpfile current "$STATE_FILE" --argjson nfuse "$current_nfuse" --argjson schema "$STATE_SCHEMA_VERSION" '
     def endpoint_from_legacy:
       if (.protocol // "ss2022") == "anytls" then
@@ -1281,7 +1281,7 @@ collect_migration_conflicts() {
   fi
   normalized="$(mktemp /tmp/sb-migration-config.XXXXXX)"
   register_temp_path "$normalized"
-  if ! "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" > "$normalized"; then
+  if ! kernel_normalized_config > "$normalized"; then
     rm -f "$normalized"; add_migration_conflict "无法读取目标 sing-box 配置"; return 0
   fi
   while IFS= read -r user; do

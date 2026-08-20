@@ -377,6 +377,17 @@ install_runtime_traps() {
   trap 'handle_runtime_signal QUIT 131' QUIT
   trap 'handle_runtime_signal TERM 143' TERM
 }
+# 内核适配层。所有对代理内核可执行文件的直接调用都集中在本模块，
+# 其它模块只经由这里定义的函数与内核交互。
+# 这样做的原因：上游内核会在小版本之间修改配置规范与命令行接口，
+# 调用点散落在各模块时，每次跟进都要同时改多处；集中之后只改这里一处。
+
+# 读取当前部署的内核配置，输出内核自身规范化后的 JSON 到标准输出。
+# 调用方可以重定向到文件、用命令替换取值，或直接接管道，三种形态都适用。
+# 失败时按内核的退出码返回，由调用方决定如何处理。
+kernel_normalized_config() {
+  "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG"
+}
 
 is_ipv4_address() {
   local a b c d extra
@@ -668,7 +679,7 @@ migrate_state() {
   if ((schema == 1)); then
     normalized="$(mktemp "$(dirname "$STATE_FILE")/.migration-config.XXXXXX")"
     register_temp_path "$normalized"
-    if ! "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" > "$normalized"; then
+    if ! kernel_normalized_config > "$normalized"; then
       rm -f "$normalized"; restore_state_backup_atomically "$backup" || die "旧用户资料升级失败，且无法自动恢复原数据；备份：$backup"
       die "无法读取连接配置，旧用户资料未能升级；原数据已自动恢复"
     fi
@@ -2605,7 +2616,7 @@ build_merge_migration_payload() {
   jq -e 'type == "array"' <<<"$current_nfuse" >/dev/null || return 1
   normalized="$(mktemp /tmp/sb-migration-merge-config.XXXXXX)" || return 1
   register_temp_path "$normalized"
-  "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" > "$normalized" || { rm -f -- "$normalized"; return 1; }
+  kernel_normalized_config > "$normalized" || { rm -f -- "$normalized"; return 1; }
   jq --slurpfile current "$STATE_FILE" --argjson nfuse "$current_nfuse" --argjson schema "$STATE_SCHEMA_VERSION" '
     def endpoint_from_legacy:
       if (.protocol // "ss2022") == "anytls" then
@@ -2901,7 +2912,7 @@ collect_migration_conflicts() {
   fi
   normalized="$(mktemp /tmp/sb-migration-config.XXXXXX)"
   register_temp_path "$normalized"
-  if ! "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" > "$normalized"; then
+  if ! kernel_normalized_config > "$normalized"; then
     rm -f "$normalized"; add_migration_conflict "无法读取目标 sing-box 配置"; return 0
   fi
   while IFS= read -r user; do
@@ -3548,7 +3559,7 @@ port_in_state() {
 
 tag_exists_in_config() {
   local tag="$1"
-  "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" |
+  kernel_normalized_config |
     jq -e --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' >/dev/null
 }
 
@@ -3569,7 +3580,7 @@ load_new_user_config_snapshot() {
   local json_output_name="$1" source_output_name="$2"
   local source_before snapshot_json
   read_singbox_config_source source_before || return 1
-  snapshot_json="$("$SINGBOX_BIN" format -c "$SINGBOX_CONFIG")" || return 1
+  snapshot_json="$(kernel_normalized_config)" || return 1
   printf -v "$json_output_name" '%s' "$snapshot_json"
   printf -v "$source_output_name" '%s' "$source_before"
 }
@@ -3822,7 +3833,7 @@ rewrite_singbox_config() {
     return 1
   }
   register_temp_path "$normalized"
-  if ! "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" > "$normalized"; then
+  if ! kernel_normalized_config > "$normalized"; then
     rm -f -- "$tmp" "$normalized"
     printf '错误：无法解析或格式化 sing-box 配置：%s\n' "$SINGBOX_CONFIG" >&2
     return 1
@@ -5843,7 +5854,7 @@ collect_legacy_split_cleanup_plan_from_config() {
 
 legacy_split_cleanup_pending() {
   local config tags cleanup
-  config="$("$SINGBOX_BIN" format -c "$SINGBOX_CONFIG")" || return 1
+  config="$(kernel_normalized_config)" || return 1
   tags="$(collect_managed_split_tags)" || return 1
   cleanup="$(collect_legacy_split_cleanup_plan_from_config "$config" "$tags")" || return 1
   jq -e '(.rule_tags | length) > 0' <<<"$cleanup" >/dev/null
@@ -5961,7 +5972,7 @@ rebuild_all_split_configs() {
   # 先完整生成计划，任何读取、冲突或格式错误都不得提前改动现有配置。
   plan="$(build_split_runtime_plan)" || return 1
   tags="$(collect_managed_split_tags)" || return 1
-  config="$("$SINGBOX_BIN" format -c "$SINGBOX_CONFIG")" || return 1
+  config="$(kernel_normalized_config)" || return 1
   legacy_cleanup="$(collect_legacy_split_cleanup_plan_from_config "$config" "$tags")" || return 1
   SB_JQ_PLAN="$plan" rewrite_singbox_config '
     ($ENV.SB_JQ_PLAN | fromjson) as $plan |
@@ -6027,7 +6038,7 @@ SINGBOX_CONFIG_NORMALISE_PROGRAM='
     else . end'
 
 singbox_config_for_comparison() {
-  "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" | jq -c "$SINGBOX_CONFIG_NORMALISE_PROGRAM"
+  kernel_normalized_config | jq -c "$SINGBOX_CONFIG_NORMALISE_PROGRAM"
 }
 
 shared_preset_runtime_is_current() {
@@ -10031,7 +10042,7 @@ audit_consistency() {
   local preset_link_rows preset_kind preset_reason managed_tags legacy_cleanup legacy_count
   AUDIT_ISSUES=0
   AUDIT_REPAIRABLE=0
-  config_json="$("$SINGBOX_BIN" format -c "$SINGBOX_CONFIG")" || return 1
+  config_json="$(kernel_normalized_config)" || return 1
   nfuse_json="$(nfuse list --json)" || return 1
   # 类型校验与 inbound 还原折在同一次 jq 调用里：本函数的 jq 调用次数受单元测试的
   # 性能门禁看守（批量化后固定为 9 次），不能为还原再多开一个进程。程序文本与

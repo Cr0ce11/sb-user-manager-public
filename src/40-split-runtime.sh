@@ -415,7 +415,7 @@ collect_legacy_split_cleanup_plan_from_config() {
 
 legacy_split_cleanup_pending() {
   local config tags cleanup
-  config="$("$SINGBOX_BIN" format -c "$SINGBOX_CONFIG")" || return 1
+  config="$(kernel_normalized_config)" || return 1
   tags="$(collect_managed_split_tags)" || return 1
   cleanup="$(collect_legacy_split_cleanup_plan_from_config "$config" "$tags")" || return 1
   jq -e '(.rule_tags | length) > 0' <<<"$cleanup" >/dev/null
@@ -533,7 +533,7 @@ rebuild_all_split_configs() {
   # 先完整生成计划，任何读取、冲突或格式错误都不得提前改动现有配置。
   plan="$(build_split_runtime_plan)" || return 1
   tags="$(collect_managed_split_tags)" || return 1
-  config="$("$SINGBOX_BIN" format -c "$SINGBOX_CONFIG")" || return 1
+  config="$(kernel_normalized_config)" || return 1
   legacy_cleanup="$(collect_legacy_split_cleanup_plan_from_config "$config" "$tags")" || return 1
   SB_JQ_PLAN="$plan" rewrite_singbox_config '
     ($ENV.SB_JQ_PLAN | fromjson) as $plan |
@@ -599,7 +599,7 @@ SINGBOX_CONFIG_NORMALISE_PROGRAM='
     else . end'
 
 singbox_config_for_comparison() {
-  "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" | jq -c "$SINGBOX_CONFIG_NORMALISE_PROGRAM"
+  kernel_normalized_config | jq -c "$SINGBOX_CONFIG_NORMALISE_PROGRAM"
 }
 
 shared_preset_runtime_is_current() {

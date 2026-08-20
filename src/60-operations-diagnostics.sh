@@ -837,7 +837,7 @@ audit_consistency() {
   local preset_link_rows preset_kind preset_reason managed_tags legacy_cleanup legacy_count
   AUDIT_ISSUES=0
   AUDIT_REPAIRABLE=0
-  config_json="$("$SINGBOX_BIN" format -c "$SINGBOX_CONFIG")" || return 1
+  config_json="$(kernel_normalized_config)" || return 1
   nfuse_json="$(nfuse list --json)" || return 1
   # 类型校验与 inbound 还原折在同一次 jq 调用里：本函数的 jq 调用次数受单元测试的
   # 性能门禁看守（批量化后固定为 9 次），不能为还原再多开一个进程。程序文本与
