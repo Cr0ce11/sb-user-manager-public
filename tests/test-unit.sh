@@ -8,6 +8,15 @@ source ./sb-user-manager.sh
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
+# 审计夹具必须带骨架，否则新增的骨架检查会在每个用例里额外报出缺项，
+# 把各用例真正要断言的东西淹掉。这里用与实现相同的补齐程序处理夹具，
+# 夹具因此与真实部署保持一致，而不是靠调高期望的问题数来回避。
+apply_skeleton_to_test_config() {
+  local tmp
+  tmp="$(mktemp "$work/skeleton.XXXXXX")" || return 1
+  jq -c "$SINGBOX_SKELETON_ENSURE_PROGRAM" "$SINGBOX_CONFIG" > "$tmp" || return 1
+  mv "$tmp" "$SINGBOX_CONFIG" || return 1
+}
 
 create_test_sqlite_database() {
   python3 - "$1" "$2" <<'PY'
@@ -7296,6 +7305,7 @@ fi
     "outbounds":[],
     "route":{"rule_set":[],"rules":[]}
   }' > "$SINGBOX_CONFIG"
+  apply_skeleton_to_test_config
   audit_batch_nfuse_json='[
     {"name":"any-disabled","tier":"c","ports":[{"start":20002,"end":20002}]},
     {"name":"direct-active","tier":"c","ports":[{"start":21003,"end":21003}]},
@@ -7359,6 +7369,7 @@ EOF
     "outbounds":[],
     "route":{"rule_set":[],"rules":[]}
   }' > "$SINGBOX_CONFIG"
+  apply_skeleton_to_test_config
   audit_user_nfuse_singbox() {
     [[ "${1:-}" == format && "${2:-}" == -c && "${3:-}" == "$SINGBOX_CONFIG" ]] || return 1
     command cat "$SINGBOX_CONFIG"
@@ -7405,6 +7416,7 @@ EOF
     "rule_presets":[]
   }' > "$STATE_FILE"
   printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rule_set":[],"rules":[]}}' > "$SINGBOX_CONFIG"
+  apply_skeleton_to_test_config
   audit_disabled_split_singbox() {
     [[ "${1:-}" == format && "${2:-}" == -c && "${3:-}" == "$SINGBOX_CONFIG" ]] || return 1
     command cat "$SINGBOX_CONFIG"
@@ -7419,9 +7431,61 @@ EOF
   printf '%s\n' '{"inbounds":[],"outbounds":[{"tag":"Hinet"}],
     "route":{"rule_set":[{"tag":"AI","url":"https://rules.example/ai.srs"}],
       "rules":[{"rule_set":"AI","outbound":"Hinet","inbound":["anytls-paused"]}]}}' > "$SINGBOX_CONFIG"
+  apply_skeleton_to_test_config
   audit_consistency > "$work/audit-disabled-split-stale-output"
   [[ "$AUDIT_ISSUES" == 1 && "$AUDIT_REPAIRABLE" == 1 ]]
   grep -Fq '[可自动修复] 分流 AI 指定的用户 paused 已停用，但连接规则仍在生效' "$work/audit-disabled-split-stale-output"
+)
+
+# 骨架检查：配置缺少 log / dns / route.final / experimental 这些只在装机或接管时
+# 写入、此后从不复查的段落时，审计必须报出来。这是上游废弃字段后存量配置悄悄
+# 过期的唯一可见信号。
+(
+  STATE_FILE="$work/audit-skeleton-state.json"
+  SINGBOX_CONFIG="$work/audit-skeleton-config.json"
+  SINGBOX_BIN=audit_skeleton_singbox
+  audit_skeleton_singbox() {
+    case "${1:-}" in
+      format) command jq . "$3";;
+      *) return 64;;
+    esac
+  }
+  nfuse() {
+    [[ "${1:-}" == list && "${2:-}" == --json ]] || return 1
+    printf '%s\n' '[]'
+  }
+  printf '%s\n' '{"schema_version":7,"users":[],"splits":[]}' > "$STATE_FILE"
+  # 骨架完整：对照组，必须一个问题都不报。缺了这一组就分不清检查是有效还是恒真。
+  command jq -cn "{} | $SINGBOX_SKELETON_ENSURE_PROGRAM" > "$SINGBOX_CONFIG"
+  audit_consistency > "$work/audit-skeleton-complete-output"
+  if [[ "$AUDIT_ISSUES" != 0 ]]; then
+    printf '骨架完整时不得报出问题，实际报了 %s 个\n' "$AUDIT_ISSUES" >&2
+    cat "$work/audit-skeleton-complete-output" >&2
+    exit 1
+  fi
+  # 骨架缺失：四个段落全缺，必须逐项报出
+  printf '%s\n' '{"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}' > "$SINGBOX_CONFIG"
+  audit_consistency > "$work/audit-skeleton-missing-output"
+  if [[ "$AUDIT_ISSUES" != 4 ]]; then
+    printf '骨架缺 4 项时应报 4 个问题，实际 %s 个\n' "$AUDIT_ISSUES" >&2
+    cat "$work/audit-skeleton-missing-output" >&2
+    exit 1
+  fi
+  for skeleton_expected in log dns route experimental; do
+    if ! grep -Fq "运行配置缺少骨架项 $skeleton_expected" "$work/audit-skeleton-missing-output"; then
+      printf '审计没有报出缺失的骨架项 %s\n' "$skeleton_expected" >&2
+      exit 1
+    fi
+  done
+  # 只缺一个子项时应精确到该子项，而不是笼统报出整段
+  command jq -cn "{} | $SINGBOX_SKELETON_ENSURE_PROGRAM" \
+    | command jq -c 'del(.route.final)' > "$SINGBOX_CONFIG"
+  audit_consistency > "$work/audit-skeleton-partial-output"
+  if [[ "$AUDIT_ISSUES" != 1 ]]; then
+    printf '只缺 route.final 时应报 1 个问题，实际 %s 个\n' "$AUDIT_ISSUES" >&2
+    exit 1
+  fi
+  grep -Fq '运行配置缺少骨架项 route.final' "$work/audit-skeleton-partial-output"
 )
 
 # 50 个 ShadowTLS 用户的一致性检查固定批量处理；重构前该夹具会启动 409 次 jq。
@@ -7445,6 +7509,7 @@ EOF
       {type:"shadowsocks",tag:("ss-udp-" + $name),network:"udp",listen_port:$port,password:"audit-secret"}],
     outbounds:[],route:{rule_set:[],rules:[]}
   }' > "$SINGBOX_CONFIG"
+  apply_skeleton_to_test_config
   audit_batch_count_nfuse="$(command jq -cn '[range(0; 50) as $index | {
     name:("user" + ($index | tostring)),tier:"c",
     ports:[{start:(20000 + $index),end:(20000 + $index)}]
@@ -7469,7 +7534,9 @@ EOF
   audit_consistency > "$work/audit-batch-count-output"
   [[ "$AUDIT_ISSUES" == 0 && "$AUDIT_REPAIRABLE" == 0 ]]
   grep -Fq '一切正常' "$work/audit-batch-count-output"
-  [[ "$(wc -l < "$audit_jq_calls" | tr -d ' ')" == 9 ]]
+  # 9 次是原有批量化后的次数，第 10 次是新增的骨架检查——它与 src/05-kernel.sh
+  # 共用同一份补齐程序，把「配置缺哪些骨架项」一次算出，不逐项试探。
+  [[ "$(wc -l < "$audit_jq_calls" | tr -d ' ')" == 10 ]]
   if tr '\0' '\n' < "$audit_jq_args" | grep -Fq 'audit-secret'; then
     echo 'unexpected audit-secret in $audit_jq_args' >&2
     exit 1
@@ -7478,6 +7545,7 @@ EOF
 
 printf '%s\n' '{"schema_version":3,"users":[{"name":"test","status":"disabled","port":10001,"metered":true,"limit_gib":1},{"name":"crocell","status":"active","port":10000,"metered":false},{"name":"test2","status":"active","port":22547,"metered":true,"limit_gib":2}],"splits":[{"name":"AI","status":"active","scope":"user","user":"crocell","rule_set_tag":"AI","outbound_tag":"Hinet"}]}' > "$STATE_FILE"
 printf '%s\n' '{"inbounds":[{"tag":"st-crocell"},{"tag":"ss-crocell"},{"type":"shadowsocks","tag":"ss-udp-crocell","network":"udp","listen_port":10000},{"tag":"st-test2"},{"tag":"ss-test2"},{"type":"shadowsocks","tag":"ss-udp-test2","network":"udp","listen_port":22547}],"outbounds":[{"tag":"Hinet"}],"route":{"rule_set":[{"tag":"AI"}],"rules":[{"rule_set":"AI","outbound":"Hinet","inbound":["st-crocell","ss-crocell","ss-udp-crocell"]}]}}' > "$SINGBOX_CONFIG"
+apply_skeleton_to_test_config
 nfuse() {
   if [[ "$1" == list && "$2" == --json ]]; then
     printf '%s\n' '[{"name":"test","tier":"a","ports":[{"start":10001,"end":10001}]},{"name":"crocell","tier":"c","ports":[{"start":10000,"end":10000}]},{"name":"test2","tier":"a","ports":[{"start":22547,"end":22547}]}]'
@@ -7503,6 +7571,7 @@ grep -Fq 'UDP 连接配置不正确' "$work/audit-udp-invalid-output"
 
 printf '%s\n' '{"schema_version":6,"users":[{"name":"direct-audit","status":"active","port":20044,"protocol":"ss2022","transport":"direct","metered":false,"usage_offset_bytes":0,"ss2022_password":"direct-secret","method":"2022-blake3-aes-128-gcm","endpoints":[{"protocol":"ss2022","transport":"direct","port":20044,"ss2022_password":"direct-secret","method":"2022-blake3-aes-128-gcm"}]}],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
 printf '%s\n' '{"inbounds":[{"type":"shadowsocks","tag":"ss-direct-audit","listen":"::","listen_port":20044,"method":"2022-blake3-aes-128-gcm","password":"direct-secret"},{"type":"shadowtls","tag":"st-direct-audit"},{"type":"shadowsocks","tag":"ss-udp-direct-audit","network":"udp","listen_port":20044}],"outbounds":[],"route":{"rule_set":[],"rules":[]}}' > "$SINGBOX_CONFIG"
+apply_skeleton_to_test_config
 nfuse() {
   if [[ "$1" == list && "$2" == --json ]]; then
     printf '%s\n' '[{"name":"direct-audit","tier":"c","ports":[{"start":20044,"end":20044}]}]'

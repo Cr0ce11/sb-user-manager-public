@@ -10078,7 +10078,7 @@ collect_user_consistency_issue_rows() {
 }
 
 audit_consistency() {
-  local config_json nfuse_json user_issue_rows issue_repairable issue_message expiry_rows split_rows split name split_status rule_tag out_tag scope scope_user scope_user_status scope_tags expires
+  local config_json nfuse_json skeleton_missing_rows skeleton_path user_issue_rows issue_repairable issue_message expiry_rows split_rows split name split_status rule_tag out_tag scope scope_user scope_user_status scope_tags expires
   local preset_link_rows preset_kind preset_reason managed_tags legacy_cleanup legacy_count
   AUDIT_ISSUES=0
   AUDIT_REPAIRABLE=0
@@ -10092,7 +10092,22 @@ audit_consistency() {
   user_issue_rows="$(collect_user_consistency_issue_rows "$config_json" "$nfuse_json")" || return 1
   expiry_rows="$(jq -r '.users[] | select(.expires_at != null) | [.name, (.expires_at | tostring)] | @tsv' "$STATE_FILE")" || return 1
   split_rows="$(jq -c '.splits[]?' "$STATE_FILE")" || return 1
+  # 骨架段（log、dns、route.final、experimental 等）只在全新安装或接管时写入，
+  # 此后从不复查；上游废弃或改写字段时，存量配置会悄悄过期而没有任何提示。
+  # 这里不另写一份「期望骨架」，而是把 src/05-kernel.sh 那份补齐程序应用到当前
+  # 配置上反推：被补上的就是缺项。两处共用同一定义，不会各自漂移。
+  skeleton_missing_rows="$(jq -r '. as $orig | ($orig | '"$SINGBOX_SKELETON_ENSURE_PROGRAM"') as $full |
+    [$full | paths]
+    | map(. as $p | select(($orig | getpath($p)) == null))
+    | map(. as $p | select(($p[:-1] | length) == 0 or ($orig | getpath($p[:-1])) != null))
+    | map(map(tostring) | join("."))
+    | .[]' <<<"$config_json")" || return 1
   printf '\n服务与配置检查结果\n\n'
+  while IFS= read -r skeleton_path; do
+    [[ -n "$skeleton_path" ]] || continue
+    printf '  [需要处理] 运行配置缺少骨架项 %s\n' "$skeleton_path"
+    ((AUDIT_ISSUES+=1))
+  done <<<"$skeleton_missing_rows"
   while IFS=$'\t' read -r name expires; do
     [[ -n "$name" ]] || continue
     if ! parse_expiry_epoch "$expires" >/dev/null; then
