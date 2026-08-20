@@ -847,11 +847,20 @@ grep -Fq 'write_deployed_versions()' sb-user-manager.sh
 grep -Fq 'activate_managed_services()' sb-user-manager.sh
 grep -Fq 'restore_failed_environment_change()' sb-user-manager.sh
 grep -Fq 'complete_environment_change()' sb-user-manager.sh
-for shared_helper in default_network_interface ensure_anytls_certificate install_manager_binary \
-  write_deployed_versions activate_managed_services restore_failed_environment_change complete_environment_change; do
+# 这几个助手必须被复用而不是各写一份。调用点数量钉死，多出来一处通常意味着
+# 有人又抄了一遍实现；改动调用点时同步改这里的期望值，并想清楚新增的那一处
+# 为什么必须存在。
+# default_network_interface 的四处：全新部署、接管既有安装，以及服务单元漂移的
+# 检查与修复（公开 Issue #190）——后两处必须现场识别接口，不能读旧单元里的那个，
+# 那正是可能不对的东西。
+# activate_managed_services 的三处：部署、接管，以及重写单元之后的重新激活
+# ——不 daemon-reload 就等于「修了但没生效」。
+for shared_helper in default_network_interface:4 ensure_anytls_certificate:2 install_manager_binary:2 \
+  write_deployed_versions:2 activate_managed_services:3 restore_failed_environment_change:3 \
+  complete_environment_change:3; do
+  expected_calls="${shared_helper##*:}"
+  shared_helper="${shared_helper%%:*}"
   shared_helper_calls="$(awk -v helper="$shared_helper" 'index($0, helper) && !index($0, helper "()") {count++} END {print count+0}' sb-user-manager.sh)"
-  expected_calls=2
-  [[ "$shared_helper" == restore_failed_environment_change || "$shared_helper" == complete_environment_change ]] && expected_calls=3
   if [[ "$shared_helper_calls" != "$expected_calls" ]]; then
     echo "expected shared $shared_helper to have $expected_calls callers, found $shared_helper_calls" >&2
     exit 1
