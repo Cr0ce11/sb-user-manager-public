@@ -134,6 +134,72 @@ if [[ -n "$(manager_data_path_literals "$manager_data_fixture")" ]]; then
 fi
 rm -f -- "$manager_data_fixture/91-config.sh"
 
+# 使用者的分流规则目录只能经 MIHOMO_RULES_DIR 取得。它必须与 mihomo 单元里
+# SAFE_PATHS 的第二条一字不差，写死两处之后改一处就是「配置根本加载不了」，
+# 而 mihomo 给出的错误信息不会提到是哪一边不对（公开 Issue #186）。
+mihomo_rules_dir_literals() {
+  grep -rn '/etc/mihomo/rules' "$1" |
+    grep -v '^[^:]*:[0-9]*:[[:space:]]*#' || true
+}
+if [[ -n "$(mihomo_rules_dir_literals src)" ]]; then
+  mihomo_rules_dir_literals src >&2
+  echo 'the split rule directory must derive from MIHOMO_RULES_DIR, not be hardcoded' >&2
+  exit 1
+fi
+printf 'x() {\n  rules="/etc/mihomo/rules/mine.yaml"\n}\n' > "$manager_data_fixture/92-rules.sh"
+if [[ -z "$(mihomo_rules_dir_literals "$manager_data_fixture")" ]]; then
+  echo 'the rule directory check must reject a hardcoded literal' >&2
+  exit 1
+fi
+rm -f -- "$manager_data_fixture/92-rules.sh"
+# 对照：mihomo 自己的配置路径不受这条规则约束。
+printf 'x() {\n  config="/etc/mihomo/config.json"\n}\n' > "$manager_data_fixture/93-config.sh"
+if [[ -n "$(mihomo_rules_dir_literals "$manager_data_fixture")" ]]; then
+  echo 'the rule directory check must not flag the mihomo kernel config path' >&2
+  exit 1
+fi
+rm -f -- "$manager_data_fixture/93-config.sh"
+
+# SAFE_PATHS 只能由 mihomo_safe_paths 给出。单元里写一份、配置校验里再写一份，
+# 两边一旦不一致就会出现「管理器说配置不可用、服务其实跑得起来」这种自相矛盾的
+# 失败——2d 实测撞到过一次，当时校验那一侧根本没设这个环境变量。
+safe_paths_outside_single_source() {
+  grep -rn 'SAFE_PATHS' src |
+    grep -v 'mihomo_safe_paths' |
+    grep -v 'Environment=SAFE_PATHS=\$safe_paths' |
+    grep -v '^[^:]*:[0-9]*:[[:space:]]*#' || true
+}
+if [[ -n "$(safe_paths_outside_single_source)" ]]; then
+  safe_paths_outside_single_source >&2
+  echo 'SAFE_PATHS must come from mihomo_safe_paths only' >&2
+  exit 1
+fi
+
+# mihomo 的路由规则是字符串，拼错一个字符就是另一条规则。因此规则语法只许
+# 出现在适配层的渲染函数里；分流模块与界面模块里不得自己拼 RULE-SET / IN-NAME
+# / SUB-RULE。散着写第二处，两处迟早只改一处，而 mihomo 只会说「规则类型不支持」。
+mihomo_rule_syntax_outside_adapter() {
+  grep -rn '"\(RULE-SET\|IN-NAME\|SUB-RULE\),' src/40-split-runtime.sh src/70-split-prompts.sh \
+    src/60-operations-diagnostics.sh src/30-user-runtime.sh 2>/dev/null || true
+}
+if [[ -n "$(mihomo_rule_syntax_outside_adapter)" ]]; then
+  mihomo_rule_syntax_outside_adapter >&2
+  echo 'mihomo rule syntax must only be produced by kernel_render_split_plan' >&2
+  exit 1
+fi
+
+# 派发条目必须真的指向那个托管 sub-rule。这两个常量分开写，拼不上时
+# mihomo 会拒绝加载整份配置——机器停在起不来的状态上。
+dispatch_rule="$(sed -n 's/^MIHOMO_SPLIT_DISPATCH_RULE="\(.*\)"$/\1/p' src/05-kernel.sh)"
+if [[ "$dispatch_rule" != *',${MIHOMO_MANAGED_SUB_RULE}' ]]; then
+  printf 'the mihomo dispatch rule must end with the managed sub-rule name: %s\n' "$dispatch_rule" >&2
+  exit 1
+fi
+if [[ "$dispatch_rule" != SUB-RULE,\(*\),* ]]; then
+  printf 'the mihomo dispatch rule must be a SUB-RULE with a parenthesised condition: %s\n' "$dispatch_rule" >&2
+  exit 1
+fi
+
 # GitHub 的 API 查询与资产下载必须经 github_api_get / github_download_to，
 # 不得在调用点各写一份 curl。散落时一旦要调整重试或超时策略就得逐处跟进，
 # Issue #140 正是因此漏掉了 TLS 瞬时失败的重试。
@@ -644,7 +710,7 @@ grep -Fq 'is_public_ipv4()' sb-user-manager.sh
 grep -Fq 'https://api.ipify.org' sb-user-manager.sh
 grep -Fq 'PUBLIC_SERVER_OVERRIDE=""' sb-user-manager.sh
 grep -Fq 'repair_consistency()' sb-user-manager.sh
-grep -Fq 'rewrite_singbox_config()' sb-user-manager.sh
+grep -Fq 'rewrite_kernel_config()' sb-user-manager.sh
 grep -Fq 'make_user_inbounds_from_state()' sb-user-manager.sh
 grep -Fq 'replace_user_inbounds()' sb-user-manager.sh
 grep -Fq 'state_replace_user()' sb-user-manager.sh
@@ -653,7 +719,7 @@ grep -Fq 'prompt_edit_user()' sb-user-manager.sh
 grep -Fq 'ensure_global_sni_config()' sb-user-manager.sh
 grep -Fq 'cmd_set_global_sni()' sb-user-manager.sh
 grep -Fq 'global_sni_menu()' sb-user-manager.sh
-grep -Fq 'validate_remote_rule_set()' sb-user-manager.sh
+grep -Fq 'validate_split_rule_source()' sb-user-manager.sh
 grep -Fq 'rebuild_all_split_configs()' sb-user-manager.sh
 grep -Fq 'build_split_runtime_plan()' sb-user-manager.sh
 grep -Fq 'stable_managed_tag()' sb-user-manager.sh
@@ -663,7 +729,7 @@ grep -Fq 'split_preset_fields_are_current()' sb-user-manager.sh
 grep -Fq 'state_normalize_split_preset_fields()' sb-user-manager.sh
 grep -Fq 'migrate_empty_split_preset_fields()' sb-user-manager.sh
 [[ "$(grep -Fc 'migrate_empty_split_preset_fields' sb-user-manager.sh)" == 2 ]]
-grep -Fq 'if ! cmd_split_add "$name" "$url" "$scope" "$user" "$upstream" "$outbound_tag" "$rule_preset" "$outbound_preset"; then' sb-user-manager.sh
+grep -Fq 'if ! cmd_split_add "$name" "$source" "$scope" "$user" "$upstream" "$outbound_tag" "$rule_preset" "$outbound_preset" "$behavior"; then' sb-user-manager.sh
 grep -Fq '分流没有添加，现有配置没有改变。' sb-user-manager.sh
 grep -Fq 'SHARED_PRESET_RUNTIME_MARKER=' sb-user-manager.sh
 grep -Fq '同一用户不能让同一条预置规则同时使用两个不同出口' sb-user-manager.sh

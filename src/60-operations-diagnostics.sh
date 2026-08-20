@@ -906,7 +906,8 @@ audit_consistency() {
     (if (($split.rule_preset // "") != "") then
        (first($rules[] | select(.name == $split.rule_preset)) // null) as $preset |
        if $preset == null then [$split.name,"规则","预置已不存在"]
-       elif $split.url != $preset.url then [$split.name,"规则","保存内容未同步"] else empty end
+       elif ($split.url // $split.rule_file) != ($preset.url // $preset.rule_file) or
+            ($split.rule_behavior // "") != ($preset.rule_behavior // "") then [$split.name,"规则","保存内容未同步"] else empty end
      else empty end) | @tsv
   ' "$STATE_FILE")" || return 1
   while IFS=$'\t' read -r name preset_kind preset_reason; do
@@ -1054,7 +1055,7 @@ repair_consistency() {
       select((.name|type)=="string" and (.name|length)>0) |
       select(.status=="active" or .status=="disabled") |
       select(.scope=="all" or .scope=="user") |
-      select((.url|type)=="string" and (.url|length)>0) |
+      select(((.url // .rule_file)|type)=="string" and ((.url // .rule_file)|length)>0) |
       select((.upstream|type)=="object")
     ' <<<"$split" >/dev/null; then
       rollback_active_operation 1 || true

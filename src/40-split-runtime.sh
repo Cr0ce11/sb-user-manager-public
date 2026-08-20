@@ -74,11 +74,146 @@ validate_public_rule_set_url() {
   done <<<"$resolved"
 }
 
-validate_remote_rule_set() {
-  validate_public_rule_set_url "$1" ||
-    die "远程规则集地址必须使用 HTTPS，且不能指向本机或内网地址"
-  check_rule_set_with_binary "$SINGBOX_BIN" "$1" ||
-    die "远程规则集无法通过当前 sing-box 检查，请确认地址、格式和版本兼容性"
+# 一个规则文件名在 mihomo 部署下的完整路径。
+# 只接受目录下的一层文件名：SAFE_PATHS 覆盖的是这个目录，
+# 而「只填文件名」也是界面上唯一需要使用者理解的东西。
+mihomo_rule_file_path() {
+  printf '%s/%s' "$MIHOMO_RULES_DIR" "$1"
+}
+
+validate_mihomo_rule_file_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] ||
+    die "规则文件名只能包含字母、数字、点、下划线和连字符，长度 1-64，且不能以点开头"
+}
+
+# 规则文件的写法与配置里声明的 behavior 是否对得上。
+#
+# 这条检查存在的唯一理由是 **mihomo 在这件事上是静默的**：把「完整规则行」
+# 按「域名列表」读，一条警告都没有，规则就是静静地不生效（公开 Issue #186 实测，
+# 反方向只有 warning，也不会让服务起不来）。内核不报，就只能管理器来报。
+#
+# 刻意只在**确定对不上**时才拒绝，不做风格审查：这条护栏一旦误报，
+# 使用者会学会绕过它，那比没有还糟。
+# 输出第一条对不上的内容；全部合规时无输出。
+mihomo_rule_file_mismatch() {
+  local file="$1" behavior="$2"
+  awk -v behavior="$behavior" '
+    function trim(text) {
+      sub(/^[[:space:]]+/, "", text); sub(/[[:space:]]+$/, "", text)
+      return text
+    }
+    /^[[:space:]]*payload[[:space:]]*:/ { seen_payload = 1; next }
+    {
+      line = $0
+      sub(/[[:space:]]*#.*$/, "", line)
+      line = trim(line)
+      if (line == "") next
+      if (line !~ /^-[[:space:]]*/) next
+      sub(/^-[[:space:]]*/, "", line)
+      item = trim(line)
+      gsub(/^["'"'"']|["'"'"']$/, "", item)
+      if (item == "") next
+      items++
+      looks_like_rule = (item ~ /^[A-Z][A-Z0-9_-]*,/)
+      if (behavior == "classical") {
+        if (!looks_like_rule) { print "第 " NR " 行不是完整规则行：" item; exit }
+      } else if (behavior == "domain") {
+        if (looks_like_rule) { print "第 " NR " 行看着是完整规则行而不是域名：" item; exit }
+      } else if (behavior == "ipcidr") {
+        if (looks_like_rule) { print "第 " NR " 行看着是完整规则行而不是 IP 段：" item; exit }
+        # 前缀长度可有可无：社区的 IP 清单里裸写一个地址是常见写法，
+        # 为此报错就成了误报，而误报的护栏会被人学会绕过去。
+        if (item !~ /^[0-9.]+(\/[0-9]+)?$/ && item !~ /^[0-9a-fA-F:]+(\/[0-9]+)?$/) {
+          print "第 " NR " 行不是 IP 段写法：" item; exit
+        }
+      }
+    }
+    END {
+      if (!seen_payload) { print "整个文件里没有 payload: 这一行"; exit }
+      if (items == 0) { print "payload: 下面一条规则都没有"; exit }
+    }
+  ' "$file"
+}
+
+# mihomo 部署下的规则集来源：使用者自己放在规则目录里的一个块状 yaml 文件。
+# 管理器只读它，永远不改它的内容（公开 Issue #157 的决定）。
+validate_mihomo_rule_set() {
+  local name="$1" behavior="$2" path mismatch
+  validate_mihomo_rule_file_name "$name"
+  case "$behavior" in
+    classical|domain|ipcidr) ;;
+    *) die "规则写法只能是 classical、domain 或 ipcidr：$behavior" ;;
+  esac
+  path="$(mihomo_rule_file_path "$name")"
+  # 「文件在不在」是 mihomo -t 唯一测不出的一项：文件不存在时配置检查照样通过，
+  # 服务也照样起得来，只在启动日志里留一行 error，规则则完全不生效
+  # （公开 Issue #186 实测，与证书路径同一个毛病的镜像版本）。
+  # 因此这里必须真的看一眼，不能等内核来说。
+  [[ ! -L "$path" ]] || die "规则文件不能是符号链接：$path"
+  [[ -f "$path" ]] || die "规则文件不存在：${path}；请先把规则文件放到 ${MIHOMO_RULES_DIR} 下"
+  [[ -r "$path" ]] || die "规则文件无法读取：$path"
+  mismatch="$(mihomo_rule_file_mismatch "$path" "$behavior")" || return 1
+  [[ -z "$mismatch" ]] ||
+    die "规则文件的内容与所选写法对不上：${mismatch}；选错写法时 mihomo 不会报错，规则会静静地不生效"
+}
+
+# 来源写法的校验。与「这个来源可不可用」分开：这一条只看写法，
+# 界面上输入即时反馈用得到，不需要下载或读文件。
+validate_split_rule_source_format() {
+  case "$PROXY_KERNEL" in
+    singbox)
+      [[ "$1" == https://* ]] || die "规则集地址必须使用 HTTPS"
+      split_rule_format "$1" >/dev/null || die "规则集地址必须指向 .srs 或 .json 文件"
+      ;;
+    mihomo) validate_mihomo_rule_file_name "$1" ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 规则集来源的校验。两个内核的来源完全不同，格式也不通用：
+# sing-box 是公网 HTTPS 上的 .srs / .json，由 sing-box 自己下载并检查；
+# mihomo 是本机上一个块状 yaml 文件，由管理器检查存在性与写法。
+validate_split_rule_source() {
+  local source="$1" behavior="${2:-}"
+  case "$PROXY_KERNEL" in
+    singbox)
+      validate_public_rule_set_url "$source" ||
+        die "远程规则集地址必须使用 HTTPS，且不能指向本机或内网地址"
+      check_rule_set_with_binary "$SINGBOX_BIN" "$source" ||
+        die "远程规则集无法通过当前 sing-box 检查，请确认地址、格式和版本兼容性"
+      ;;
+    mihomo) validate_mihomo_rule_set "$source" "$behavior" ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 规则集来源在状态里的取值。两个键在同一台机器上不会同时存在
+# （见适配层的 kernel_rule_source_key），因此读取写成一个表达式即可。
+split_rule_source_from_json() {
+  jq -r '(.url // .rule_file // "")' <<<"$1"
+}
+
+split_rule_behavior_from_json() {
+  jq -r '(.rule_behavior // "")' <<<"$1"
+}
+
+# 规则来源在界面上的写法。sing-box 是完整地址，mihomo 是文件名加写法说明。
+split_rule_source_display() {
+  local source="$1" behavior="$2"
+  case "$PROXY_KERNEL" in
+    singbox) printf '%s' "$source" ;;
+    mihomo) printf '%s（%s）' "$(mihomo_rule_file_path "$source")" "$(mihomo_rule_behavior_label "$behavior")" ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+mihomo_rule_behavior_label() {
+  case "$1" in
+    classical) printf '完整规则行' ;;
+    domain) printf '域名列表' ;;
+    ipcidr) printf 'IP 段列表' ;;
+    *) printf '未知写法' ;;
+  esac
 }
 
 split_exists() { jq -e --arg name "$1" '.splits[]? | select(.name == $name)' "$STATE_FILE" >/dev/null; }
@@ -191,34 +326,50 @@ remove_split_config() {
   stored_tag="$(stored_split_rule_tag "$name")" || return 1
   stored_out="$(stored_split_out_tag "$name")" || return 1
   stored_transport="$(split_transport_tag "$name")"
-  rewrite_singbox_config '
-    .route.rules = [(.route.rules // [])[] | select(((.rule_set // "") == $tag or (.rule_set // "") == $stored_tag) | not)] |
-    .route.rule_set = [(.route.rule_set // [])[] | select((.tag == $tag or .tag == $stored_tag) | not)] |
-    .outbounds = [(.outbounds // [])[] |
-      select((.tag == $out_tag or .tag == $transport_tag or .tag == $stored_out or .tag == $stored_transport) | not)]
-  ' --arg tag "$tag" --arg stored_tag "$stored_tag" --arg out_tag "$out_tag" --arg transport_tag "$transport_tag" \
-    --arg stored_out "$stored_out" --arg stored_transport "$stored_transport"
+  case "$PROXY_KERNEL" in
+    singbox)
+      rewrite_kernel_config '
+        .route.rules = [(.route.rules // [])[] | select(((.rule_set // "") == $tag or (.rule_set // "") == $stored_tag) | not)] |
+        .route.rule_set = [(.route.rule_set // [])[] | select((.tag == $tag or .tag == $stored_tag) | not)] |
+        .outbounds = [(.outbounds // [])[] |
+          select((.tag == $out_tag or .tag == $transport_tag or .tag == $stored_out or .tag == $stored_transport) | not)]
+      ' --arg tag "$tag" --arg stored_tag "$stored_tag" --arg out_tag "$out_tag" --arg transport_tag "$transport_tag" \
+        --arg stored_out "$stored_out" --arg stored_transport "$stored_transport"
+      ;;
+    mihomo)
+      # 托管的分流条目分布在三处：proxies 里的出口、rule-providers 里的规则集、
+      # 以及 sub-rules 里那一块规则。顶层 rules 里只有一条派发，
+      # 它与具体某条分流无关，因此这里不动——使用者自己写在 rules 里的东西同理。
+      #
+      # sub-rules 里按规则集标签认自己的行。行的形状只有两种，都由
+      # kernel_render_split_plan 生成：
+      #   RULE-SET,<规则集>,<出口>
+      #   AND,((RULE-SET,<规则集>),(IN-NAME,...)),<出口>
+      # 与 sing-box 那一支同样按标签删，因此「多条分流共用同一个预置规则时
+      # 一起被删掉」这个语义两个内核一致，随后的整体重建会把该留的补回来。
+      rewrite_kernel_config "$MIHOMO_SPLIT_RULE_OWNED_DEF"'
+        .proxies = [(.proxies // [])[] |
+          select((.name == $out_tag or .name == $transport_tag or .name == $stored_out or .name == $stored_transport) | not)] |
+        .["rule-providers"] = ((.["rule-providers"] // {}) |
+          with_entries(select(.key != $tag and .key != $stored_tag))) |
+        (if (.["sub-rules"] // {}) | has($sub_rule) then
+           .["sub-rules"][$sub_rule] = [(.["sub-rules"][$sub_rule] // [])[] |
+             select(sbm_line_owned_by(.; [$tag, $stored_tag]) | not)]
+         else . end)
+      ' --arg tag "$tag" --arg stored_tag "$stored_tag" --arg out_tag "$out_tag" --arg transport_tag "$transport_tag" \
+        --arg stored_out "$stored_out" --arg stored_transport "$stored_transport" \
+        --arg sub_rule "$MIHOMO_MANAGED_SUB_RULE"
+      ;;
+    *) kernel_unknown ;;
+  esac
 }
 
+# 上游出口的托管条目。形状与条目数量都随内核不同，因此实现在适配层，
+# 这里只补上「没有显式给传输标签时用默认名」这一条与内核无关的规则。
 build_split_outbounds() {
-  local name="$1" upstream="$2" out_tag="$3" transport_tag="${4:-}" protocol
-  protocol="$(jq -r '.protocol' <<<"$upstream")"
+  local name="$1" upstream="$2" out_tag="$3" transport_tag="${4:-}"
   [[ -n "$transport_tag" ]] || transport_tag="$(split_transport_tag "$name")"
-  case "$protocol" in
-    anytls)
-      SB_JQ_UPSTREAM="$upstream" jq -cn --arg tag "$out_tag" '($ENV.SB_JQ_UPSTREAM | fromjson) as $u | [{type:"anytls",tag:$tag,server:$u.server,server_port:$u.server_port,password:$u.password,domain_resolver:"local",tls:{enabled:true,server_name:$u.sni,insecure:$u.insecure}}]'
-      ;;
-    shadowsocks)
-      SB_JQ_UPSTREAM="$upstream" jq -cn --arg tag "$out_tag" '($ENV.SB_JQ_UPSTREAM | fromjson) as $u | [{type:"shadowsocks",tag:$tag,server:$u.server,server_port:$u.server_port,method:$u.method,password:$u.password,domain_resolver:"local"}]'
-      ;;
-    ss_shadowtls)
-      SB_JQ_UPSTREAM="$upstream" jq -cn --arg tag "$out_tag" --arg transport "$transport_tag" '($ENV.SB_JQ_UPSTREAM | fromjson) as $u | [
-        {type:"shadowsocks",tag:$tag,server:$u.server,server_port:$u.server_port,method:$u.method,password:$u.ss_password,detour:$transport},
-        {type:"shadowtls",tag:$transport,server:$u.server,server_port:$u.server_port,version:3,password:$u.shadowtls_password,domain_resolver:"local",tls:{enabled:true,server_name:$u.sni,insecure:$u.insecure}}
-      ]'
-      ;;
-    *) die "不支持的上游协议：$protocol";;
-  esac
+  kernel_split_outbounds "$name" "$upstream" "$out_tag" "$transport_tag"
 }
 
 validate_upstream_json() {
@@ -244,37 +395,26 @@ validate_upstream_json() {
 }
 
 validate_upstream_candidate() {
-  local upstream="$1" name out_tag outbounds candidate
+  local upstream="$1" name out_tag outbounds candidate container runtime_config
   validate_upstream_json "$upstream" || die "预置出口内容不完整或格式无效"
   name="preset-check-${BASHPID:-$$}"
   out_tag="${name}-out"
   outbounds="$(build_split_outbounds "$name" "$upstream" "$out_tag")" || return 1
   candidate="$(mktemp /tmp/sb-preset-outbound.XXXXXX.json)" || return 1
   register_temp_path "$candidate"
-  if ! SB_JQ_OUTBOUNDS="$outbounds" jq '($ENV.SB_JQ_OUTBOUNDS | fromjson) as $outbounds | .outbounds += $outbounds' "$SINGBOX_CONFIG" > "$candidate" ||
+  # 出口容器的键名随内核不同（sing-box 的 outbounds、mihomo 的 proxies），
+  # 校验用的也必须是当前内核自己的运行配置——拿 mihomo 去检查一份
+  # sing-box 配置，报出来的东西没有任何意义。
+  container="$(kernel_split_outbound_container)" || return 1
+  runtime_config="$(kernel_runtime_config_path)" || return 1
+  if ! SB_JQ_OUTBOUNDS="$outbounds" jq --arg container "$container" \
+        '($ENV.SB_JQ_OUTBOUNDS | fromjson) as $outbounds | .[$container] = ((.[$container] // []) + $outbounds)' \
+        "$runtime_config" > "$candidate" ||
      ! kernel_check_config "$candidate" >/dev/null 2>&1; then
     rm -f -- "$candidate"
-    die "预置出口无法通过当前 sing-box 检查，请确认协议和连接参数"
+    die "预置出口无法通过当前 $(kernel_display_name) 检查，请确认协议和连接参数"
   fi
   rm -f -- "$candidate"
-}
-
-apply_split_config() {
-  local name="$1" url="$2" scope="$3" user="$4" upstream="$5" out_tag="$6" tag="$7" transport_tag="${8:-}" format outbounds inbounds='[]'
-  outbounds="$(build_split_outbounds "$name" "$upstream" "$out_tag" "$transport_tag")"
-  format="$(split_rule_format "$url")" || die "远程规则集地址必须指向 .srs 或 .json 文件"
-  if [[ "$scope" == user ]]; then inbounds="$(split_user_inbound_tags "$user")" || return 1; fi
-  SB_JQ_NEW_OUTBOUNDS="$outbounds" rewrite_singbox_config '
-    ($ENV.SB_JQ_NEW_OUTBOUNDS | fromjson) as $new_outbounds |
-    .route.rules = [(.route.rules // [])[] | select((.rule_set // "") != $tag)] |
-    .route.rule_set = [(.route.rule_set // [])[] | select(.tag != $tag)] |
-    .outbounds += $new_outbounds |
-    .route.rule_set += [{type:"remote",tag:$tag,format:$format,url:$url,download_detour:"direct",update_interval:"24h"}] |
-    .route.rules += [
-      ({rule_set:$tag,action:"route",outbound:$out_tag} +
-       (if $scope == "user" then {inbound:$inbounds} else {} end))
-    ]
-  ' --arg tag "$tag" --arg out_tag "$out_tag" --arg url "$url" --arg format "$format" --arg scope "$scope" --argjson inbounds "$inbounds"
 }
 
 collect_managed_split_tags_with_shell_tools() {
@@ -413,8 +553,12 @@ collect_legacy_split_cleanup_plan_from_config() {
   ' <<<"$config_json"
 }
 
+# 旧版分流的清理只对 sing-box 有意义：托管分流在 mihomo 上从第二步 2d 才开始
+# 存在，不可能有「按旧写法留下的残留」。显式判断而不是依赖「查出来恰好是空的」
+# ——那种依赖读起来像是碰巧成立。
 legacy_split_cleanup_pending() {
   local config tags cleanup
+  [[ "$PROXY_KERNEL" == singbox ]] || return 1
   config="$(kernel_normalized_config)" || return 1
   tags="$(collect_managed_split_tags)" || return 1
   cleanup="$(collect_legacy_split_cleanup_plan_from_config "$config" "$tags")" || return 1
@@ -427,16 +571,36 @@ remove_all_managed_split_config() {
   rule_tags="$(jq -c '.rule_tags' <<<"$tags")" || return 1
   out_tags="$(jq -c '.out_tags' <<<"$tags")" || return 1
   transport_tags="$(jq -c '.transport_tags' <<<"$tags")" || return 1
-  rewrite_singbox_config '
-    .route.rules = [(.route.rules // [])[] | . as $item | select(($rule_tags | index($item.rule_set // "")) == null)] |
-    .route.rule_set = [(.route.rule_set // [])[] | . as $item | select(($rule_tags | index($item.tag)) == null)] |
-    .outbounds = [(.outbounds // [])[] | . as $item | select((($out_tags + $transport_tags) | index($item.tag)) == null)]
-  ' --argjson rule_tags "$rule_tags" --argjson out_tags "$out_tags" --argjson transport_tags "$transport_tags"
+  case "$PROXY_KERNEL" in
+    singbox)
+      rewrite_kernel_config '
+        .route.rules = [(.route.rules // [])[] | . as $item | select(($rule_tags | index($item.rule_set // "")) == null)] |
+        .route.rule_set = [(.route.rule_set // [])[] | . as $item | select(($rule_tags | index($item.tag)) == null)] |
+        .outbounds = [(.outbounds // [])[] | . as $item | select((($out_tags + $transport_tags) | index($item.tag)) == null)]
+      ' --argjson rule_tags "$rule_tags" --argjson out_tags "$out_tags" --argjson transport_tags "$transport_tags"
+      ;;
+    mihomo)
+      # 托管的四处一并清掉，包括顶层 rules 里那一条派发——这里是「把托管分流
+      # 全部撤走」，留着一条指向已不存在的 sub-rule 的派发会让配置加载不了。
+      rewrite_kernel_config '
+        .proxies = [(.proxies // [])[] | . as $item | select((($out_tags + $transport_tags) | index($item.name)) == null)] |
+        .["rule-providers"] = ((.["rule-providers"] // {}) |
+          with_entries(select(.key as $key | ($rule_tags | index($key)) == null))) |
+        .["sub-rules"] = ((.["sub-rules"] // {}) | del(.[$sub_rule])) |
+        .rules = [(.rules // [])[] | select((type == "string" and endswith("," + $sub_rule)) | not)]
+      ' --argjson rule_tags "$rule_tags" --argjson out_tags "$out_tags" --argjson transport_tags "$transport_tags" \
+        --arg sub_rule "$MIHOMO_MANAGED_SUB_RULE"
+      ;;
+    *) kernel_unknown ;;
+  esac
 }
 
+# 一个用户在当前内核下的全部托管入口名。用户专属分流按这些名字限定范围。
+# SS2022 + ShadowTLS 的条目数两个内核不同，因此前缀从适配层取。
 split_user_inbound_tags() {
-  local user="$1"
-  jq -c --arg name "$user" '
+  local user="$1" shadowtls_prefixes
+  shadowtls_prefixes="$(kernel_shadowtls_entry_prefixes)" || return 1
+  jq -c --arg name "$user" --argjson st_prefixes "$shadowtls_prefixes" '
     first(.users[]? | select(.name == $name)) as $user |
     if $user == null then []
     else (if ($user.endpoints | type) == "array" then $user.endpoints
@@ -444,21 +608,25 @@ split_user_inbound_tags() {
     ($endpoints | any(.protocol == "ss2022" and .transport == "shadowtls")) as $has_legacy |
     [ $endpoints[] |
       if .protocol == "anytls" then "anytls-" + $name
-      elif .transport == "shadowtls" then "st-" + $name, "ss-" + $name, "ss-udp-" + $name
+      elif .transport == "shadowtls" then ($st_prefixes[] + $name)
       elif $has_legacy then "ss-direct-" + $name
       else "ss-" + $name end
     ] | unique end
   ' "$STATE_FILE"
 }
 
+# 与内核无关的分流计划：哪条规则集配哪个出口、限定哪些入口、按什么顺序。
+# 出口条目与规则集条目本身已经是内核形状（由适配层生成），计划只负责摆放；
+# 最后一步的渲染同样在适配层——sing-box 的路由是对象数组，mihomo 是字符串数组。
 build_split_runtime_plan() {
-  local split_rows split plan name url scope user user_status upstream out_tag rule_tag transport_tag format outbounds rule_set inbounds conflict
+  local split_rows split plan name source behavior scope user user_status upstream out_tag rule_tag transport_tag outbounds rule_set inbounds conflict rule_file_path
   split_rows="$(jq -c '.splits[] | select(.status == "active")' "$STATE_FILE")" || return 1
   plan='{"outbound_groups":[],"rule_sets":[],"routes":[]}'
   while IFS= read -r split; do
     [[ -n "$split" ]] || continue
     name="$(jq -er '.name | select(type == "string" and length > 0)' <<<"$split")" || return 1
-    url="$(jq -er '.url | select(type == "string" and length > 0)' <<<"$split")" || return 1
+    source="$(jq -er '(.url // .rule_file) | select(type == "string" and length > 0)' <<<"$split")" || return 1
+    behavior="$(split_rule_behavior_from_json "$split")" || return 1
     scope="$(jq -er '.scope | select(. == "all" or . == "user")' <<<"$split")" || return 1
     user="$(jq -er '.user // ""' <<<"$split")" || return 1
     if [[ "$scope" == user ]]; then
@@ -473,10 +641,21 @@ build_split_runtime_plan() {
     out_tag="$(split_runtime_out_tag_from_json "$split")" || return 1
     rule_tag="$(split_runtime_rule_tag_from_json "$split")" || return 1
     transport_tag="$(split_runtime_transport_tag_from_json "$split")" || return 1
-    format="$(split_rule_format "$url")" || return 1
     outbounds="$(build_split_outbounds "$name" "$upstream" "$out_tag" "$transport_tag")" || return 1
-    rule_set="$(jq -cn --arg tag "$rule_tag" --arg format "$format" --arg url "$url" \
-      '{type:"remote",tag:$tag,format:$format,url:$url,download_detour:"direct",update_interval:"24h"}')" || return 1
+    # 规则文件是使用者自己的，添加之后随时可能被他删掉或改名。
+    # 这是 `mihomo -t` 唯一测不出的一项：文件不在时配置检查照样通过、服务也照样
+    # 起得来，只在启动日志里留一行 error，而那条分流从此静静地不生效
+    # ——本该走上游的流量会改走直连。因此每次重建都真的看一眼。
+    # 计划在任何配置改动之前完整生成，这里失败不会留下改了一半的运行配置。
+    if [[ "$PROXY_KERNEL" == mihomo ]]; then
+      rule_file_path="$(mihomo_rule_file_path "$source")"
+      if [[ ! -f "$rule_file_path" || -L "$rule_file_path" ]]; then
+        printf '错误：分流 %s 的规则文件不存在或不是普通文件：%s\n' "$name" "$rule_file_path" >&2
+        printf '请把该文件放回原处后重试；在此之前这条分流不会生效。\n' >&2
+        return 1
+      fi
+    fi
+    rule_set="$(kernel_split_rule_set_entry "$rule_tag" "$source" "$behavior")" || return 1
     if jq -e --arg tag "$out_tag" 'any(.outbound_groups[]; .tag == $tag)' <<<"$plan" >/dev/null; then
       if ! SB_JQ_OUTBOUNDS="$outbounds" jq -e --arg tag "$out_tag" \
         '($ENV.SB_JQ_OUTBOUNDS | fromjson) as $objects | any(.outbound_groups[]; .tag == $tag and .objects == $objects)' <<<"$plan" >/dev/null; then
@@ -488,7 +667,7 @@ build_split_runtime_plan() {
     fi
     if jq -e --arg tag "$rule_tag" 'any(.rule_sets[]; .tag == $tag)' <<<"$plan" >/dev/null; then
       jq -e --arg tag "$rule_tag" --argjson item "$rule_set" 'any(.rule_sets[]; .tag == $tag and . == $item)' <<<"$plan" >/dev/null || {
-        echo "错误：多个分流使用了同一个预置规则名称，但下载地址不同；请重新选择预置规则。" >&2
+        echo "错误：多个分流使用了同一条预置规则名称，但规则来源不同；请重新选择预置规则。" >&2
         return 1
       }
     else
@@ -521,11 +700,7 @@ build_split_runtime_plan() {
       ' <<<"$plan")" || return 1
     fi
   done <<<"$split_rows"
-  jq -c '{
-    outbounds:[.outbound_groups[].objects[]],
-    rule_sets:.rule_sets,
-    rules:[.routes[] | ({rule_set:.rule_set,action:"route",outbound:.outbound} + (if .scope_all then {} else {inbound:.inbound} end))]
-  }' <<<"$plan"
+  kernel_render_split_plan "$plan"
 }
 
 rebuild_all_split_configs() {
@@ -533,40 +708,80 @@ rebuild_all_split_configs() {
   # 先完整生成计划，任何读取、冲突或格式错误都不得提前改动现有配置。
   plan="$(build_split_runtime_plan)" || return 1
   tags="$(collect_managed_split_tags)" || return 1
-  config="$(kernel_normalized_config)" || return 1
-  legacy_cleanup="$(collect_legacy_split_cleanup_plan_from_config "$config" "$tags")" || return 1
-  SB_JQ_PLAN="$plan" rewrite_singbox_config '
-    ($ENV.SB_JQ_PLAN | fromjson) as $plan |
-    .route.rules = [
-      (.route.rules // [])[] | . as $item |
-      select(($tags.rule_tags | index($item.rule_set // "")) == null) |
-      select(($legacy.rule_tags | index($item.rule_set // "")) == null)
-    ] |
-    .route.rule_set = [
-      (.route.rule_set // [])[] | . as $item |
-      select(($tags.rule_tags | index($item.tag)) == null) |
-      select(($legacy.rule_tags | index($item.tag)) == null)
-    ] |
-    ([
-      (.route.rules[]?.outbound // empty),
-      (.route.final // empty),
-      ((.outbounds // [])[] |
-        . as $outbound |
-        select(($legacy.out_tags | index($outbound.tag // "")) == null) |
-        (.detour // empty))
-    ] | unique) as $protected_outbounds |
-    .outbounds = [
-      (.outbounds // [])[] | . as $item |
-      select((($tags.out_tags + $tags.transport_tags) | index($item.tag)) == null) |
-      select(
-        ($legacy.out_tags | index($item.tag)) == null or
-        ($protected_outbounds | index($item.tag)) != null
-      )
-    ] |
-    .outbounds += $plan.outbounds |
-    .route.rule_set += $plan.rule_sets |
-    .route.rules += $plan.rules
-  ' --argjson tags "$tags" --argjson legacy "$legacy_cleanup"
+  case "$PROXY_KERNEL" in
+    singbox)
+      config="$(kernel_normalized_config)" || return 1
+      legacy_cleanup="$(collect_legacy_split_cleanup_plan_from_config "$config" "$tags")" || return 1
+      SB_JQ_PLAN="$plan" rewrite_kernel_config '
+        ($ENV.SB_JQ_PLAN | fromjson) as $plan |
+        .route.rules = [
+          (.route.rules // [])[] | . as $item |
+          select(($tags.rule_tags | index($item.rule_set // "")) == null) |
+          select(($legacy.rule_tags | index($item.rule_set // "")) == null)
+        ] |
+        .route.rule_set = [
+          (.route.rule_set // [])[] | . as $item |
+          select(($tags.rule_tags | index($item.tag)) == null) |
+          select(($legacy.rule_tags | index($item.tag)) == null)
+        ] |
+        ([
+          (.route.rules[]?.outbound // empty),
+          (.route.final // empty),
+          ((.outbounds // [])[] |
+            . as $outbound |
+            select(($legacy.out_tags | index($outbound.tag // "")) == null) |
+            (.detour // empty))
+        ] | unique) as $protected_outbounds |
+        .outbounds = [
+          (.outbounds // [])[] | . as $item |
+          select((($tags.out_tags + $tags.transport_tags) | index($item.tag)) == null) |
+          select(
+            ($legacy.out_tags | index($item.tag)) == null or
+            ($protected_outbounds | index($item.tag)) != null
+          )
+        ] |
+        .outbounds += $plan.outbounds |
+        .route.rule_set += $plan.rule_sets |
+        .route.rules += $plan.rules
+      ' --argjson tags "$tags" --argjson legacy "$legacy_cleanup"
+      ;;
+    mihomo)
+      # 归属划分（公开 Issue #186）：proxies 与 rule-providers 按名字认领，
+      # 外来的原样保留；sub-rules 里那一块整块归管理器；顶层 rules 里
+      # 管理器只留一条派发，其余全是使用者的，原样保留。
+      #
+      # 派发放在最前面：使用者若在 rules 里写了 MATCH，放在后面会把整块托管
+      # 分流盖掉。派发落空时流量继续走后面（使用者自己的）规则，这一点有实测。
+      # 没有任何启用中的分流时不写派发，也不写空的 sub-rule——一条指向不存在
+      # sub-rule 的派发会让 mihomo 直接拒绝加载配置。
+      #
+      # 认自己那条派发的办法是「以托管 sub-rule 名结尾」，而不是与常量整条相等：
+      # 派发条件将来若改写法，按整条相等会认不出旧的那条，于是每次重建多留一条。
+      # 代价是使用者若把自己的出口取名叫 managed-splits，指向它的规则会被一并
+      # 拿掉——那个名字是管理器保留的，不该被拿去当出口名。
+      #
+      # mihomo 部署没有旧版分流的历史包袱：托管分流在 mihomo 上从本片才开始存在。
+      SB_JQ_PLAN="$plan" rewrite_kernel_config '
+        ($ENV.SB_JQ_PLAN | fromjson) as $plan |
+        .proxies = [(.proxies // [])[] | . as $item |
+          select((($tags.out_tags + $tags.transport_tags) | index($item.name)) == null)] |
+        .proxies += $plan.proxies |
+        .["rule-providers"] = ((.["rule-providers"] // {}) |
+          with_entries(select(.key as $key | ($tags.rule_tags | index($key)) == null)) +
+          $plan.rule_providers) |
+        .["sub-rules"] = ((.["sub-rules"] // {}) | del(.[$sub_rule])) |
+        .rules = [(.rules // [])[] | select((type == "string" and endswith("," + $sub_rule)) | not)] |
+        (if ($plan.sub_rules | length) > 0 then
+           .["sub-rules"][$sub_rule] = $plan.sub_rules |
+           .rules = [$dispatch] + .rules
+         else . end) |
+        (if (.["sub-rules"] | length) == 0 then del(.["sub-rules"]) else . end) |
+        (if (.["rule-providers"] | length) == 0 then del(.["rule-providers"]) else . end)
+      ' --argjson tags "$tags" --arg sub_rule "$MIHOMO_MANAGED_SUB_RULE" \
+        --arg dispatch "$MIHOMO_SPLIT_DISPATCH_RULE"
+      ;;
+    *) kernel_unknown ;;
+  esac
 }
 
 rebuild_and_finish_split_operation() {
@@ -744,18 +959,26 @@ migrate_shared_preset_runtime_configs() {
   release_operation_lock
 }
 
+# 规则来源的键名随内核不同（sing-box 的 url、mihomo 的 rule_file），
+# 因此写入时取键名而不是写死；behavior 只有 mihomo 用得上，为空时不写这个键，
+# 这样 sing-box 机器的状态文件与历史版本一字不差。
 state_add_split() {
+  local source_key
+  source_key="$(kernel_rule_source_key)" || return 1
   SB_JQ_UPSTREAM="$5" atomic_state_update '(
     $ENV.SB_JQ_UPSTREAM | fromjson
   ) as $upstream |
-    .splits += [{name:$name,url:$url,scope:$scope,user:(if $scope == "user" then $user else null end),upstream:$upstream,outbound_tag:$out_tag,rule_set_tag:$rule_tag,
+    .splits += [{name:$name,scope:$scope,user:(if $scope == "user" then $user else null end),upstream:$upstream,outbound_tag:$out_tag,rule_set_tag:$rule_tag,
       runtime_rule_tag:$runtime_rule_tag,runtime_outbound_tag:$runtime_outbound_tag,runtime_transport_tag:$runtime_transport_tag,
       rule_preset:$rule_preset,outbound_preset:$outbound_preset,status:"active",created_at:$created_at}
+      | .[$source_key] = $source
+      | (if $behavior == "" then . else .rule_behavior = $behavior end)
       | (if $rule_preset == "" then del(.rule_preset) else . end)
       | (if $outbound_preset == "" then del(.outbound_preset) else . end)]
-  ' --arg name "$1" --arg url "$2" --arg scope "$3" --arg user "$4" \
+  ' --arg name "$1" --arg source "$2" --arg scope "$3" --arg user "$4" \
     --arg out_tag "$6" --arg rule_tag "$7" --arg rule_preset "$8" --arg outbound_preset "$9" \
     --arg runtime_rule_tag "${10}" --arg runtime_outbound_tag "${11}" --arg runtime_transport_tag "${12}" \
+    --arg behavior "${13:-}" --arg source_key "$source_key" \
     --arg created_at "$(date -Iseconds)"
 }
 
@@ -765,18 +988,23 @@ state_set_split_status() {
 }
 
 state_replace_split() {
+  local source_key
+  source_key="$(kernel_rule_source_key)" || return 1
   SB_JQ_UPSTREAM="$5" atomic_state_update '(
     $ENV.SB_JQ_UPSTREAM | fromjson
   ) as $upstream |
     (.splits[] | select(.name == $name)) |=
-      (. + {url:$url,scope:$scope,user:(if $scope == "user" then $user else null end),upstream:$upstream,outbound_tag:$out_tag,
+      (. + {scope:$scope,user:(if $scope == "user" then $user else null end),upstream:$upstream,outbound_tag:$out_tag,
         runtime_rule_tag:$runtime_rule_tag,runtime_outbound_tag:$runtime_outbound_tag,runtime_transport_tag:$runtime_transport_tag,
         updated_at:$updated_at}
+       | .[$source_key] = $source
+       | (if $behavior == "" then . else .rule_behavior = $behavior end)
        | (if $rule_preset == "" then del(.rule_preset) else .rule_preset = $rule_preset end)
        | (if $outbound_preset == "" then del(.outbound_preset) else .outbound_preset = $outbound_preset end))
-  ' --arg name "$1" --arg url "$2" --arg scope "$3" --arg user "$4" \
+  ' --arg name "$1" --arg source "$2" --arg scope "$3" --arg user "$4" \
     --arg out_tag "$6" --arg rule_preset "$7" --arg outbound_preset "$8" \
     --arg runtime_rule_tag "$9" --arg runtime_outbound_tag "${10}" --arg runtime_transport_tag "${11}" \
+    --arg behavior "${12:-}" --arg source_key "$source_key" \
     --arg updated_at "$(date -Iseconds)"
 }
 
@@ -883,21 +1111,30 @@ state_remove_outbound_preset() {
 }
 
 state_add_rule_preset() {
+  local source_key
+  source_key="$(kernel_rule_source_key)" || return 1
   atomic_state_update '
-    .rule_presets += [{name:$name,url:$url,created_at:$created_at}]
-  ' --arg name "$1" --arg url "$2" --arg created_at "$(date -Iseconds)"
+    .rule_presets += [{name:$name,created_at:$created_at}
+      | .[$source_key] = $source
+      | (if $behavior == "" then . else .rule_behavior = $behavior end)]
+  ' --arg name "$1" --arg source "$2" --arg behavior "${3:-}" \
+    --arg source_key "$source_key" --arg created_at "$(date -Iseconds)"
 }
 
 state_replace_rule_preset() {
+  local source_key
+  source_key="$(kernel_rule_source_key)" || return 1
   atomic_state_update '
-    (.rule_presets[] | select(.name == $name)) |=
-      (. + {url:$url,updated_at:$updated_at}) |
+    def apply_source: .[$source_key] = $source |
+      (if $behavior == "" then . else .rule_behavior = $behavior end);
+    (.rule_presets[] | select(.name == $name)) |= ((. + {updated_at:$updated_at}) | apply_source) |
     .splits |= map(
       if (.rule_preset // "") == $name then
-        . + {url:$url,updated_at:$updated_at}
+        ((. + {updated_at:$updated_at}) | apply_source)
       else . end
     )
-  ' --arg name "$1" --arg url "$2" --arg updated_at "$(date -Iseconds)"
+  ' --arg name "$1" --arg source "$2" --arg behavior "${3:-}" \
+    --arg source_key "$source_key" --arg updated_at "$(date -Iseconds)"
 }
 
 state_remove_rule_preset() {
@@ -912,6 +1149,8 @@ state_remove_rule_preset() {
 }
 
 state_sync_linked_split_snapshots() {
+  local source_key
+  source_key="$(kernel_rule_source_key)" || return 1
   atomic_state_update '
     .outbound_presets as $outbounds |
     .rule_presets as $rules |
@@ -927,10 +1166,13 @@ state_sync_linked_split_snapshots() {
          if $outbound == null then del(.outbound_preset) else .upstream = $outbound.upstream end
        else . end) |
       (if (($split.rule_preset // "") != "") then
-         if $rule == null then del(.rule_preset) else .url = $rule.url end
+         if $rule == null then del(.rule_preset)
+         else .[$source_key] = ($rule.url // $rule.rule_file) |
+              (if ($rule.rule_behavior // "") == "" then . else .rule_behavior = $rule.rule_behavior end)
+         end
        else . end)
     )
-  '
+  ' --arg source_key "$source_key"
 }
 
 cmd_outbound_preset_add() {
@@ -968,29 +1210,27 @@ cmd_outbound_preset_remove() {
 }
 
 cmd_rule_preset_add() {
-  local name="$1" url="$2"
+  local name="$1" source="$2" behavior="${3:-}"
   validate_preset_name "$name"
   rule_preset_exists "$name" && die "同名预置规则已经存在"
-  [[ "$url" == https://* ]] || die "规则集地址必须使用 HTTPS"
-  split_rule_format "$url" >/dev/null || die "规则集地址必须指向 .srs 或 .json 文件"
-  validate_remote_rule_set "$url"
-  state_add_rule_preset "$name" "$url" || return 1
+  validate_split_rule_source_format "$source"
+  validate_split_rule_source "$source" "$behavior"
+  state_add_rule_preset "$name" "$source" "$behavior" || return 1
   log "预置规则已保存：${name}；它不会改变当前分流"
 }
 
 cmd_rule_preset_edit() {
-  local name="$1" url="$2" active
+  local name="$1" source="$2" behavior="${3:-}" active
   rule_preset_exists "$name" || die "预置规则不存在：$name"
-  [[ "$url" == https://* ]] || die "规则集地址必须使用 HTTPS"
-  split_rule_format "$url" >/dev/null || die "规则集地址必须指向 .srs 或 .json 文件"
-  validate_remote_rule_set "$url"
+  validate_split_rule_source_format "$source"
+  validate_split_rule_source "$source" "$behavior"
   active="$(jq --arg name "$name" '[.splits[] | select((.rule_preset // "") == $name and .status == "active")] | length' "$STATE_FILE")" || return 1
   if ((active == 0)); then
-    state_replace_rule_preset "$name" "$url" || return 1
+    state_replace_rule_preset "$name" "$source" "$behavior" || return 1
   else
     ensure_safe_ssh_for_kernel_restart || return 0
     start_managed_operation "edit-rule-preset:$name" || return 1
-    run_managed_step state_replace_rule_preset "$name" "$url" || return 1
+    run_managed_step state_replace_rule_preset "$name" "$source" "$behavior" || return 1
     rebuild_and_finish_split_operation || return 1
   fi
   log "预置规则已更新：${name}；关联分流已经同步"
@@ -1002,6 +1242,32 @@ cmd_rule_preset_remove() {
   runtime_rule_tag="$(stable_managed_tag rule "$name")" || return 1
   state_remove_rule_preset "$name" "$runtime_rule_tag" || return 1
   log "预置规则已删除：${name}；关联分流已转为独立配置，现有规则地址没有变化"
+}
+
+# 运行配置里是否已经存在同名的规则集 / 出口。
+# 两个内核的容器与标识字段都不同：sing-box 是 route.rule_set[] 的 tag 与
+# outbounds[] 的 tag，mihomo 是 rule-providers{} 的键与 proxies[] 的 name。
+# 这两条检查的目的两个内核一致——不要覆盖掉不是管理器放进去的东西。
+runtime_config_has_rule_set() {
+  local tag="$1" config
+  config="$(kernel_runtime_config_path)" || return 1
+  case "$PROXY_KERNEL" in
+    singbox) jq -e --arg tag "$tag" '.route.rule_set[]? | select(.tag == $tag)' "$config" >/dev/null ;;
+    mihomo) jq -e --arg tag "$tag" '(.["rule-providers"] // {}) | has($tag)' "$config" >/dev/null ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+runtime_config_has_outbound() {
+  local config container key tags
+  config="$(kernel_runtime_config_path)" || return 1
+  container="$(kernel_split_outbound_container)" || return 1
+  key="$(kernel_managed_key)" || return 1
+  tags="$(printf '%s\n' "$@" | jq -Rsc 'split("\n") | map(select(length > 0))')" || return 1
+  # 先把元素绑成 $item 再进 index：jq 里函数参数是按 index 自己的输入求值的，
+  # 直接写 index(.[$key]) 会拿 $tags 当输入，报「Cannot index array with string」。
+  jq -e --arg container "$container" --arg key "$key" --argjson tags "$tags" \
+    '(.[$container] // [])[] | . as $item | select(($tags | index($item[$key])) != null)' "$config" >/dev/null
 }
 
 validate_split_relationships() {
@@ -1052,8 +1318,9 @@ runtime_outbound_tag_owned_by_state() {
 }
 
 cmd_split_add() {
-  local name="$1" url="$2" scope="$3" user="$4" upstream="$5" out_tag="$6" rule_preset="${7:-}" outbound_preset="${8:-}" rule_tag="$1"
-  local runtime_rule_tag runtime_outbound_tag runtime_transport_tag
+  local name="$1" source="$2" scope="$3" user="$4" upstream="$5" out_tag="$6" rule_preset="${7:-}" outbound_preset="${8:-}" behavior="${9:-}" rule_tag="$1"
+  local runtime_rule_tag runtime_outbound_tag runtime_transport_tag kernel_name
+  kernel_name="$(kernel_display_name)" || return 1
   validate_split_name "$name"; split_exists "$name" && die "分流规则已存在：$name"
   rule_preset_exists "$rule_preset" || die "预置规则不存在：$rule_preset"
   outbound_preset_exists "$outbound_preset" || die "预置出口不存在：$outbound_preset"
@@ -1061,27 +1328,27 @@ cmd_split_add() {
   runtime_rule_tag="$(stable_managed_tag rule "$rule_preset")" || return 1
   runtime_outbound_tag="$(stable_managed_tag outbound "$outbound_preset")" || return 1
   runtime_transport_tag="$(stable_managed_tag transport "$outbound_preset")" || return 1
-  [[ "$url" == https://* ]] || die "远程规则集地址必须使用 HTTPS"
+  validate_split_rule_source_format "$source"
   if [[ "$scope" == user ]]; then validate_name "$user"; user_exists "$user" || die "用户不存在：$user"; fi
-  jq -e --arg tag "$rule_tag" '.route.rule_set[]? | select(.tag == $tag)' "$SINGBOX_CONFIG" >/dev/null && die "sing-box 已存在同名规则集标签"
+  runtime_config_has_rule_set "$rule_tag" && die "${kernel_name} 已存在同名规则集标签"
   jq -e --arg out "$out_tag" '.splits[]? | select((.outbound_tag // ("managed-out-" + .name)) == $out)' "$STATE_FILE" >/dev/null && die "出口名称已被其他分流使用，请换一个名称"
   [[ "$out_tag" != "$(split_transport_tag "$name")" ]] || die "出口名称与系统内部名称冲突，请换一个名称"
   jq -e --arg out "$out_tag" '.splits[]? | select(("managed-transport-" + .name) == $out)' "$STATE_FILE" >/dev/null && die "出口名称与其他分流的内部名称冲突，请换一个名称"
-  jq -e --arg out "$out_tag" --arg transport "$(split_transport_tag "$name")" '.outbounds[]? | select(.tag == $out or .tag == $transport)' "$SINGBOX_CONFIG" >/dev/null && die "sing-box 已存在同名分流出站标签"
-  if jq -e --arg tag "$runtime_rule_tag" '.route.rule_set[]? | select(.tag == $tag)' "$SINGBOX_CONFIG" >/dev/null &&
+  runtime_config_has_outbound "$out_tag" "$(split_transport_tag "$name")" && die "${kernel_name} 已存在同名分流出站标签"
+  if runtime_config_has_rule_set "$runtime_rule_tag" &&
      ! runtime_rule_tag_owned_by_state "$runtime_rule_tag"; then
-    die "这个预置规则与现有 sing-box 配置重名，请更换预置名称"
+    die "这个预置规则与现有 ${kernel_name} 配置重名，请更换预置名称"
   fi
-  if jq -e --arg tag "$runtime_outbound_tag" '.outbounds[]? | select(.tag == $tag)' "$SINGBOX_CONFIG" >/dev/null &&
+  if runtime_config_has_outbound "$runtime_outbound_tag" &&
      ! runtime_outbound_tag_owned_by_state "$runtime_outbound_tag"; then
-    die "这个预置出口与现有 sing-box 配置重名，请更换预置名称"
+    die "这个预置出口与现有 ${kernel_name} 配置重名，请更换预置名称"
   fi
   validate_split_relationships "$name" "$runtime_rule_tag" "$runtime_outbound_tag" "$scope" "$user" false || return 1
-  validate_remote_rule_set "$url"
+  validate_split_rule_source "$source" "$behavior"
   ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "add-split:$name" || return 1
-  run_managed_step state_add_split "$name" "$url" "$scope" "$user" "$upstream" "$out_tag" "$rule_tag" "$rule_preset" "$outbound_preset" \
-    "$runtime_rule_tag" "$runtime_outbound_tag" "$runtime_transport_tag" || return 1
+  run_managed_step state_add_split "$name" "$source" "$scope" "$user" "$upstream" "$out_tag" "$rule_tag" "$rule_preset" "$outbound_preset" \
+    "$runtime_rule_tag" "$runtime_outbound_tag" "$runtime_transport_tag" "$behavior" || return 1
   rebuild_and_finish_split_operation || return 1
   log "分流增加成功：$name"
 }
@@ -1110,8 +1377,8 @@ cmd_split_enable() {
   runtime_outbound_tag="$(split_runtime_out_tag_from_json "$split")" || return 1
   validate_split_relationships "$name" "$runtime_rule_tag" "$runtime_outbound_tag" "$(jq -r '.scope' <<<"$split")" "$(jq -r '.user // ""' <<<"$split")" true || return 1
   validate_outbound_tag "$out_tag"
-  jq -e --arg out "$out_tag" --arg transport "$(split_transport_tag "$name")" '.outbounds[]? | select(.tag == $out or .tag == $transport)' "$SINGBOX_CONFIG" >/dev/null && die "sing-box 已存在同名分流出站标签"
-  jq -e --arg tag "$rule_tag" '.route.rule_set[]? | select(.tag == $tag)' "$SINGBOX_CONFIG" >/dev/null && die "sing-box 已存在同名规则集标签"
+  runtime_config_has_outbound "$out_tag" "$(split_transport_tag "$name")" && die "$(kernel_display_name) 已存在同名分流出站标签"
+  runtime_config_has_rule_set "$rule_tag" && die "$(kernel_display_name) 已存在同名规则集标签"
   ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "enable-split:$name" || return 1
   run_managed_step state_set_split_status "$name" active || return 1
@@ -1131,7 +1398,7 @@ cmd_split_remove() {
 }
 
 cmd_split_edit() {
-  local name="$1" url="$2" scope="$3" user="$4" upstream="$5" out_tag="$6" rule_preset="${7:-}" outbound_preset="${8:-}" split old_out
+  local name="$1" source="$2" scope="$3" user="$4" upstream="$5" out_tag="$6" rule_preset="${7:-}" outbound_preset="${8:-}" behavior="${9:-}" split old_out
   local runtime_rule_tag runtime_outbound_tag runtime_transport_tag
   split_exists "$name" || die "分流不存在：$name"
   [[ -z "$rule_preset" ]] || rule_preset_exists "$rule_preset" || die "预置规则不存在：$rule_preset"
@@ -1149,22 +1416,21 @@ cmd_split_edit() {
     runtime_transport_tag="$(split_runtime_transport_tag_from_json "$split")" || return 1
   fi
   validate_outbound_tag "$out_tag"
-  [[ "$url" == https://* ]] || die "远程规则集地址必须使用 HTTPS"
-  split_rule_format "$url" >/dev/null || die "远程规则集地址必须指向 .srs 或 .json 文件"
+  validate_split_rule_source_format "$source"
   if [[ "$scope" == user ]]; then validate_name "$user"; user_exists "$user" || die "用户不存在：$user"; fi
   jq -e --arg name "$name" --arg out "$out_tag" '.splits[]? | select(.name != $name and (.outbound_tag // ("managed-out-" + .name)) == $out)' "$STATE_FILE" >/dev/null && die "出口名称已被其他分流使用，请换一个名称"
   [[ "$out_tag" != "$(split_transport_tag "$name")" ]] || die "出口名称与系统内部名称冲突，请换一个名称"
   jq -e --arg name "$name" --arg out "$out_tag" '.splits[]? | select(.name != $name and ("managed-transport-" + .name) == $out)' "$STATE_FILE" >/dev/null && die "出口名称与其他分流的内部名称冲突，请换一个名称"
   if [[ "$out_tag" != "$old_out" ]]; then
-    jq -e --arg out "$out_tag" '.outbounds[]? | select(.tag == $out)' "$SINGBOX_CONFIG" >/dev/null && die "sing-box 已存在同名出站"
+    runtime_config_has_outbound "$out_tag" && die "$(kernel_display_name) 已存在同名出站"
   fi
   validate_split_relationships "$name" "$runtime_rule_tag" "$runtime_outbound_tag" "$scope" "$user" false || return 1
-  validate_remote_rule_set "$url"
+  validate_split_rule_source "$source" "$behavior"
   ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "edit-split:$name" || return 1
   run_managed_step remove_split_config "$name" || return 1
-  run_managed_step state_replace_split "$name" "$url" "$scope" "$user" "$upstream" "$out_tag" "$rule_preset" "$outbound_preset" \
-    "$runtime_rule_tag" "$runtime_outbound_tag" "$runtime_transport_tag" || return 1
+  run_managed_step state_replace_split "$name" "$source" "$scope" "$user" "$upstream" "$out_tag" "$rule_preset" "$outbound_preset" \
+    "$runtime_rule_tag" "$runtime_outbound_tag" "$runtime_transport_tag" "$behavior" || return 1
   rebuild_and_finish_split_operation || return 1
   log "分流修改成功：$name"
 }
@@ -1230,7 +1496,10 @@ cmd_split_show() {
     "状态：\(if $s.status == "active" then "启用" else "停用" end)",
     "作用范围：\(if $s.scope == "all" then "全部用户" else "用户:" + $s.user end)",
     "规则来源：\($s.rule_preset // "独立配置")",
-    "规则集地址：\($s.url)",
+    (if $kernel == "mihomo" then
+       "规则文件：\($rules_dir)/\($s.rule_file // "?")",
+       "规则写法：\(if $s.rule_behavior == "classical" then "完整规则行" elif $s.rule_behavior == "domain" then "域名列表" elif $s.rule_behavior == "ipcidr" then "IP 段列表" else "未知写法" end)"
+     else "规则集地址：\($s.url)" end),
     "出口来源：\($s.outbound_preset // "独立配置")",
     "出口协议：\(if $s.upstream.protocol == "anytls" then "AnyTLS" elif $s.upstream.protocol == "shadowsocks" then "Shadowsocks" elif $s.upstream.protocol == "ss_shadowtls" then "SS2022 + ShadowTLS" else "旧版未配置" end)",
     "出口服务器：\($s.upstream.server // "-"):\($s.upstream.server_port // "-")",
@@ -1239,5 +1508,5 @@ cmd_split_show() {
     (if ($s.upstream | has("insecure")) then "证书验证：\(if $s.upstream.insecure then "跳过" else "验证" end)" else empty end),
     "创建时间：\($s.created_at // "-")",
     (if ($s.updated_at // "") != "" then "修改时间：\($s.updated_at)" else empty end)
-  ' "$STATE_FILE"
+  ' --arg kernel "$PROXY_KERNEL" --arg rules_dir "$MIHOMO_RULES_DIR" "$STATE_FILE"
 }

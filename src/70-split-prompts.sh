@@ -156,13 +156,23 @@ print_outbound_preset_list() {
 
 print_rule_preset_list() {
   local rows
-  if ! rows="$(jq -r '
+  # 「来源」两个内核不同：sing-box 是远程地址的格式（SRS / JSON），
+  # mihomo 是本机文件名加它的写法。列名跟着变，不做成一个都说不清的通用词。
+  if ! rows="$(jq -r --arg kernel "$PROXY_KERNEL" '
     . as $state |
+    def source_label($p):
+      if $kernel == "mihomo" then
+        ($p.rule_file // "?") + "｜" +
+        (if $p.rule_behavior == "classical" then "完整规则行"
+         elif $p.rule_behavior == "domain" then "域名列表"
+         elif $p.rule_behavior == "ipcidr" then "IP 段列表"
+         else "未知写法" end)
+      else (if ($p.url | test("\\.srs([?#].*)?$")) then "SRS" else "JSON" end) end;
     if (.rule_presets | length) == 0 then "暂无预置规则"
-    else (["名称","格式","关联分流","其中启用"] | @tsv),
+    else (["名称","来源","关联分流","其中启用"] | @tsv),
       ($state.rule_presets | sort_by(.name)[] as $p |
         [ $p.name,
-          (if ($p.url | test("\\.srs([?#].*)?$")) then "SRS" else "JSON" end),
+          source_label($p),
           ([$state.splits[] | select((.rule_preset // "") == $p.name)] | length),
           ([$state.splits[] | select((.rule_preset // "") == $p.name and .status == "active")] | length)
         ] | @tsv)
@@ -196,11 +206,25 @@ prompt_select_rule_preset() {
   count="$(jq 'length' <<<"$rows")"
   ((count > 0)) || { echo '尚未添加预置规则，请先到“预置规则管理”中添加。'; return 1; }
   printf '\n%s\n\n' "$title"
-  jq -r '(["编号","名称","格式"] | @tsv), (to_entries[] | [(.key+1),.value.name,(if (.value.url|test("\\.srs([?#].*)?$")) then "SRS" else "JSON" end)] | @tsv)' <<<"$rows" | column -t -s $'\t'
+  jq -r --arg kernel "$PROXY_KERNEL" '
+    def source_label($p):
+      if $kernel == "mihomo" then
+        ($p.rule_file // "?") + "｜" +
+        (if $p.rule_behavior == "classical" then "完整规则行"
+         elif $p.rule_behavior == "domain" then "域名列表"
+         elif $p.rule_behavior == "ipcidr" then "IP 段列表"
+         else "未知写法" end)
+      else (if ($p.url | test("\\.srs([?#].*)?$")) then "SRS" else "JSON" end) end;
+    (["编号","名称","来源"] | @tsv),
+    (to_entries[] | [(.key+1),.value.name,source_label(.value)] | @tsv)' <<<"$rows" | column -t -s $'\t'
   echo '0. 返回上一级'
   read_numbered_index '请选择预置规则：' "$count" || return 1
   SELECTED_RULE_PRESET="$(jq -r ".[${SELECTED_INDEX}].name" <<<"$rows")"
-  SELECTED_RULE_URL="$(jq -r ".[${SELECTED_INDEX}].url" <<<"$rows")"
+  # 用 --argjson 传下标而不是把它拼进过滤器：这里要写的是 (.url // "")，
+  # 而在双引号里写 \" 会让 tests/check-shell-call-targets.py 的分词器当场放弃，
+  # 文件剩下的部分从此不再受检（公开 Issue #102）。
+  SELECTED_RULE_SOURCE="$(jq -r --argjson idx "$SELECTED_INDEX" '.[$idx] | (.url // .rule_file // "")' <<<"$rows")"
+  SELECTED_RULE_BEHAVIOR="$(jq -r --argjson idx "$SELECTED_INDEX" '.[$idx] | (.rule_behavior // "")' <<<"$rows")"
 }
 
 prompt_preset_name() {
@@ -285,43 +309,107 @@ prompt_remove_outbound_preset() {
   cmd_outbound_preset_remove "$name"
 }
 
+# mihomo 部署下的规则来源：使用者自己放在规则目录里的一个块状 yaml 文件。
+# 让人从目录里挑，而不是让人敲路径——路径敲错的后果是配置根本加载不了，
+# 而这个目录的位置是 mihomo 唯一允许读规则文件的地方。
+prompt_mihomo_rule_file() {
+  local files count
+  printf '\n规则文件请放在这个目录里：%s\n' "$MIHOMO_RULES_DIR"
+  files="$(find "$MIHOMO_RULES_DIR" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | LC_ALL=C sort)" || files=''
+  if [[ -z "$files" ]]; then
+    echo '这个目录里还没有任何文件。'
+    echo '请先把你的规则文件（从社区抄来的 yaml 片段）放进去，再回到这里添加。'
+    return 1
+  fi
+  files="$(jq -Rsc 'split("\n") | map(select(length > 0))' <<<"$files")" || return 1
+  count="$(jq 'length' <<<"$files")" || return 1
+  echo
+  jq -r 'to_entries[] | "  \(.key + 1). \(.value)"' <<<"$files"
+  echo '  0. 返回上一级'
+  read_numbered_index '请选择规则文件：' "$count" || return 1
+  SELECTED_RULE_FILE="$(jq -r ".[${SELECTED_INDEX}]" <<<"$files")"
+}
+
+# 文件里写的是哪一种内容。这一项必须问：mihomo 在写法与声明不符时是**静默**的，
+# 把完整规则行按域名列表读，一条警告都没有，规则就是静静地不生效
+# （公开 Issue #186 实测）。选完之后管理器会读一遍文件核对。
+prompt_mihomo_rule_behavior() {
+  local choice
+  echo
+  echo '这个文件里写的是什么？'
+  echo '  1. 完整规则行（从网上抄来的规则片段，例如 DOMAIN-SUFFIX,openai.com）'
+  echo '  2. 只有域名（例如 +.openai.com）'
+  echo '  3. 只有 IP 段（例如 192.168.1.0/24）'
+  echo '  0. 返回上一级'
+  read_menu_choice '请选择：' '0,1,2,3' '' '请输入 1、2、3 或 0' || return 1
+  choice="$PROMPT_VALUE"
+  case "$choice" in
+    1) SELECTED_RULE_BEHAVIOR=classical ;;
+    2) SELECTED_RULE_BEHAVIOR=domain ;;
+    3) SELECTED_RULE_BEHAVIOR=ipcidr ;;
+    0) return 1 ;;
+  esac
+}
+
+# 规则来源的输入。sing-box 要一个公网 HTTPS 地址，mihomo 要本机的一个文件
+# 加上它的写法——两个内核的规则集格式不通用，界面上也就没有共同的问法。
+# 第一个参数是当前取值：修改时留空表示保持不变，新增时不传。
+prompt_split_rule_source() {
+  local current="${1:-}" source answer
+  SELECTED_RULE_SOURCE=''
+  SELECTED_RULE_BEHAVIOR=''
+  case "$PROXY_KERNEL" in
+    singbox)
+      while true; do
+        # 读失败即输入结束（管道读到头或使用者按了 Ctrl-D），与「输入 0」同样当作取消。
+        # 不这样写的话，输入一结束这个循环就会永远打印同一条错误提示。
+        if [[ -n "$current" ]]; then
+          read -r -p "规则集下载地址（当前 ${current}；留空保持；输入 0 返回）：" answer || return 1
+          source="${answer:-$current}"
+        else
+          read -r -p '规则集下载地址（HTTPS，.srs 或 .json；输入 0 返回）：' source || return 1
+        fi
+        [[ "$source" != 0 ]] || return 1
+        [[ "$source" == https://* ]] || { echo '输入无效：必须使用 HTTPS，请重新输入。'; continue; }
+        split_rule_format "$source" >/dev/null || { echo '输入无效：地址必须指向 .srs 或 .json 文件，请重新输入。'; continue; }
+        break
+      done
+      SELECTED_RULE_SOURCE="$source"
+      ;;
+    mihomo)
+      prompt_mihomo_rule_file || return 1
+      prompt_mihomo_rule_behavior || return 1
+      SELECTED_RULE_SOURCE="$SELECTED_RULE_FILE"
+      ;;
+    *) kernel_unknown; return 1 ;;
+  esac
+}
+
 prompt_add_rule_preset() {
-  local url answer
+  local answer
   prepare_core
   prompt_preset_name '预置规则名称' rule || { MENU_RETURNED=true; return 0; }
-  while true; do
-    read -r -p '规则集下载地址（HTTPS，.srs 或 .json；输入 0 返回）：' url
-    [[ "$url" != 0 ]] || { MENU_RETURNED=true; return 0; }
-    [[ "$url" == https://* ]] || { echo '输入无效：必须使用 HTTPS，请重新输入。'; continue; }
-    split_rule_format "$url" >/dev/null || { echo '输入无效：地址必须指向 .srs 或 .json 文件，请重新输入。'; continue; }
-    break
-  done
-  echo '说明：保存预置不会修改 sing-box，也不会影响现有分流。'
+  prompt_split_rule_source || { MENU_RETURNED=true; return 0; }
+  printf '说明：保存预置不会修改 %s，也不会影响现有分流。\n' "$(kernel_display_name)"
   read -r -p '确认检查并保存？[y/N]：' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消保存。'; return 0; }
-  cmd_rule_preset_add "$PRESET_NAME" "$url"
+  cmd_rule_preset_add "$PRESET_NAME" "$SELECTED_RULE_SOURCE" "$SELECTED_RULE_BEHAVIOR"
 }
 
 prompt_edit_rule_preset() {
-  local name url total active answer
+  local name source behavior total active answer
   prepare_core
   prompt_select_rule_preset '修改预置规则' || { MENU_RETURNED=true; return 0; }
-  name="$SELECTED_RULE_PRESET"; url="$SELECTED_RULE_URL"
+  name="$SELECTED_RULE_PRESET"; source="$SELECTED_RULE_SOURCE"; behavior="$SELECTED_RULE_BEHAVIOR"
   total="$(jq --arg name "$name" '[.splits[] | select((.rule_preset // "") == $name)] | length' "$STATE_FILE")"
   active="$(jq --arg name "$name" '[.splits[] | select((.rule_preset // "") == $name and .status == "active")] | length' "$STATE_FILE")"
   printf '\n关联分流：%s 条，其中启用 %s 条。\n' "$total" "$active"
-  while true; do
-    read -r -p "规则集下载地址（当前 ${url}；留空保持；输入 0 返回）：" answer
-    [[ "$answer" != 0 ]] || { MENU_RETURNED=true; return 0; }
-    url="${answer:-$url}"
-    [[ "$url" == https://* ]] || { echo '输入无效：必须使用 HTTPS，请重新输入。'; continue; }
-    split_rule_format "$url" >/dev/null || { echo '输入无效：地址必须指向 .srs 或 .json 文件，请重新输入。'; continue; }
-    break
-  done
-  if ((active > 0)); then echo '保存后会同步更新所有关联分流，并只重启一次 sing-box。'; else echo '保存后会同步更新关联记录；当前没有启用中的关联分流，不会重启服务。'; fi
+  printf '当前来源：%s\n' "$(split_rule_source_display "$source" "$behavior")"
+  prompt_split_rule_source "$source" || { MENU_RETURNED=true; return 0; }
+  if ((active > 0)); then printf '保存后会同步更新所有关联分流，并只重启一次 %s。\n' "$(kernel_display_name)"; else echo '保存后会同步更新关联记录；当前没有启用中的关联分流，不会重启服务。'; fi
   read -r -p '确认检查并保存？[y/N]：' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消修改。'; return 0; }
-  cmd_rule_preset_edit "$name" "$url"
+  cmd_rule_preset_edit "$name" "$SELECTED_RULE_SOURCE" "$SELECTED_RULE_BEHAVIOR"
 }
 
 prompt_remove_rule_preset() {
@@ -339,7 +427,7 @@ prompt_remove_rule_preset() {
 }
 
 prompt_add_split() {
-  local name url rule_preset scope_choice scope user="" outbound_preset outbound_tag upstream answer
+  local name source behavior rule_preset scope_choice scope user="" outbound_preset outbound_tag upstream answer
   prepare_core
   if ! jq -e '(.rule_presets | length) > 0' "$STATE_FILE" >/dev/null; then echo '尚未添加预置规则，请先到“预置规则管理”中添加。'; return 0; fi
   if ! jq -e '(.outbound_presets | length) > 0' "$STATE_FILE" >/dev/null; then echo '尚未添加预置出口，请先到“预置出口管理”中添加。'; return 0; fi
@@ -349,11 +437,11 @@ prompt_add_split() {
     [[ "$name" != 0 ]] || { MENU_RETURNED=true; return 0; }
     if ! validate_without_exit validate_split_name "$name"; then printf '输入无效：%s，请重新输入。\n' "$VALIDATION_ERROR"; continue; fi
     split_exists "$name" && { echo '分流名称已存在，请重新输入。'; continue; }
-    jq -e --arg tag "$name" '.route.rule_set[]? | select(.tag == $tag)' "$SINGBOX_CONFIG" >/dev/null && { echo '这个名称已被其他规则使用，请换一个名称。'; continue; }
+    runtime_config_has_rule_set "$name" && { echo '这个名称已被其他规则使用，请换一个名称。'; continue; }
     break
   done
   prompt_select_rule_preset '选择要使用的预置规则' || { MENU_RETURNED=true; return 0; }
-  rule_preset="$SELECTED_RULE_PRESET"; url="$SELECTED_RULE_URL"
+  rule_preset="$SELECTED_RULE_PRESET"; source="$SELECTED_RULE_SOURCE"; behavior="$SELECTED_RULE_BEHAVIOR"
   while true; do
     cat <<'EOF'
 作用范围：
@@ -372,7 +460,7 @@ EOF
   printf '\n分流预览：\n  名称：%s\n  预置规则：%s\n  范围：%s\n  预置出口：%s\n' "$name" "$rule_preset" "$(if [[ "$scope" == all ]]; then echo 全部用户; else echo "用户:$user"; fi)" "$outbound_preset"
   read -r -p '确认检查并添加？[y/N]：' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消添加。'; return 0; }
-  if ! cmd_split_add "$name" "$url" "$scope" "$user" "$upstream" "$outbound_tag" "$rule_preset" "$outbound_preset"; then
+  if ! cmd_split_add "$name" "$source" "$scope" "$user" "$upstream" "$outbound_tag" "$rule_preset" "$outbound_preset" "$behavior"; then
     echo '分流没有添加，现有配置没有改变。'
     return 0
   fi
@@ -544,6 +632,23 @@ render_split_diagnostic_results() {
 prompt_split_diagnostic() {
   local split split_name scope user expected_outbound expected_outbound_display answer cursor_line cursor log_file log_level status kernel_service
   prepare_core
+  # 这一项按 sing-box 的连接日志写成：它把入站标签与出站标签配成一对，
+  # 因此能回答「这个用户的这条分流有没有走对出口」。
+  # mihomo 的连接日志给出目的地址与所选出口，但**不带入站名**
+  # （实测行形如 `[TCP] 源 --> 目的 match SubRules(...) using 出口`），
+  # 按用户归因这一半拿不到，整套呈现要重做。
+  # 单独立项：公开 Issue #187，不在第二步 2d 内。
+  case "$PROXY_KERNEL" in
+    singbox) ;;
+    mihomo)
+      echo
+      printf '「验证分流是否生效」暂不支持 %s 部署：它依赖连接日志里的入口标签，而 %s 的日志不记这一项。\n' \
+        "$(kernel_display_name)" "$(kernel_display_name)"
+      echo '分流的增加、修改、停用、启用与删除都不受影响。'
+      return 0
+      ;;
+    *) kernel_unknown; return 0 ;;
+  esac
   need_cmd journalctl
   if legacy_split_cleanup_pending; then
     echo '检测到旧版分流仍在当前规则之前生效，暂时无法准确验证。'
@@ -630,13 +735,14 @@ prompt_split_details() {
 }
 
 prompt_edit_split() {
-  local name split url scope user upstream out_tag choice answer current_scope current_out rule_preset outbound_preset current_source
+  local name split source behavior scope user upstream out_tag choice answer current_scope current_out rule_preset outbound_preset current_source
   prepare_core
   prompt_select_split all "编辑分流" || return 0
   name="$SELECTED_SPLIT_NAME"
   split="$(jq -c --arg name "$name" '.splits[] | select(.name == $name)' "$STATE_FILE")"
   jq -e '.upstream.protocol' <<<"$split" >/dev/null || die "这条旧版分流缺少出口服务器信息，请删除后重新添加"
-  url="$(jq -r '.url' <<<"$split")"
+  source="$(split_rule_source_from_json "$split")"
+  behavior="$(split_rule_behavior_from_json "$split")"
   rule_preset="$(jq -r '.rule_preset // ""' <<<"$split")"
   current_source="${rule_preset:-独立配置}"
   cat <<EOF
@@ -649,7 +755,7 @@ EOF
   choice="$PROMPT_VALUE"
   case "$choice" in
     1) :;;
-    2) prompt_select_rule_preset '选择新的预置规则' || { MENU_RETURNED=true; return 0; }; rule_preset="$SELECTED_RULE_PRESET"; url="$SELECTED_RULE_URL";;
+    2) prompt_select_rule_preset '选择新的预置规则' || { MENU_RETURNED=true; return 0; }; rule_preset="$SELECTED_RULE_PRESET"; source="$SELECTED_RULE_SOURCE"; behavior="$SELECTED_RULE_BEHAVIOR";;
     0) MENU_RETURNED=true; return 0;;
   esac
   current_scope="$(jq -r '.scope' <<<"$split")"
@@ -693,7 +799,7 @@ EOF
   printf '  出口来源：%s\n' "${outbound_preset:-独立配置}"
   read -r -p '确认检查并保存？[y/N]：' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo "已取消修改。"; return 0; }
-  if ! cmd_split_edit "$name" "$url" "$scope" "$user" "$upstream" "$out_tag" "$rule_preset" "$outbound_preset"; then
+  if ! cmd_split_edit "$name" "$source" "$scope" "$user" "$upstream" "$out_tag" "$rule_preset" "$outbound_preset" "$behavior"; then
     echo '分流修改没有保存，原有配置继续使用。'
     return 0
   fi
@@ -782,7 +888,6 @@ rule_preset_management_menu() {
 
 split_management_menu() {
   ensure_management_environment_ready || return 0
-  ensure_split_supported_by_kernel || return 0
   while true; do
     prepare_menu_screen
     ui_menu_begin
