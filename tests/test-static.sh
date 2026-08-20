@@ -76,6 +76,28 @@ for kernel_adapter_bypass in '"$SINGBOX_BIN" format -c "$SINGBOX_CONFIG"' '"$SIN
 done
 rm -f -- "$kernel_adapter_fixture/90-bypass.sh"
 
+# GitHub 的 API 查询与资产下载必须经 github_api_get / github_download_to，
+# 不得在调用点各写一份 curl。散落时一旦要调整重试或超时策略就得逐处跟进，
+# Issue #140 正是因此漏掉了 TLS 瞬时失败的重试。
+github_call_violations() {
+  grep -REn --include='*.sh' "application/vnd\\.github\\+json|--max-time 300" "$1" \
+    | grep -v 'github_api_get\|github_download_to' || true
+}
+github_helper_hits="$(grep -REn --include='*.sh' 'application/vnd\.github\+json' src | wc -l | tr -d ' ')"
+if [[ "$github_helper_hits" != 1 ]]; then
+  echo 'GitHub API 请求头只应出现在 github_api_get 中' >&2
+  grep -REn --include='*.sh' 'application/vnd\.github\+json' src >&2
+  exit 1
+fi
+if ! grep -Fq -- '--retry-all-errors' <<<"$(sed -n '/^github_api_get() {/,/^}$/p' src/50-install-update.sh)"; then
+  echo 'github_api_get must retry transient TLS failures' >&2
+  exit 1
+fi
+if ! grep -Fq -- '--retry-all-errors' <<<"$(sed -n '/^github_download_to() {/,/^}$/p' src/50-install-update.sh)"; then
+  echo 'github_download_to must retry transient TLS failures' >&2
+  exit 1
+fi
+
 sed '/^download_binaries() {/,/^}$/ {
   /LATEST_SINGBOX_URL/ s/ || return 1//
 }' sb-user-manager.sh > "$managed_step_fixture"
