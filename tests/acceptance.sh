@@ -25,6 +25,9 @@ SNAPSHOT=""
 SS_USER=""
 ANYTLS_USER=""
 SPLIT_NAME=""
+SPLIT_RULE_SOURCE=""
+SPLIT_RULE_SOURCE_UPDATED=""
+SPLIT_RULE_BEHAVIOR=""
 MERGE_TARGET_USER=""
 BASELINE_USERS=""
 BASELINE_SPLITS=""
@@ -334,39 +337,79 @@ cleanup_live_objects() {
       run_mutation "清理测试用户 $name" cmd_remove "$name"
     fi
   done
+  # 验收工具自己造的临时规则文件也要收走，否则机器上会越积越多。
+  cleanup_split_rule_sources
+}
+
+# 分流规则的来源在两个内核上完全不同：sing-box 要一个公网 HTTPS 的 .srs/.json，
+# mihomo 要本机规则目录里的一个块状 yaml 文件。因此这里按内核各准备一份，
+# 后面的生命周期步骤只用 SPLIT_RULE_SOURCE / SPLIT_RULE_BEHAVIOR 两个取值。
+#
+# mihomo 那一支由验收工具自己造两个临时规则文件（第二个用于「修改预置规则」
+# 那一步），跑完在 cleanup_split_rule_sources 里删掉。管理器本身永远不写那个
+# 目录——写它的是验收工具，与它创建临时用户、临时分流是同一类行为。
+prepare_split_rule_sources() {
+  case "$PROXY_KERNEL" in
+    singbox)
+      if [[ -z "$RULESET_URL" ]]; then
+        skip '分流生命周期' '未设置 SB_ACCEPTANCE_RULESET_URL'
+        return 1
+      fi
+      [[ "$RULESET_URL" == https://* && "$RULESET_URL" =~ \.(srs|json)([?#].*)?$ ]] || {
+        fail '分流生命周期' '规则集必须是 HTTPS .srs/.json 地址'
+        return 2
+      }
+      SPLIT_RULE_SOURCE="$RULESET_URL"
+      SPLIT_RULE_BEHAVIOR=""
+      if [[ "$RULESET_URL" == *\?* ]]; then SPLIT_RULE_SOURCE_UPDATED="${RULESET_URL}&sbm_acceptance=1"
+      else SPLIT_RULE_SOURCE_UPDATED="${RULESET_URL}?sbm_acceptance=1"; fi
+      ;;
+    mihomo)
+      [[ -d "$MIHOMO_RULES_DIR" ]] || {
+        fail '分流生命周期' "规则目录不存在：$MIHOMO_RULES_DIR"
+        return 2
+      }
+      SPLIT_RULE_SOURCE="${SPLIT_NAME}-a.yaml"
+      SPLIT_RULE_SOURCE_UPDATED="${SPLIT_NAME}-b.yaml"
+      SPLIT_RULE_BEHAVIOR=classical
+      printf 'payload:\n  - DOMAIN-SUFFIX,acceptance-a.invalid\n' > "$MIHOMO_RULES_DIR/$SPLIT_RULE_SOURCE" || return 2
+      printf 'payload:\n  - DOMAIN-SUFFIX,acceptance-b.invalid\n' > "$MIHOMO_RULES_DIR/$SPLIT_RULE_SOURCE_UPDATED" || return 2
+      chmod 644 "$MIHOMO_RULES_DIR/$SPLIT_RULE_SOURCE" "$MIHOMO_RULES_DIR/$SPLIT_RULE_SOURCE_UPDATED" || return 2
+      ;;
+    *) fail '分流生命周期' '代理内核无法识别'; return 2 ;;
+  esac
+}
+
+cleanup_split_rule_sources() {
+  [[ "$PROXY_KERNEL" == mihomo ]] || return 0
+  [[ -n "${SPLIT_RULE_SOURCE:-}" ]] || return 0
+  rm -f -- "$MIHOMO_RULES_DIR/$SPLIT_RULE_SOURCE" "$MIHOMO_RULES_DIR/$SPLIT_RULE_SOURCE_UPDATED"
 }
 
 run_split_lifecycle() {
-  local upstream updated_upstream updated_url password config_before config_after
-  if [[ -z "$RULESET_URL" ]]; then
-    skip '分流生命周期' '未设置 SB_ACCEPTANCE_RULESET_URL'
-    return 0
-  fi
-  [[ "$RULESET_URL" == https://* && "$RULESET_URL" =~ \.(srs|json)([?#].*)?$ ]] || {
-    fail '分流生命周期' '规则集必须是 HTTPS .srs/.json 地址'
-    return 1
-  }
+  local upstream updated_upstream password config_before config_after runtime_config rc=0
+  prepare_split_rule_sources || { rc=$?; [[ "$rc" == 1 ]] && return 0; return 1; }
+  runtime_config="$(kernel_runtime_config_path)" || return 1
   password="$(generate_ss_password 2022-blake3-aes-128-gcm)"
   upstream="$(jq -cn --arg password "$password" '{protocol:"shadowsocks",server:"127.0.0.1",server_port:9,method:"2022-blake3-aes-128-gcm",password:$password}')"
   state_add_outbound_preset "${SPLIT_NAME}-exit" "$upstream"
-  state_add_rule_preset "${SPLIT_NAME}-rule" "$RULESET_URL"
-  run_mutation '增加用户专属分流' cmd_split_add "$SPLIT_NAME" "$RULESET_URL" user "$ANYTLS_USER" "$upstream" "${SPLIT_NAME}-out" "${SPLIT_NAME}-rule" "${SPLIT_NAME}-exit"
+  state_add_rule_preset "${SPLIT_NAME}-rule" "$SPLIT_RULE_SOURCE" "$SPLIT_RULE_BEHAVIOR"
+  run_mutation '增加用户专属分流' cmd_split_add "$SPLIT_NAME" "$SPLIT_RULE_SOURCE" user "$ANYTLS_USER" "$upstream" "${SPLIT_NAME}-out" "${SPLIT_NAME}-rule" "${SPLIT_NAME}-exit" "$SPLIT_RULE_BEHAVIOR"
   verify_state_value '分流状态为启用' ".splits[] | select(.name == \"$SPLIT_NAME\") | .status" active || return 1
   updated_upstream="$(jq -cn --arg password "$password" '{protocol:"shadowsocks",server:"127.0.0.1",server_port:10,method:"2022-blake3-aes-128-gcm",password:$password}')"
   run_mutation '修改关联预置出口并同步分流' cmd_outbound_preset_edit "${SPLIT_NAME}-exit" "$updated_upstream"
   if jq -e --arg name "$SPLIT_NAME" --arg preset "${SPLIT_NAME}-exit" --argjson upstream "$updated_upstream" '
       .splits[] | select(.name == $name and .outbound_preset == $preset and .upstream == $upstream)
     ' "$STATE_FILE" >/dev/null; then pass '预置出口修改已同步关联分流'; else fail '预置出口修改已同步关联分流'; return 1; fi
-  if [[ "$RULESET_URL" == *\?* ]]; then updated_url="${RULESET_URL}&sbm_acceptance=1"; else updated_url="${RULESET_URL}?sbm_acceptance=1"; fi
-  run_mutation '修改关联预置规则并同步分流' cmd_rule_preset_edit "${SPLIT_NAME}-rule" "$updated_url"
-  if jq -e --arg name "$SPLIT_NAME" --arg preset "${SPLIT_NAME}-rule" --arg url "$updated_url" '
-      .splits[] | select(.name == $name and .rule_preset == $preset and .url == $url)
+  run_mutation '修改关联预置规则并同步分流' cmd_rule_preset_edit "${SPLIT_NAME}-rule" "$SPLIT_RULE_SOURCE_UPDATED" "$SPLIT_RULE_BEHAVIOR"
+  if jq -e --arg name "$SPLIT_NAME" --arg preset "${SPLIT_NAME}-rule" --arg source "$SPLIT_RULE_SOURCE_UPDATED" '
+      .splits[] | select(.name == $name and .rule_preset == $preset and (.url // .rule_file) == $source)
     ' "$STATE_FILE" >/dev/null; then pass '预置规则修改已同步关联分流'; else fail '预置规则修改已同步关联分流'; return 1; fi
   if [[ "$MODE" != full ]]; then
-    config_before="$(sha256sum "$SINGBOX_CONFIG" | awk '{print $1}')"
+    config_before="$(sha256sum "$runtime_config" | awk '{print $1}')"
     run_mutation '删除预置出口并保留分流快照' cmd_outbound_preset_remove "${SPLIT_NAME}-exit"
     run_mutation '删除预置规则并保留分流快照' cmd_rule_preset_remove "${SPLIT_NAME}-rule"
-    config_after="$(sha256sum "$SINGBOX_CONFIG" | awk '{print $1}')"
+    config_after="$(sha256sum "$runtime_config" | awk '{print $1}')"
     if [[ "$config_before" == "$config_after" ]] && jq -e --arg name "$SPLIT_NAME" '
         .splits[] | select(.name == $name and (has("outbound_preset")|not) and (has("rule_preset")|not) and .upstream.server_port == 10)
       ' "$STATE_FILE" >/dev/null; then pass '删除预置只解除关联且不改运行配置'; else fail '删除预置只解除关联且不改运行配置'; return 1; fi
@@ -472,10 +515,15 @@ run_lifecycle() {
      jq -e --arg name "$SS_USER" --argjson port "$ss_port" '
        .users[] | select(.name == $name and .port == $port and .transport == "direct" and .method == "2022-blake3-aes-256-gcm" and (has("shadowtls_sni") | not))
      ' "$STATE_FILE" >/dev/null &&
-     jq -e --arg tag "ss-$SS_USER" '
-       any(.inbounds[]; .tag == $tag and .type == "shadowsocks" and (has("network") | not)) and
-       all(.inbounds[]; .tag != ("st-" + ($tag | ltrimstr("ss-"))) and .tag != ("ss-udp-" + ($tag | ltrimstr("ss-"))))
-     ' "$SINGBOX_CONFIG" >/dev/null; then
+     kernel_normalized_config | jq -e --arg tag "ss-$SS_USER" --arg name "$SS_USER" \
+       --arg container "$(kernel_managed_container)" --arg key "$(kernel_managed_key)" '
+       # 托管条目的容器与标识随内核不同；「原生 SS2022 不带 UDP 那一半」在
+       # sing-box 上表现为入站没有 network 字段，在 mihomo 上表现为监听器上
+       # 没有 shadow-tls 子结构——一个监听器本来就同时承载 TCP 与 UDP。
+       any(.[$container][]; .[$key] == $tag and .type == "shadowsocks" and
+         (has("network") | not) and (has("shadow-tls") | not)) and
+       all(.[$container][]; .[$key] != ("st-" + $name) and .[$key] != ("ss-udp-" + $name))
+     ' >/dev/null; then
     pass 'SS2022 编辑同步状态、入站并更换密钥'
   else
     fail 'SS2022 编辑同步状态、入站并更换密钥'
@@ -550,7 +598,7 @@ run_lifecycle() {
   if [[ "$usage" == 0 ]]; then pass '续期启用后已用流量清零'; else fail '续期启用后已用流量清零' "实际 $usage"; return 1; fi
 
   expected_reduced_expiry="$(calculate_renewal_expiry "$renewed_epoch" -1)"
-  config_before_reduction="$(sha256sum "$SINGBOX_CONFIG" | awk '{print $1}')"
+  config_before_reduction="$(sha256sum "$(kernel_runtime_config_path)" | awk '{print $1}')"
   if nfuse set-usage "$ANYTLS_USER" 12345 >/dev/null && nfuse persist >/dev/null; then
     pass '写入提前到期前的流量基线'
   else
@@ -568,11 +616,11 @@ run_lifecycle() {
   fi
   usage="$(nfuse list --json | jq -r --arg name "$ANYTLS_USER" '.[] | select(.name == $name) | .used_bytes')"
   if [[ "$usage" == 12345 ]]; then pass '提前到期不清零已用流量'; else fail '提前到期不清零已用流量' "实际 $usage"; return 1; fi
-  config_after_reduction="$(sha256sum "$SINGBOX_CONFIG" | awk '{print $1}')"
+  config_after_reduction="$(sha256sum "$(kernel_runtime_config_path)" | awk '{print $1}')"
   if [[ "$config_after_reduction" == "$config_before_reduction" ]]; then
-    pass '提前到期不改写 sing-box 配置'
+    pass "提前到期不改写 $(kernel_display_name) 配置"
   else
-    fail '提前到期不改写 sing-box 配置'
+    fail "提前到期不改写 $(kernel_display_name) 配置"
     return 1
   fi
 

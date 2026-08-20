@@ -904,19 +904,147 @@ kernel_shadowtls_entry_prefixes() {
 # 分流名至少一个字符，managed-split-<名字> 永远带那个连字符。
 MIHOMO_MANAGED_SUB_RULE="managed-splits"
 
-# 判断托管 sub-rule 里的一行是不是某条规则集生成的。
-# 行的形状只有两种，都由 kernel_render_split_plan 生成：
+# 一个用户端点的托管条目除了「在不在」之外还要对哪些字段。
+#
+# 「在不在」两个内核完全一样，由审计里共用的那段程序负责；这里只写形状特有的
+# 那一部分，两个内核各一份，与用户入口的生成放在同一个模块里——生成改了形状，
+# 审计的断言就得跟着改，隔着模块放迟早只改一处。
+#
+# 两段都只用到审计程序里先定义好的 issue()，以及 $config 和 $strict_mode 这两个变量。
+SINGBOX_USER_ENTRY_SHAPE_DEF='
+  def sbm_entry_shape_issues($name; $protocol; $transport; $port; $status; $has_legacy; $expected):
+    (if $protocol == "ss2022" and $transport == "shadowtls" and $status == "active" and
+        any($config.inbounds[]?; .tag == ("ss-udp-" + $name)) and
+        (any($config.inbounds[]?;
+          .tag == ("ss-udp-" + $name) and .type == "shadowsocks" and .network == "udp" and .listen_port == $port) | not)
+     then issue(true; "[可自动修复] 用户 \($name) 的 UDP 连接配置不正确") else empty end),
+    (if $protocol == "ss2022" and $transport == "direct" and $status == "active" and
+        (any($config.inbounds[]?;
+          .tag == $expected and .type == "shadowsocks" and .listen_port == $port and ((.network // "") == "")) | not)
+     then issue(true; "[可自动修复] 用户 \($name) 的原生 SS2022 连接配置不正确") else empty end),
+    (if $protocol == "ss2022" and $transport == "direct" and ($has_legacy | not) and
+        any($config.inbounds[]?; .tag == ("st-" + $name) or .tag == ("ss-udp-" + $name))
+     then issue(true; "[可自动修复] 用户 \($name) 的原生 SS2022 仍有旧版 ShadowTLS 连接残留") else empty end);'
+
+# mihomo 侧的对应物。差别来自 2c 定下的形状：
+# 一个监听器同时承载 TCP 与 UDP（因此没有单独的 UDP 条目，改看 udp 字段），
+# ShadowTLS 是挂在 shadowsocks 监听器上的子结构而不是独立入站。
+#
+# strict-mode 这一条 sing-box 侧今天没有对应检查（它的 strict_mode 同样没查）。
+# mihomo 侧加它的理由是这个键**恰恰是 mihomo 会静默丢弃的那一类**——键名写错
+# 不报错、严格模式悄悄关掉（公开 Issue #154 的更正评论）。运行配置里它是不是
+# 管理配置里那个值，是审计能便宜地回答的问题。
+MIHOMO_USER_ENTRY_SHAPE_DEF='
+  def sbm_entry_shape_issues($name; $protocol; $transport; $port; $status; $has_legacy; $expected):
+    (first($config.listeners[]? | select(.name == ("st-" + $name))) // null) as $shadowtls |
+    (if $protocol == "ss2022" and $transport == "shadowtls" and $status == "active" and
+        ($shadowtls != null) and
+        (($shadowtls | .type == "shadowsocks" and .port == $port and .udp == true and
+          ((.["shadow-tls"].enable // false) == true) and
+          ((.["shadow-tls"].version // 0) == 3)) | not)
+     then issue(true; "[可自动修复] 用户 \($name) 的 SS2022 + ShadowTLS 连接配置不正确") else empty end),
+    (if $protocol == "ss2022" and $transport == "shadowtls" and $status == "active" and
+        ($shadowtls != null) and
+        (($shadowtls | .["shadow-tls"]["strict-mode"]) != $strict_mode)
+     then issue(true; "[可自动修复] 用户 \($name) 的 ShadowTLS 严格模式与管理配置不一致") else empty end),
+    (if $protocol == "ss2022" and $transport == "direct" and $status == "active" and
+        (any($config.listeners[]?;
+          .name == $expected and .type == "shadowsocks" and .port == $port and .udp == true and
+          (has("shadow-tls") | not)) | not)
+     then issue(true; "[可自动修复] 用户 \($name) 的原生 SS2022 连接配置不正确") else empty end),
+    (if $protocol == "ss2022" and $transport == "direct" and ($has_legacy | not) and
+        ($shadowtls != null)
+     then issue(true; "[可自动修复] 用户 \($name) 的原生 SS2022 仍有旧版 ShadowTLS 连接残留") else empty end);'
+
+kernel_user_entry_shape_def() {
+  case "$PROXY_KERNEL" in
+    singbox) printf '%s' "$SINGBOX_USER_ENTRY_SHAPE_DEF" ;;
+    mihomo) printf '%s' "$MIHOMO_USER_ENTRY_SHAPE_DEF" ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 拿运行配置与「我们写进去的样子」做比对之前，要先做的规范化。
+#
+# sing-box 的 Listable 字段只有一个元素时，会被 `format` 规范化成裸标量：
+#   写入的 "inbound":["anytls-share"]  →  读回的 "inbound":"anytls-share"
+# 直接拿它和期望的标签数组做集合运算，jq 会因类型不符而报错
+# （array and string cannot be subtracted）。而这些比对的调用点写成
+# `if ! jq ...` 或 `jq ... || return 1`，jq 崩溃会被当成「配置不符」，
+# 于是既误报「分流尚未覆盖用户的全部连接」，又会触发一次不必要的配置重建与
+# sing-box 重启。字符串上的 `.inbound[]?` 还会安静地什么都不返回，让
+# 「已停用用户的规则仍在生效」这类检查静默失效（v4.25.11 修的正是这个）。
+#
+# **mihomo 侧不存在这件事**：这一支的规范化本身就是 `jq .`，写进去什么形状
+# 读回来就是什么形状，这条管线里没有会改写形状的环节。因此它只做类型校验。
+# 照搬 sing-box 那一段过去没有意义——mihomo 的配置里根本没有 route.rules。
+#
+# 整段放在单引号常量里，调用处只做一次普通变量展开：内联拼接会产生转义双引号，
+# 而 tests/check-shell-call-targets.py 的分词器遇到那种写法会静默停止检查
+# 文件剩余部分（见公开 Issue #102）。
+SINGBOX_CONFIG_NORMALISE_PROGRAM='
+  if type != "object" then error("运行配置不是 JSON 对象") else . end
+  | if (.route.rules? | type) == "array" then
+      .route.rules |= map(
+        if has("inbound") and ((.inbound | type) != "array") then .inbound = [.inbound] else . end)
+    else . end'
+
+MIHOMO_CONFIG_NORMALISE_PROGRAM='
+  if type != "object" then error("运行配置不是 JSON 对象") else . end'
+
+kernel_config_normalise_program() {
+  case "$PROXY_KERNEL" in
+    singbox) printf '%s' "$SINGBOX_CONFIG_NORMALISE_PROGRAM" ;;
+    mihomo) printf '%s' "$MIHOMO_CONFIG_NORMALISE_PROGRAM" ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 骨架反推出的缺项里，期望值为空容器的那些要不要报。
+#
+# sing-box 的 `format` **会把空数组整个省略**，读回来分不清「没有这个键」和
+# 「这个键是空数组」，而对内核而言两者语义相同——不排除就会在没有分流的
+# 服务器上把 route.rules 与 route.rule_set 误报成缺项（v4.25.13 修的正是这个）。
+#
+# **mihomo 侧必须报。** 它的规范化是 `jq .`，空数组原样在，读回来分得清；
+# 照搬那条排除的后果是：一台丢了 listeners、proxies 或 rules 的 mihomo 机器，
+# 「服务与配置检查」会说一切正常。这一条有实测与对照（公开 Issue #189）。
+kernel_skeleton_skips_empty_containers() {
+  case "$PROXY_KERNEL" in
+    singbox) return 0 ;;
+    mihomo) return 1 ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 判断托管 sub-rule 里的一行是什么。行的形状只有两种，都由
+# kernel_render_split_plan 生成：
 #   RULE-SET,<规则集>,<出口>
 #   AND,((RULE-SET,<规则集>),(IN-NAME,...)),<出口>
-# 生成与识别必须一起改，因此这段判断与渲染函数放在同一个模块里，
-# 由分流模块以变量展开的方式注入自己的 jq 程序。
-# tests/test-static.sh 据此禁止分流模块与界面模块自己拼这套规则语法。
-MIHOMO_SPLIT_RULE_OWNED_DEF='
+# 生成与识别必须一起改，因此这几段判断与渲染函数放在同一个模块里，
+# 由分流模块与审计以变量展开的方式注入自己的 jq 程序。
+# tests/test-static.sh 据此禁止其它模块自己拼这套规则语法。
+#
+# 四个判断各自回答一个问题：这一行属不属于某条规则集（删除时用）、
+# 是不是「某规则集 → 某出口」（审计「配置完不完整」用）、是不是不限入口的
+# 那一种（审计已停用的全局分流用）、有没有覆盖到某几个入口名（审计
+# 「有没有覆盖用户的全部连接」与「已停用用户是否仍在生效」用）。
+MIHOMO_SPLIT_RULE_DEFS='
   def sbm_line_owned_by($line; $tags):
     ($line | type) == "string" and
     any($tags[]; . as $tag |
       ($line | startswith("RULE-SET," + $tag + ",")) or
-      ($line | contains("(RULE-SET," + $tag + ")")));'
+      ($line | contains("(RULE-SET," + $tag + ")")));
+  def sbm_line_routes($line; $rule; $out):
+    sbm_line_owned_by($line; [$rule]) and ($line | endswith("," + $out));
+  def sbm_line_scope_all($line; $rule; $out):
+    ($line | type) == "string" and $line == ("RULE-SET," + $rule + "," + $out);
+  def sbm_line_covers($line; $names):
+    ($line | type) == "string" and
+    all($names[]; . as $entry | $line | contains("(IN-NAME," + $entry + ")"));
+  def sbm_line_touches($line; $rule; $names):
+    sbm_line_owned_by($line; [$rule]) and
+    any($names[]; . as $entry | $line | contains("(IN-NAME," + $entry + ")"));'
 
 # 派发条目。条件写成覆盖整个端口空间的 DST-PORT，语义是「所有连接」：
 # MATCH 不能当逻辑规则的条件（mihomo 明确拒绝 SUB-RULE,(MATCH),名字），
@@ -6553,7 +6681,7 @@ remove_split_config() {
       #   AND,((RULE-SET,<规则集>),(IN-NAME,...)),<出口>
       # 与 sing-box 那一支同样按标签删，因此「多条分流共用同一个预置规则时
       # 一起被删掉」这个语义两个内核一致，随后的整体重建会把该留的补回来。
-      rewrite_kernel_config "$MIHOMO_SPLIT_RULE_OWNED_DEF"'
+      rewrite_kernel_config "$MIHOMO_SPLIT_RULE_DEFS"'
         .proxies = [(.proxies // [])[] |
           select((.name == $out_tag or .name == $transport_tag or .name == $stored_out or .name == $stored_transport) | not)] |
         .["rule-providers"] = ((.["rule-providers"] // {}) |
@@ -6996,31 +7124,12 @@ rebuild_and_finish_split_operation() {
   finish_managed_operation || return 1
 }
 
-# sing-box 的 Listable 字段只有一个元素时，会被 `format` 规范化成裸标量：
-#   写入的 "inbound":["anytls-share"]  →  读回的 "inbound":"anytls-share"
-# 直接拿它和期望的标签数组做集合运算，jq 会因类型不符而报错
-# （array and string cannot be subtracted）。而这些比对的调用点写成
-# `if ! jq ...` 或 `jq ... || return 1`，jq 崩溃会被当成「配置不符」，
-# 于是既误报「分流尚未覆盖用户的全部连接」，又会触发一次不必要的配置重建与
-# sing-box 重启。字符串上的 `.inbound[]?` 还会安静地什么都不返回，让
-# 「已停用用户的规则仍在生效」这类检查静默失效。
-#
-# 因此凡是要拿运行配置和期望标签做比对的地方，都必须经这里读入，
-# 把 route.rules[].inbound 统一还原成数组。只有单一入口的用户会踩到，
-# 而那恰恰是最常见的配置。
-# 校验加还原的完整 jq 程序。两处比对共用同一份文本，避免各写一套后分叉。
-# 整段放在单引号常量里，调用处只做一次普通变量展开：内联拼接会产生转义双引号，
-# 而 tests/check-shell-call-targets.py 的分词器遇到那种写法会静默停止检查
-# 文件剩余部分（见公开 Issue #102）。
-SINGBOX_CONFIG_NORMALISE_PROGRAM='
-  if type != "object" then error("运行配置不是 JSON 对象") else . end
-  | if (.route.rules? | type) == "array" then
-      .route.rules |= map(
-        if has("inbound") and ((.inbound | type) != "array") then .inbound = [.inbound] else . end)
-    else . end'
-
+# 拿运行配置与期望标签做比对的地方都必须经这里读入：规范化程序按内核分派，
+# 定义在适配层，与骨架、托管容器那几项同源（公开 Issue #189）。
 singbox_config_for_comparison() {
-  kernel_normalized_config | jq -c "$SINGBOX_CONFIG_NORMALISE_PROGRAM"
+  local program
+  program="$(kernel_config_normalise_program)" || return 1
+  kernel_normalized_config | jq -c "$program"
 }
 
 shared_preset_runtime_is_current() {
@@ -7474,6 +7583,101 @@ runtime_config_has_outbound() {
   # 直接写 index(.[$key]) 会拿 $tags 当输入，报「Cannot index array with string」。
   jq -e --arg container "$container" --arg key "$key" --argjson tags "$tags" \
     '(.[$container] // [])[] | . as $item | select(($tags | index($item[$key])) != null)' "$config" >/dev/null
+}
+
+# 审计要向运行配置提的四个问题。两个内核的托管分流摆在完全不同的地方
+# （sing-box 在 route.rule_set／outbounds／route.rules，mihomo 在
+# rule-providers／proxies／sub-rules），但问题是同一批，因此按内核分派，
+# 不让审计那边各写一遍。
+#
+# $config 是已规范化的运行配置；$lines 是 mihomo 托管 sub-rule 里的那一块
+# （sing-box 上恒为空数组，不使用）。mihomo 那几支用的规则行判断来自适配层，
+# 与生成它们的渲染函数放在一起。
+
+# 这条分流的规则集、出口与路由是不是都在。
+split_audit_runtime_complete() {
+  local config="$1" lines="$2" rule="$3" out="$4"
+  case "$PROXY_KERNEL" in
+    singbox)
+      jq -e --arg tag "$rule" '.route.rule_set[]? | select(.tag == $tag)' <<<"$config" >/dev/null &&
+      jq -e --arg out "$out" '.outbounds[]? | select(.tag == $out)' <<<"$config" >/dev/null &&
+      jq -e --arg rule "$rule" --arg out "$out" \
+        '.route.rules[]? | select(.rule_set == $rule and .outbound == $out)' <<<"$config" >/dev/null
+      ;;
+    mihomo)
+      jq -e --arg rule "$rule" --arg out "$out" --argjson lines "$lines" "$MIHOMO_SPLIT_RULE_DEFS"'
+        ((.["rule-providers"] // {}) | has($rule)) and
+        any(.proxies[]?; .name == $out) and
+        any($lines[]; sbm_line_routes(.; $rule; $out))' <<<"$config" >/dev/null
+      ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 这条分流有没有一条限定到某个用户入口的路由。
+# mode=all 要求覆盖该用户的全部入口（回答「有没有覆盖用户的全部连接」），
+# mode=any 只要沾上任意一个入口就算（回答「已停用之后规则是不是还在生效」）。
+split_audit_user_rule_present() {
+  local config="$1" lines="$2" rule="$3" out="$4" tags="$5" mode="$6"
+  case "$PROXY_KERNEL" in
+    singbox)
+      if [[ "$mode" == all ]]; then
+        jq -e --arg rule "$rule" --arg out "$out" --argjson expected "$tags" '
+          .route.rules[]? | select(.rule_set == $rule and .outbound == $out and
+            ($expected - (.inbound // []) | length) == 0)' <<<"$config" >/dev/null
+      else
+        jq -e --arg rule "$rule" --arg out "$out" --argjson expected "$tags" '
+          .route.rules[]? | select(.rule_set == $rule and .outbound == $out and
+            ([.inbound[]? as $tag | select($expected | index($tag) != null)] | length) > 0)' <<<"$config" >/dev/null
+      fi
+      ;;
+    mihomo)
+      if [[ "$mode" == all ]]; then
+        jq -e --arg rule "$rule" --arg out "$out" --argjson expected "$tags" --argjson lines "$lines" \
+          "$MIHOMO_SPLIT_RULE_DEFS"'
+          any($lines[]; sbm_line_routes(.; $rule; $out) and sbm_line_covers(.; $expected))' <<<"$config" >/dev/null
+      else
+        jq -e --arg rule "$rule" --arg out "$out" --argjson expected "$tags" --argjson lines "$lines" \
+          "$MIHOMO_SPLIT_RULE_DEFS"'
+          any($lines[]; sbm_line_routes(.; $rule; $out) and sbm_line_touches(.; $rule; $expected))' <<<"$config" >/dev/null
+      fi
+      ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 不限入口的那一条路由在不在。已停用的「全部用户」分流不该还留着它。
+split_audit_scope_all_rule_present() {
+  local config="$1" lines="$2" rule="$3" out="$4"
+  case "$PROXY_KERNEL" in
+    singbox)
+      jq -e --arg rule "$rule" --arg out "$out" '
+        .route.rules[]? | select(.rule_set == $rule and .outbound == $out and
+          ((.inbound // []) | length == 0))' <<<"$config" >/dev/null
+      ;;
+    mihomo)
+      jq -e --arg rule "$rule" --arg out "$out" --argjson lines "$lines" "$MIHOMO_SPLIT_RULE_DEFS"'
+        any($lines[]; sbm_line_scope_all(.; $rule; $out))' <<<"$config" >/dev/null
+      ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 顶层那条派发与托管 sub-rule 的内容是否对得上：有内容就必须有派发，
+# 没内容就不该留着派发。**只有 mihomo 有这一层**，sing-box 的路由规则直接摆在
+# route.rules 里，不经过派发。
+# 派发被删掉时整块分流一条都不生效，而运行配置本身完全合法、服务照常运行
+# ——没有这条检查，就没有任何地方会把它说出来。
+split_audit_dispatch_consistent() {
+  local config="$1" lines="$2"
+  case "$PROXY_KERNEL" in
+    singbox) return 0 ;;
+    mihomo)
+      jq -e --argjson lines "$lines" --arg dispatch "$MIHOMO_SPLIT_DISPATCH_RULE" '
+        (($lines | length) > 0) == (any(.rules[]?; . == $dispatch))' <<<"$config" >/dev/null
+      ;;
+    *) kernel_unknown ;;
+  esac
 }
 
 validate_split_relationships() {
@@ -11312,16 +11516,29 @@ EOF
   printf '管理脚本：%s\n' "$([[ -x /usr/local/sbin/sb-user-manager ]] && echo '已安装' || echo '未安装')"
 }
 
+# 用户与流量统计的一致性检查。
+#
+# 「条目在不在」「流量记录对不对」两个内核完全一样，因此这段程序共用一份：
+# 托管容器与标识字段经适配层取得，一个 SS2022 + ShadowTLS 端点会产生几个
+# 条目也一样（sing-box 三个、mihomo 一个）。真正不同的只有「条目里哪些字段
+# 要对」，那一段由适配层按内核注入 —— 注入点在 issue() 之后，因为它要用。
 collect_user_consistency_issue_rows() {
-  local config_json="$1" nfuse_json="$2"
-  printf '%s\n%s\n' "$config_json" "$nfuse_json" | jq -rs --slurpfile state "$STATE_FILE" '
+  local config_json="$1" nfuse_json="$2" container entry_key shadowtls_prefixes shape_def
+  container="$(kernel_managed_container)" || return 1
+  entry_key="$(kernel_managed_key)" || return 1
+  shadowtls_prefixes="$(kernel_shadowtls_entry_prefixes)" || return 1
+  shape_def="$(kernel_user_entry_shape_def)" || return 1
+  printf '%s\n%s\n' "$config_json" "$nfuse_json" | jq -rs --slurpfile state "$STATE_FILE" \
+    --arg container "$container" --arg entry_key "$entry_key" \
+    --argjson st_prefixes "$shadowtls_prefixes" --argjson strict_mode "${SHADOWTLS_STRICT_MODE:-true}" '
     .[0] as $config | .[1] as $nfuse | $state[0] as $state |
     def issue($repairable; $message): [($repairable | tostring), $message] | @tsv;
-    def inbound_exists($tag): any($config.inbounds[]?; .tag == $tag);
+    def entry_exists($entry): any($config[$container][]?; .[$entry_key] == $entry);
     def nfuse_user_exists($name): any($nfuse[]; .name == $name);
     def nfuse_tier_exists($name; $tier): any($nfuse[]; .name == $name and .tier == $tier);
     def nfuse_port_exists($name; $port):
       any($nfuse[] | select(.name == $name) | .ports[]?; .start <= $port and .end >= $port);
+    '"$shape_def"'
     $state.users[] as $user |
     $user.name as $name |
     $user.status as $status |
@@ -11334,28 +11551,17 @@ collect_user_consistency_issue_rows() {
      ($endpoint.transport // "-") as $transport |
      $endpoint.port as $port |
      (if $protocol == "anytls" then ["anytls-" + $name]
-      elif $transport == "shadowtls" then ["st-" + $name, "ss-" + $name, "ss-udp-" + $name]
+      elif $transport == "shadowtls" then [$st_prefixes[] + $name]
       elif $has_legacy then ["ss-direct-" + $name]
       else ["ss-" + $name] end) as $expected_tags |
      $expected_tags[0] as $expected |
      ($expected_tags[] as $tag |
-       if $status == "active" and (inbound_exists($tag) | not) then
+       if $status == "active" and (entry_exists($tag) | not) then
          issue(true; "[可自动修复] 用户 \($name) 缺少连接配置（\($tag)）")
-       elif $status == "disabled" and inbound_exists($tag) then
+       elif $status == "disabled" and entry_exists($tag) then
          issue(true; "[可自动修复] 已停用用户 \($name) 仍保留连接配置（\($tag)）")
        else empty end),
-     (if $protocol == "ss2022" and $transport == "shadowtls" and $status == "active" and
-         inbound_exists("ss-udp-" + $name) and
-         (any($config.inbounds[]?;
-           .tag == ("ss-udp-" + $name) and .type == "shadowsocks" and .network == "udp" and .listen_port == $port) | not)
-      then issue(true; "[可自动修复] 用户 \($name) 的 UDP 连接配置不正确") else empty end),
-     (if $protocol == "ss2022" and $transport == "direct" and $status == "active" and
-         (any($config.inbounds[]?;
-           .tag == $expected and .type == "shadowsocks" and .listen_port == $port and ((.network // "") == "")) | not)
-      then issue(true; "[可自动修复] 用户 \($name) 的原生 SS2022 连接配置不正确") else empty end),
-     (if $protocol == "ss2022" and $transport == "direct" and ($has_legacy | not) and
-         any($config.inbounds[]?; .tag == ("st-" + $name) or .tag == ("ss-udp-" + $name))
-      then issue(true; "[可自动修复] 用户 \($name) 的原生 SS2022 仍有旧版 ShadowTLS 连接残留") else empty end),
+     sbm_entry_shape_issues($name; $protocol; $transport; $port; $status; $has_legacy; $expected),
      (if nfuse_user_exists($name) and nfuse_tier_exists($name; $expected_tier) and
          (nfuse_port_exists($name; $port) | not) then
         issue(true; "[可自动修复] 用户 \($name) 的端口 \($port) 尚未接入流量统计")
@@ -11371,24 +11577,16 @@ collect_user_consistency_issue_rows() {
 audit_consistency() {
   local config_json nfuse_json skeleton_missing_rows skeleton_path user_issue_rows issue_repairable issue_message expiry_rows split_rows split name split_status rule_tag out_tag scope scope_user scope_user_status scope_tags expires
   local preset_link_rows preset_kind preset_reason managed_tags legacy_cleanup legacy_count
+  local normalise_program skeleton_program skeleton_filter sub_rule_name managed_lines
   AUDIT_ISSUES=0
   AUDIT_REPAIRABLE=0
-  # 一致性检查按 sing-box 的入站标签比对托管内容，mihomo 侧的等价识别方式
-  # 还没有建立（第二步 2e）。这里明确说明并计为一个待处理项，而不是让下面的
-  # 流程去读一份读不出来的配置然后报一个看不懂的错。
-  # 计为待处理项是有意的：一台还不能自检的机器本来就不该被当作正常。
-  if [[ "$PROXY_KERNEL" != singbox ]]; then
-    printf '\n服务与配置检查结果\n\n'
-    printf '  [需要处理] 服务与配置一致性检查尚未支持 %s 部署，本项未执行。\n' "$(kernel_display_name)"
-    AUDIT_ISSUES=1
-    return 0
-  fi
   config_json="$(kernel_normalized_config)" || return 1
   nfuse_json="$(nfuse list --json)" || return 1
   # 类型校验与 inbound 还原折在同一次 jq 调用里：本函数的 jq 调用次数受单元测试的
-  # 性能门禁看守（批量化后固定为 9 次），不能为还原再多开一个进程。程序文本与
-  # shared_preset_runtime_is_current 共用 SINGBOX_CONFIG_NORMALISE_PROGRAM。
-  config_json="$(jq -ce "$SINGBOX_CONFIG_NORMALISE_PROGRAM" <<<"$config_json")" || return 1
+  # 性能门禁看守，不能为还原再多开一个进程。程序按内核分派，与
+  # shared_preset_runtime_is_current 共用 kernel_config_normalise_program。
+  normalise_program="$(kernel_config_normalise_program)" || return 1
+  config_json="$(jq -ce "$normalise_program" <<<"$config_json")" || return 1
   jq -e 'type == "array"' <<<"$nfuse_json" >/dev/null || return 1
   user_issue_rows="$(collect_user_consistency_issue_rows "$config_json" "$nfuse_json")" || return 1
   expiry_rows="$(jq -r '.users[] | select(.expires_at != null) | [.name, (.expires_at | tostring)] | @tsv' "$STATE_FILE")" || return 1
@@ -11397,16 +11595,22 @@ audit_consistency() {
   # 此后从不复查；上游废弃或改写字段时，存量配置会悄悄过期而没有任何提示。
   # 这里不另写一份「期望骨架」，而是把 src/05-kernel.sh 那份补齐程序应用到当前
   # 配置上反推：被补上的就是缺项。两处共用同一定义，不会各自漂移。
-  # 期望值为空容器的路径必须排除：比对基准是 sing-box format 的输出，而它会把
-  # 空数组整个省略，读回来分不清「没有这个键」和「这个键是空数组」，而对内核
-  # 而言两者语义相同。不排除就会在没有分流的服务器上把 route.rules 与
-  # route.rule_set 误报成缺项。
-  skeleton_missing_rows="$(jq -r '. as $orig | ($orig | '"$SINGBOX_SKELETON_ENSURE_PROGRAM"') as $full |
+  # 期望值为空容器的路径要不要排除**随内核不同**，判断在适配层：sing-box 的
+  # format 会把空数组整个省略，不排除就会在没有分流的服务器上误报；mihomo 的
+  # 规范化是 jq 本身，空数组原样在，排除反而会把真缺项一并放过（公开 Issue #189
+  # 有实测与对照）。
+  skeleton_program="$(kernel_skeleton_ensure_program)" || return 1
+  if kernel_skeleton_skips_empty_containers; then
+    skeleton_filter='| map(. as $p | ($full | getpath($p)) as $value | ($value | type) as $kind
+        | select(($kind != "array" and $kind != "object") or ($value | length) > 0))'
+  else
+    skeleton_filter=''
+  fi
+  skeleton_missing_rows="$(jq -r '. as $orig | ($orig | '"$skeleton_program"') as $full |
     [$full | paths]
     | map(. as $p | select(($orig | getpath($p)) == null))
     | map(. as $p | select(($p[:-1] | length) == 0 or ($orig | getpath($p[:-1])) != null))
-    | map(. as $p | ($full | getpath($p)) as $value | ($value | type) as $kind
-        | select(($kind != "array" and $kind != "object") or ($value | length) > 0))
+    '"$skeleton_filter"'
     | map(map(tostring) | join("."))
     | .[]' <<<"$config_json")" || return 1
   printf '\n服务与配置检查结果\n\n'
@@ -11450,6 +11654,14 @@ audit_consistency() {
     ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
   done <<<"$preset_link_rows"
 
+  # mihomo 的托管分流全部关在一个 sub-rule 里，顶层 rules 只留一条派发；
+  # 因此这里先把那一块取出来，循环里逐条分流去里面认自己的行。
+  # 派发在不在是另一回事，循环之后单独查。
+  sub_rule_name="$MIHOMO_MANAGED_SUB_RULE"
+  managed_lines='[]'
+  if [[ "$PROXY_KERNEL" == mihomo ]]; then
+    managed_lines="$(jq -c --arg sub "$sub_rule_name" '(.["sub-rules"][$sub] // [])' <<<"$config_json")" || return 1
+  fi
   while IFS= read -r split; do
     [[ -n "$split" ]] || continue
     name="$(jq -r '.name' <<<"$split")" || return 1
@@ -11465,17 +11677,12 @@ audit_consistency() {
     if [[ "$split_status" == active && "$scope_user_status" == disabled ]]; then
       # 用户已停用时这条专属分流不会写入运行配置，只需确认没有残留规则
       scope_tags="$(split_user_inbound_tags "$scope_user")" || return 1
-      if jq -e --arg rule "$rule_tag" --arg out "$out_tag" --argjson expected "$scope_tags" '
-        .route.rules[]? | select(.rule_set == $rule and .outbound == $out and
-          ([.inbound[]? as $tag | select($expected | index($tag) != null)] | length) > 0)
-      ' <<<"$config_json" >/dev/null; then
+      if split_audit_user_rule_present "$config_json" "$managed_lines" "$rule_tag" "$out_tag" "$scope_tags" any; then
         printf '  [可自动修复] 分流 %s 指定的用户 %s 已停用，但连接规则仍在生效\n' "$name" "$scope_user"
         ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
       fi
     elif [[ "$split_status" == active ]]; then
-      if ! jq -e --arg tag "$rule_tag" '.route.rule_set[]? | select(.tag == $tag)' <<<"$config_json" >/dev/null ||
-         ! jq -e --arg out "$out_tag" '.outbounds[]? | select(.tag == $out)' <<<"$config_json" >/dev/null ||
-         ! jq -e --arg rule "$rule_tag" --arg out "$out_tag" '.route.rules[]? | select(.rule_set == $rule and .outbound == $out)' <<<"$config_json" >/dev/null; then
+      if ! split_audit_runtime_complete "$config_json" "$managed_lines" "$rule_tag" "$out_tag"; then
         printf '  [可自动修复] 分流 %s 的规则或出口配置不完整\n' "$name"
         ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
       fi
@@ -11484,26 +11691,20 @@ audit_consistency() {
         ((AUDIT_ISSUES+=1))
       elif [[ -n "$scope_user" ]]; then
         scope_tags="$(split_user_inbound_tags "$scope_user")" || return 1
-        if ! jq -e --arg rule "$rule_tag" --arg out "$out_tag" --argjson expected "$scope_tags" '
-          .route.rules[]? | select(.rule_set == $rule and .outbound == $out and
-            ($expected - (.inbound // []) | length) == 0)
-        ' <<<"$config_json" >/dev/null; then
+        if ! split_audit_user_rule_present "$config_json" "$managed_lines" "$rule_tag" "$out_tag" "$scope_tags" all; then
           printf '  [可自动修复] 分流 %s 尚未覆盖用户 %s 的全部连接\n' "$name" "$scope_user"
           ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
         fi
       fi
     else
       if [[ "$scope" == all ]]; then
-        if jq -e --arg rule "$rule_tag" --arg out "$out_tag" '.route.rules[]? | select(.rule_set == $rule and .outbound == $out and ((.inbound // []) | length == 0))' <<<"$config_json" >/dev/null; then
+        if split_audit_scope_all_rule_present "$config_json" "$managed_lines" "$rule_tag" "$out_tag"; then
           printf '  [可自动修复] 已停用分流 %s 仍有连接规则生效\n' "$name"
           ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
         fi
       elif [[ -n "$scope_user" ]]; then
         scope_tags="$(split_user_inbound_tags "$scope_user")" || return 1
-        if jq -e --arg rule "$rule_tag" --arg out "$out_tag" --argjson expected "$scope_tags" '
-          .route.rules[]? | select(.rule_set == $rule and .outbound == $out and
-            ([.inbound[]? as $tag | select($expected | index($tag) != null)] | length) > 0)
-        ' <<<"$config_json" >/dev/null; then
+        if split_audit_user_rule_present "$config_json" "$managed_lines" "$rule_tag" "$out_tag" "$scope_tags" any; then
           printf '  [可自动修复] 已停用分流 %s 仍有连接规则生效\n' "$name"
           ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
         fi
@@ -11511,9 +11712,26 @@ audit_consistency() {
     fi
   done <<<"$split_rows"
 
-  managed_tags="$(collect_managed_split_tags)" || return 1
-  legacy_cleanup="$(collect_legacy_split_cleanup_plan_from_config "$config_json" "$managed_tags")" || return 1
-  legacy_count="$(jq '.rule_tags | length' <<<"$legacy_cleanup")" || return 1
+  # mihomo 独有的一条：托管分流那一块在不在，与顶层那条派发在不在，必须一致。
+  # 派发被删掉时整块分流一条都不生效，而运行配置本身完全合法、服务照常运行
+  # ——没有这条检查就没有任何地方会说出来。sing-box 没有对应物：它的路由规则
+  # 直接摆在 route.rules 里，不经过派发这一层。
+  if [[ "$PROXY_KERNEL" == mihomo ]]; then
+    if ! split_audit_dispatch_consistent "$config_json" "$managed_lines"; then
+      printf '  [可自动修复] 托管分流的派发规则与分流内容不一致\n'
+      ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
+    fi
+  fi
+
+  # 旧版分流残留只对 sing-box 有意义：托管分流在 mihomo 上从第二步 2d 才开始
+  # 存在，不可能有「按旧写法留下的残留」。这里与 legacy_split_cleanup_pending
+  # 用同一条判断，不靠「查出来恰好是空的」。
+  legacy_count=0
+  if [[ "$PROXY_KERNEL" == singbox ]]; then
+    managed_tags="$(collect_managed_split_tags)" || return 1
+    legacy_cleanup="$(collect_legacy_split_cleanup_plan_from_config "$config_json" "$managed_tags")" || return 1
+    legacy_count="$(jq '.rule_tags | length' <<<"$legacy_cleanup")" || return 1
+  fi
   if ((legacy_count > 0)); then
     printf '  [可自动修复] 检测到 %s 条与当前预置重复的旧版分流规则\n' "$legacy_count"
     ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))

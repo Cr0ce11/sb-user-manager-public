@@ -778,16 +778,29 @@ EOF
   printf '管理脚本：%s\n' "$([[ -x /usr/local/sbin/sb-user-manager ]] && echo '已安装' || echo '未安装')"
 }
 
+# 用户与流量统计的一致性检查。
+#
+# 「条目在不在」「流量记录对不对」两个内核完全一样，因此这段程序共用一份：
+# 托管容器与标识字段经适配层取得，一个 SS2022 + ShadowTLS 端点会产生几个
+# 条目也一样（sing-box 三个、mihomo 一个）。真正不同的只有「条目里哪些字段
+# 要对」，那一段由适配层按内核注入 —— 注入点在 issue() 之后，因为它要用。
 collect_user_consistency_issue_rows() {
-  local config_json="$1" nfuse_json="$2"
-  printf '%s\n%s\n' "$config_json" "$nfuse_json" | jq -rs --slurpfile state "$STATE_FILE" '
+  local config_json="$1" nfuse_json="$2" container entry_key shadowtls_prefixes shape_def
+  container="$(kernel_managed_container)" || return 1
+  entry_key="$(kernel_managed_key)" || return 1
+  shadowtls_prefixes="$(kernel_shadowtls_entry_prefixes)" || return 1
+  shape_def="$(kernel_user_entry_shape_def)" || return 1
+  printf '%s\n%s\n' "$config_json" "$nfuse_json" | jq -rs --slurpfile state "$STATE_FILE" \
+    --arg container "$container" --arg entry_key "$entry_key" \
+    --argjson st_prefixes "$shadowtls_prefixes" --argjson strict_mode "${SHADOWTLS_STRICT_MODE:-true}" '
     .[0] as $config | .[1] as $nfuse | $state[0] as $state |
     def issue($repairable; $message): [($repairable | tostring), $message] | @tsv;
-    def inbound_exists($tag): any($config.inbounds[]?; .tag == $tag);
+    def entry_exists($entry): any($config[$container][]?; .[$entry_key] == $entry);
     def nfuse_user_exists($name): any($nfuse[]; .name == $name);
     def nfuse_tier_exists($name; $tier): any($nfuse[]; .name == $name and .tier == $tier);
     def nfuse_port_exists($name; $port):
       any($nfuse[] | select(.name == $name) | .ports[]?; .start <= $port and .end >= $port);
+    '"$shape_def"'
     $state.users[] as $user |
     $user.name as $name |
     $user.status as $status |
@@ -800,28 +813,17 @@ collect_user_consistency_issue_rows() {
      ($endpoint.transport // "-") as $transport |
      $endpoint.port as $port |
      (if $protocol == "anytls" then ["anytls-" + $name]
-      elif $transport == "shadowtls" then ["st-" + $name, "ss-" + $name, "ss-udp-" + $name]
+      elif $transport == "shadowtls" then [$st_prefixes[] + $name]
       elif $has_legacy then ["ss-direct-" + $name]
       else ["ss-" + $name] end) as $expected_tags |
      $expected_tags[0] as $expected |
      ($expected_tags[] as $tag |
-       if $status == "active" and (inbound_exists($tag) | not) then
+       if $status == "active" and (entry_exists($tag) | not) then
          issue(true; "[可自动修复] 用户 \($name) 缺少连接配置（\($tag)）")
-       elif $status == "disabled" and inbound_exists($tag) then
+       elif $status == "disabled" and entry_exists($tag) then
          issue(true; "[可自动修复] 已停用用户 \($name) 仍保留连接配置（\($tag)）")
        else empty end),
-     (if $protocol == "ss2022" and $transport == "shadowtls" and $status == "active" and
-         inbound_exists("ss-udp-" + $name) and
-         (any($config.inbounds[]?;
-           .tag == ("ss-udp-" + $name) and .type == "shadowsocks" and .network == "udp" and .listen_port == $port) | not)
-      then issue(true; "[可自动修复] 用户 \($name) 的 UDP 连接配置不正确") else empty end),
-     (if $protocol == "ss2022" and $transport == "direct" and $status == "active" and
-         (any($config.inbounds[]?;
-           .tag == $expected and .type == "shadowsocks" and .listen_port == $port and ((.network // "") == "")) | not)
-      then issue(true; "[可自动修复] 用户 \($name) 的原生 SS2022 连接配置不正确") else empty end),
-     (if $protocol == "ss2022" and $transport == "direct" and ($has_legacy | not) and
-         any($config.inbounds[]?; .tag == ("st-" + $name) or .tag == ("ss-udp-" + $name))
-      then issue(true; "[可自动修复] 用户 \($name) 的原生 SS2022 仍有旧版 ShadowTLS 连接残留") else empty end),
+     sbm_entry_shape_issues($name; $protocol; $transport; $port; $status; $has_legacy; $expected),
      (if nfuse_user_exists($name) and nfuse_tier_exists($name; $expected_tier) and
          (nfuse_port_exists($name; $port) | not) then
         issue(true; "[可自动修复] 用户 \($name) 的端口 \($port) 尚未接入流量统计")
@@ -837,24 +839,16 @@ collect_user_consistency_issue_rows() {
 audit_consistency() {
   local config_json nfuse_json skeleton_missing_rows skeleton_path user_issue_rows issue_repairable issue_message expiry_rows split_rows split name split_status rule_tag out_tag scope scope_user scope_user_status scope_tags expires
   local preset_link_rows preset_kind preset_reason managed_tags legacy_cleanup legacy_count
+  local normalise_program skeleton_program skeleton_filter sub_rule_name managed_lines
   AUDIT_ISSUES=0
   AUDIT_REPAIRABLE=0
-  # 一致性检查按 sing-box 的入站标签比对托管内容，mihomo 侧的等价识别方式
-  # 还没有建立（第二步 2e）。这里明确说明并计为一个待处理项，而不是让下面的
-  # 流程去读一份读不出来的配置然后报一个看不懂的错。
-  # 计为待处理项是有意的：一台还不能自检的机器本来就不该被当作正常。
-  if [[ "$PROXY_KERNEL" != singbox ]]; then
-    printf '\n服务与配置检查结果\n\n'
-    printf '  [需要处理] 服务与配置一致性检查尚未支持 %s 部署，本项未执行。\n' "$(kernel_display_name)"
-    AUDIT_ISSUES=1
-    return 0
-  fi
   config_json="$(kernel_normalized_config)" || return 1
   nfuse_json="$(nfuse list --json)" || return 1
   # 类型校验与 inbound 还原折在同一次 jq 调用里：本函数的 jq 调用次数受单元测试的
-  # 性能门禁看守（批量化后固定为 9 次），不能为还原再多开一个进程。程序文本与
-  # shared_preset_runtime_is_current 共用 SINGBOX_CONFIG_NORMALISE_PROGRAM。
-  config_json="$(jq -ce "$SINGBOX_CONFIG_NORMALISE_PROGRAM" <<<"$config_json")" || return 1
+  # 性能门禁看守，不能为还原再多开一个进程。程序按内核分派，与
+  # shared_preset_runtime_is_current 共用 kernel_config_normalise_program。
+  normalise_program="$(kernel_config_normalise_program)" || return 1
+  config_json="$(jq -ce "$normalise_program" <<<"$config_json")" || return 1
   jq -e 'type == "array"' <<<"$nfuse_json" >/dev/null || return 1
   user_issue_rows="$(collect_user_consistency_issue_rows "$config_json" "$nfuse_json")" || return 1
   expiry_rows="$(jq -r '.users[] | select(.expires_at != null) | [.name, (.expires_at | tostring)] | @tsv' "$STATE_FILE")" || return 1
@@ -863,16 +857,22 @@ audit_consistency() {
   # 此后从不复查；上游废弃或改写字段时，存量配置会悄悄过期而没有任何提示。
   # 这里不另写一份「期望骨架」，而是把 src/05-kernel.sh 那份补齐程序应用到当前
   # 配置上反推：被补上的就是缺项。两处共用同一定义，不会各自漂移。
-  # 期望值为空容器的路径必须排除：比对基准是 sing-box format 的输出，而它会把
-  # 空数组整个省略，读回来分不清「没有这个键」和「这个键是空数组」，而对内核
-  # 而言两者语义相同。不排除就会在没有分流的服务器上把 route.rules 与
-  # route.rule_set 误报成缺项。
-  skeleton_missing_rows="$(jq -r '. as $orig | ($orig | '"$SINGBOX_SKELETON_ENSURE_PROGRAM"') as $full |
+  # 期望值为空容器的路径要不要排除**随内核不同**，判断在适配层：sing-box 的
+  # format 会把空数组整个省略，不排除就会在没有分流的服务器上误报；mihomo 的
+  # 规范化是 jq 本身，空数组原样在，排除反而会把真缺项一并放过（公开 Issue #189
+  # 有实测与对照）。
+  skeleton_program="$(kernel_skeleton_ensure_program)" || return 1
+  if kernel_skeleton_skips_empty_containers; then
+    skeleton_filter='| map(. as $p | ($full | getpath($p)) as $value | ($value | type) as $kind
+        | select(($kind != "array" and $kind != "object") or ($value | length) > 0))'
+  else
+    skeleton_filter=''
+  fi
+  skeleton_missing_rows="$(jq -r '. as $orig | ($orig | '"$skeleton_program"') as $full |
     [$full | paths]
     | map(. as $p | select(($orig | getpath($p)) == null))
     | map(. as $p | select(($p[:-1] | length) == 0 or ($orig | getpath($p[:-1])) != null))
-    | map(. as $p | ($full | getpath($p)) as $value | ($value | type) as $kind
-        | select(($kind != "array" and $kind != "object") or ($value | length) > 0))
+    '"$skeleton_filter"'
     | map(map(tostring) | join("."))
     | .[]' <<<"$config_json")" || return 1
   printf '\n服务与配置检查结果\n\n'
@@ -916,6 +916,14 @@ audit_consistency() {
     ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
   done <<<"$preset_link_rows"
 
+  # mihomo 的托管分流全部关在一个 sub-rule 里，顶层 rules 只留一条派发；
+  # 因此这里先把那一块取出来，循环里逐条分流去里面认自己的行。
+  # 派发在不在是另一回事，循环之后单独查。
+  sub_rule_name="$MIHOMO_MANAGED_SUB_RULE"
+  managed_lines='[]'
+  if [[ "$PROXY_KERNEL" == mihomo ]]; then
+    managed_lines="$(jq -c --arg sub "$sub_rule_name" '(.["sub-rules"][$sub] // [])' <<<"$config_json")" || return 1
+  fi
   while IFS= read -r split; do
     [[ -n "$split" ]] || continue
     name="$(jq -r '.name' <<<"$split")" || return 1
@@ -931,17 +939,12 @@ audit_consistency() {
     if [[ "$split_status" == active && "$scope_user_status" == disabled ]]; then
       # 用户已停用时这条专属分流不会写入运行配置，只需确认没有残留规则
       scope_tags="$(split_user_inbound_tags "$scope_user")" || return 1
-      if jq -e --arg rule "$rule_tag" --arg out "$out_tag" --argjson expected "$scope_tags" '
-        .route.rules[]? | select(.rule_set == $rule and .outbound == $out and
-          ([.inbound[]? as $tag | select($expected | index($tag) != null)] | length) > 0)
-      ' <<<"$config_json" >/dev/null; then
+      if split_audit_user_rule_present "$config_json" "$managed_lines" "$rule_tag" "$out_tag" "$scope_tags" any; then
         printf '  [可自动修复] 分流 %s 指定的用户 %s 已停用，但连接规则仍在生效\n' "$name" "$scope_user"
         ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
       fi
     elif [[ "$split_status" == active ]]; then
-      if ! jq -e --arg tag "$rule_tag" '.route.rule_set[]? | select(.tag == $tag)' <<<"$config_json" >/dev/null ||
-         ! jq -e --arg out "$out_tag" '.outbounds[]? | select(.tag == $out)' <<<"$config_json" >/dev/null ||
-         ! jq -e --arg rule "$rule_tag" --arg out "$out_tag" '.route.rules[]? | select(.rule_set == $rule and .outbound == $out)' <<<"$config_json" >/dev/null; then
+      if ! split_audit_runtime_complete "$config_json" "$managed_lines" "$rule_tag" "$out_tag"; then
         printf '  [可自动修复] 分流 %s 的规则或出口配置不完整\n' "$name"
         ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
       fi
@@ -950,26 +953,20 @@ audit_consistency() {
         ((AUDIT_ISSUES+=1))
       elif [[ -n "$scope_user" ]]; then
         scope_tags="$(split_user_inbound_tags "$scope_user")" || return 1
-        if ! jq -e --arg rule "$rule_tag" --arg out "$out_tag" --argjson expected "$scope_tags" '
-          .route.rules[]? | select(.rule_set == $rule and .outbound == $out and
-            ($expected - (.inbound // []) | length) == 0)
-        ' <<<"$config_json" >/dev/null; then
+        if ! split_audit_user_rule_present "$config_json" "$managed_lines" "$rule_tag" "$out_tag" "$scope_tags" all; then
           printf '  [可自动修复] 分流 %s 尚未覆盖用户 %s 的全部连接\n' "$name" "$scope_user"
           ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
         fi
       fi
     else
       if [[ "$scope" == all ]]; then
-        if jq -e --arg rule "$rule_tag" --arg out "$out_tag" '.route.rules[]? | select(.rule_set == $rule and .outbound == $out and ((.inbound // []) | length == 0))' <<<"$config_json" >/dev/null; then
+        if split_audit_scope_all_rule_present "$config_json" "$managed_lines" "$rule_tag" "$out_tag"; then
           printf '  [可自动修复] 已停用分流 %s 仍有连接规则生效\n' "$name"
           ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
         fi
       elif [[ -n "$scope_user" ]]; then
         scope_tags="$(split_user_inbound_tags "$scope_user")" || return 1
-        if jq -e --arg rule "$rule_tag" --arg out "$out_tag" --argjson expected "$scope_tags" '
-          .route.rules[]? | select(.rule_set == $rule and .outbound == $out and
-            ([.inbound[]? as $tag | select($expected | index($tag) != null)] | length) > 0)
-        ' <<<"$config_json" >/dev/null; then
+        if split_audit_user_rule_present "$config_json" "$managed_lines" "$rule_tag" "$out_tag" "$scope_tags" any; then
           printf '  [可自动修复] 已停用分流 %s 仍有连接规则生效\n' "$name"
           ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
         fi
@@ -977,9 +974,26 @@ audit_consistency() {
     fi
   done <<<"$split_rows"
 
-  managed_tags="$(collect_managed_split_tags)" || return 1
-  legacy_cleanup="$(collect_legacy_split_cleanup_plan_from_config "$config_json" "$managed_tags")" || return 1
-  legacy_count="$(jq '.rule_tags | length' <<<"$legacy_cleanup")" || return 1
+  # mihomo 独有的一条：托管分流那一块在不在，与顶层那条派发在不在，必须一致。
+  # 派发被删掉时整块分流一条都不生效，而运行配置本身完全合法、服务照常运行
+  # ——没有这条检查就没有任何地方会说出来。sing-box 没有对应物：它的路由规则
+  # 直接摆在 route.rules 里，不经过派发这一层。
+  if [[ "$PROXY_KERNEL" == mihomo ]]; then
+    if ! split_audit_dispatch_consistent "$config_json" "$managed_lines"; then
+      printf '  [可自动修复] 托管分流的派发规则与分流内容不一致\n'
+      ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
+    fi
+  fi
+
+  # 旧版分流残留只对 sing-box 有意义：托管分流在 mihomo 上从第二步 2d 才开始
+  # 存在，不可能有「按旧写法留下的残留」。这里与 legacy_split_cleanup_pending
+  # 用同一条判断，不靠「查出来恰好是空的」。
+  legacy_count=0
+  if [[ "$PROXY_KERNEL" == singbox ]]; then
+    managed_tags="$(collect_managed_split_tags)" || return 1
+    legacy_cleanup="$(collect_legacy_split_cleanup_plan_from_config "$config_json" "$managed_tags")" || return 1
+    legacy_count="$(jq '.rule_tags | length' <<<"$legacy_cleanup")" || return 1
+  fi
   if ((legacy_count > 0)); then
     printf '  [可自动修复] 检测到 %s 条与当前预置重复的旧版分流规则\n' "$legacy_count"
     ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))

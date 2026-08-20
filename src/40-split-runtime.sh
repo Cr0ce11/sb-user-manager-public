@@ -347,7 +347,7 @@ remove_split_config() {
       #   AND,((RULE-SET,<规则集>),(IN-NAME,...)),<出口>
       # 与 sing-box 那一支同样按标签删，因此「多条分流共用同一个预置规则时
       # 一起被删掉」这个语义两个内核一致，随后的整体重建会把该留的补回来。
-      rewrite_kernel_config "$MIHOMO_SPLIT_RULE_OWNED_DEF"'
+      rewrite_kernel_config "$MIHOMO_SPLIT_RULE_DEFS"'
         .proxies = [(.proxies // [])[] |
           select((.name == $out_tag or .name == $transport_tag or .name == $stored_out or .name == $stored_transport) | not)] |
         .["rule-providers"] = ((.["rule-providers"] // {}) |
@@ -790,31 +790,12 @@ rebuild_and_finish_split_operation() {
   finish_managed_operation || return 1
 }
 
-# sing-box 的 Listable 字段只有一个元素时，会被 `format` 规范化成裸标量：
-#   写入的 "inbound":["anytls-share"]  →  读回的 "inbound":"anytls-share"
-# 直接拿它和期望的标签数组做集合运算，jq 会因类型不符而报错
-# （array and string cannot be subtracted）。而这些比对的调用点写成
-# `if ! jq ...` 或 `jq ... || return 1`，jq 崩溃会被当成「配置不符」，
-# 于是既误报「分流尚未覆盖用户的全部连接」，又会触发一次不必要的配置重建与
-# sing-box 重启。字符串上的 `.inbound[]?` 还会安静地什么都不返回，让
-# 「已停用用户的规则仍在生效」这类检查静默失效。
-#
-# 因此凡是要拿运行配置和期望标签做比对的地方，都必须经这里读入，
-# 把 route.rules[].inbound 统一还原成数组。只有单一入口的用户会踩到，
-# 而那恰恰是最常见的配置。
-# 校验加还原的完整 jq 程序。两处比对共用同一份文本，避免各写一套后分叉。
-# 整段放在单引号常量里，调用处只做一次普通变量展开：内联拼接会产生转义双引号，
-# 而 tests/check-shell-call-targets.py 的分词器遇到那种写法会静默停止检查
-# 文件剩余部分（见公开 Issue #102）。
-SINGBOX_CONFIG_NORMALISE_PROGRAM='
-  if type != "object" then error("运行配置不是 JSON 对象") else . end
-  | if (.route.rules? | type) == "array" then
-      .route.rules |= map(
-        if has("inbound") and ((.inbound | type) != "array") then .inbound = [.inbound] else . end)
-    else . end'
-
+# 拿运行配置与期望标签做比对的地方都必须经这里读入：规范化程序按内核分派，
+# 定义在适配层，与骨架、托管容器那几项同源（公开 Issue #189）。
 singbox_config_for_comparison() {
-  kernel_normalized_config | jq -c "$SINGBOX_CONFIG_NORMALISE_PROGRAM"
+  local program
+  program="$(kernel_config_normalise_program)" || return 1
+  kernel_normalized_config | jq -c "$program"
 }
 
 shared_preset_runtime_is_current() {
@@ -1268,6 +1249,101 @@ runtime_config_has_outbound() {
   # 直接写 index(.[$key]) 会拿 $tags 当输入，报「Cannot index array with string」。
   jq -e --arg container "$container" --arg key "$key" --argjson tags "$tags" \
     '(.[$container] // [])[] | . as $item | select(($tags | index($item[$key])) != null)' "$config" >/dev/null
+}
+
+# 审计要向运行配置提的四个问题。两个内核的托管分流摆在完全不同的地方
+# （sing-box 在 route.rule_set／outbounds／route.rules，mihomo 在
+# rule-providers／proxies／sub-rules），但问题是同一批，因此按内核分派，
+# 不让审计那边各写一遍。
+#
+# $config 是已规范化的运行配置；$lines 是 mihomo 托管 sub-rule 里的那一块
+# （sing-box 上恒为空数组，不使用）。mihomo 那几支用的规则行判断来自适配层，
+# 与生成它们的渲染函数放在一起。
+
+# 这条分流的规则集、出口与路由是不是都在。
+split_audit_runtime_complete() {
+  local config="$1" lines="$2" rule="$3" out="$4"
+  case "$PROXY_KERNEL" in
+    singbox)
+      jq -e --arg tag "$rule" '.route.rule_set[]? | select(.tag == $tag)' <<<"$config" >/dev/null &&
+      jq -e --arg out "$out" '.outbounds[]? | select(.tag == $out)' <<<"$config" >/dev/null &&
+      jq -e --arg rule "$rule" --arg out "$out" \
+        '.route.rules[]? | select(.rule_set == $rule and .outbound == $out)' <<<"$config" >/dev/null
+      ;;
+    mihomo)
+      jq -e --arg rule "$rule" --arg out "$out" --argjson lines "$lines" "$MIHOMO_SPLIT_RULE_DEFS"'
+        ((.["rule-providers"] // {}) | has($rule)) and
+        any(.proxies[]?; .name == $out) and
+        any($lines[]; sbm_line_routes(.; $rule; $out))' <<<"$config" >/dev/null
+      ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 这条分流有没有一条限定到某个用户入口的路由。
+# mode=all 要求覆盖该用户的全部入口（回答「有没有覆盖用户的全部连接」），
+# mode=any 只要沾上任意一个入口就算（回答「已停用之后规则是不是还在生效」）。
+split_audit_user_rule_present() {
+  local config="$1" lines="$2" rule="$3" out="$4" tags="$5" mode="$6"
+  case "$PROXY_KERNEL" in
+    singbox)
+      if [[ "$mode" == all ]]; then
+        jq -e --arg rule "$rule" --arg out "$out" --argjson expected "$tags" '
+          .route.rules[]? | select(.rule_set == $rule and .outbound == $out and
+            ($expected - (.inbound // []) | length) == 0)' <<<"$config" >/dev/null
+      else
+        jq -e --arg rule "$rule" --arg out "$out" --argjson expected "$tags" '
+          .route.rules[]? | select(.rule_set == $rule and .outbound == $out and
+            ([.inbound[]? as $tag | select($expected | index($tag) != null)] | length) > 0)' <<<"$config" >/dev/null
+      fi
+      ;;
+    mihomo)
+      if [[ "$mode" == all ]]; then
+        jq -e --arg rule "$rule" --arg out "$out" --argjson expected "$tags" --argjson lines "$lines" \
+          "$MIHOMO_SPLIT_RULE_DEFS"'
+          any($lines[]; sbm_line_routes(.; $rule; $out) and sbm_line_covers(.; $expected))' <<<"$config" >/dev/null
+      else
+        jq -e --arg rule "$rule" --arg out "$out" --argjson expected "$tags" --argjson lines "$lines" \
+          "$MIHOMO_SPLIT_RULE_DEFS"'
+          any($lines[]; sbm_line_routes(.; $rule; $out) and sbm_line_touches(.; $rule; $expected))' <<<"$config" >/dev/null
+      fi
+      ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 不限入口的那一条路由在不在。已停用的「全部用户」分流不该还留着它。
+split_audit_scope_all_rule_present() {
+  local config="$1" lines="$2" rule="$3" out="$4"
+  case "$PROXY_KERNEL" in
+    singbox)
+      jq -e --arg rule "$rule" --arg out "$out" '
+        .route.rules[]? | select(.rule_set == $rule and .outbound == $out and
+          ((.inbound // []) | length == 0))' <<<"$config" >/dev/null
+      ;;
+    mihomo)
+      jq -e --arg rule "$rule" --arg out "$out" --argjson lines "$lines" "$MIHOMO_SPLIT_RULE_DEFS"'
+        any($lines[]; sbm_line_scope_all(.; $rule; $out))' <<<"$config" >/dev/null
+      ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 顶层那条派发与托管 sub-rule 的内容是否对得上：有内容就必须有派发，
+# 没内容就不该留着派发。**只有 mihomo 有这一层**，sing-box 的路由规则直接摆在
+# route.rules 里，不经过派发。
+# 派发被删掉时整块分流一条都不生效，而运行配置本身完全合法、服务照常运行
+# ——没有这条检查，就没有任何地方会把它说出来。
+split_audit_dispatch_consistent() {
+  local config="$1" lines="$2"
+  case "$PROXY_KERNEL" in
+    singbox) return 0 ;;
+    mihomo)
+      jq -e --argjson lines "$lines" --arg dispatch "$MIHOMO_SPLIT_DISPATCH_RULE" '
+        (($lines | length) > 0) == (any(.rules[]?; . == $dispatch))' <<<"$config" >/dev/null
+      ;;
+    *) kernel_unknown ;;
+  esac
 }
 
 validate_split_relationships() {

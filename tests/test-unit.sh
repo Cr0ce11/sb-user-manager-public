@@ -7927,13 +7927,20 @@ if ! grep -Fq 'singbox_config_for_comparison' <<<"$(declare -f shared_preset_run
   echo 'shared_preset_runtime_is_current must read the running config through singbox_config_for_comparison' >&2
   exit 1
 fi
-if ! grep -Fq 'SINGBOX_CONFIG_NORMALISE_PROGRAM' <<<"$(declare -f audit_consistency)"; then
-  echo 'audit_consistency must normalise inbound with the shared filter' >&2
+# 两处比对都必须经适配层那份按内核分派的规范化程序，不能各写一套。
+if ! grep -Fq 'kernel_config_normalise_program' <<<"$(declare -f audit_consistency)"; then
+  echo 'audit_consistency must normalise the running config through kernel_config_normalise_program' >&2
   exit 1
 fi
-# 共用函数本身也必须用那份规则，两处不能各写一套
-if ! grep -Fq 'SINGBOX_CONFIG_NORMALISE_PROGRAM' <<<"$(declare -f singbox_config_for_comparison)"; then
+if ! grep -Fq 'kernel_config_normalise_program' <<<"$(declare -f singbox_config_for_comparison)"; then
   echo 'singbox_config_for_comparison must use the shared normalisation filter' >&2
+  exit 1
+fi
+# 分派本身两个内核都要给出：sing-box 那一支要还原被 format 塌成标量的 inbound，
+# mihomo 那一支只做类型校验——照搬 sing-box 那一段过去没有意义。
+if ! grep -Fq 'SINGBOX_CONFIG_NORMALISE_PROGRAM' <<<"$(declare -f kernel_config_normalise_program)" ||
+   ! grep -Fq 'MIHOMO_CONFIG_NORMALISE_PROGRAM' <<<"$(declare -f kernel_config_normalise_program)"; then
+  echo 'kernel_config_normalise_program must dispatch to both kernels' >&2
   exit 1
 fi
 
@@ -9071,6 +9078,192 @@ EOF
     state_add_rule_preset demo https://example.com/a.srs ''
     jq -e '.rule_presets[0] | .url == "https://example.com/a.srs" and (has("rule_file") | not) and (has("rule_behavior") | not)' "$STATE_FILE" >/dev/null ) || {
     echo '对照失败：sing-box 上的预置规则必须仍然只存 url' >&2; exit 1; }
+)
+
+# ============================================================
+# 第二步 2e：审计与一致性检查的 mihomo 侧
+# ============================================================
+# 这一组的第一条是「生成与审计是否同步」：夹具不是手写的运行配置，而是用
+# **生成函数**按状态算出来的。将来谁改了生成的形状而没有跟着改审计的断言，
+# 这一条会当场变红——这是 #189 里定下的做法，用它换掉「审计整体比对」那条路，
+# 好处留下（不脱节），噪声留在测试里而不是跑到使用者面前。
+(
+  work_2e="$work/mihomo-audit"
+  mkdir -p "$work_2e/rules"
+  PROXY_KERNEL=mihomo
+  MIHOMO_CONFIG="$work_2e/config.json"
+  MIHOMO_RULES_DIR="$work_2e/rules"
+  STATE_FILE="$work_2e/state.json"
+  HANDSHAKE_PORT=443
+  SHADOWTLS_STRICT_MODE=true
+  cat > "$work_2e/rules/lab.yaml" <<'YAML'
+payload:
+  - DOMAIN-SUFFIX,openai.com
+YAML
+  printf '%s\n' '{
+    "schema_version":7,
+    "users":[
+      {"name":"shadow","status":"active","metered":false,
+       "endpoints":[{"protocol":"ss2022","transport":"shadowtls","port":20001,
+                     "shadowtls_password":"stpw","ss2022_password":"sspw",
+                     "method":"2022-blake3-aes-128-gcm","shadowtls_sni":"a.example.com"}]},
+      {"name":"plain","status":"active","metered":false,
+       "endpoints":[{"protocol":"ss2022","transport":"direct","port":20002,
+                     "ss2022_password":"sspw2","method":"2022-blake3-aes-128-gcm"}]}
+    ],
+    "splits":[{"name":"s1","rule_file":"lab.yaml","rule_behavior":"classical","scope":"user","user":"shadow",
+               "upstream":{"protocol":"shadowsocks","server":"up.example.com","server_port":8388,
+                           "method":"2022-blake3-aes-128-gcm","password":"pw"},
+               "outbound_tag":"s1-out","rule_set_tag":"s1-rule","status":"active"}],
+    "outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
+  printf '%s\n' '{"log-level":"info","mode":"rule","listeners":[],"proxies":[],"proxy-groups":[],"rules":[]}' > "$MIHOMO_CONFIG"
+  nfuse() {
+    [[ "${1:-}" == list && "${2:-}" == --json ]] || return 1
+    printf '%s\n' '[{"name":"shadow","tier":"c","ports":[{"start":20001,"end":20001}]},
+                    {"name":"plain","tier":"c","ports":[{"start":20002,"end":20002}]}]'
+  }
+  # 用生成函数把托管内容写进配置——这一步是本组测试的基准。
+  rebuild_protocol_inbounds ss2022
+  rebuild_all_split_configs
+  cp "$MIHOMO_CONFIG" "$work_2e/config.good.json"
+
+  audit_consistency > "$work_2e/audit.clean"
+  if [[ "$AUDIT_ISSUES" != 0 ]]; then
+    echo '生成函数产出的 mihomo 配置必须让审计报零问题；生成与审计已经脱节：' >&2
+    cat "$work_2e/audit.clean" >&2
+    exit 1
+  fi
+
+  # 逐条先破坏再确认变红。每一条都从同一份干净配置出发，避免互相干扰。
+  break_and_expect() {
+    local label="$1" filter="$2" expect="$3" expect_count="${4:-1}"
+    cp "$work_2e/config.good.json" "$MIHOMO_CONFIG"
+    jq -c "$filter" "$work_2e/config.good.json" > "$MIHOMO_CONFIG.tmp" && mv "$MIHOMO_CONFIG.tmp" "$MIHOMO_CONFIG"
+    audit_consistency > "$work_2e/audit.broken"
+    if [[ "$AUDIT_ISSUES" != "$expect_count" ]]; then
+      printf '破坏「%s」之后期望报 %s 个问题，实际 %s 个：\n' "$label" "$expect_count" "$AUDIT_ISSUES" >&2
+      cat "$work_2e/audit.broken" >&2
+      exit 1
+    fi
+    if ! grep -Fq "$expect" "$work_2e/audit.broken"; then
+      printf '破坏「%s」之后没有报出预期的那一条（%s）：\n' "$label" "$expect" >&2
+      cat "$work_2e/audit.broken" >&2
+      exit 1
+    fi
+  }
+
+  # 条目整个不见时，「缺少连接配置」与「形状不对」会各报一条——
+  # 与 sing-box 侧的行为一致，那边的形状断言同样在条目缺失时成立。
+  break_and_expect '删掉一个监听器' \
+    '.listeners = [.listeners[] | select(.name != "ss-plain")]' \
+    '[可自动修复] 用户 plain 缺少连接配置（ss-plain）' 2
+  break_and_expect '把原生 SS2022 的端口改错' \
+    '.listeners |= map(if .name == "ss-plain" then .port = 29999 else . end)' \
+    '[可自动修复] 用户 plain 的原生 SS2022 连接配置不正确'
+  break_and_expect '把 ShadowTLS 监听器的 udp 关掉' \
+    '.listeners |= map(if .name == "st-shadow" then .udp = false else . end)' \
+    '[可自动修复] 用户 shadow 的 SS2022 + ShadowTLS 连接配置不正确'
+  # 这一条是 mihomo 最容易静默失效的字段：键名写错时它会被丢掉、严格模式悄悄关掉。
+  break_and_expect '把 ShadowTLS 严格模式改掉' \
+    '.listeners |= map(if .name == "st-shadow" then .["shadow-tls"]["strict-mode"] = false else . end)' \
+    '[可自动修复] 用户 shadow 的 ShadowTLS 严格模式与管理配置不一致'
+  break_and_expect '给原生 SS2022 挂上 shadow-tls' \
+    '.listeners |= map(if .name == "ss-plain" then .["shadow-tls"] = {"enable":true} else . end)' \
+    '[可自动修复] 用户 plain 的原生 SS2022 连接配置不正确'
+  break_and_expect '删掉规则集' \
+    'del(.["rule-providers"][(.["rule-providers"]|keys[0])])' \
+    '[可自动修复] 分流 s1 的规则或出口配置不完整'
+  break_and_expect '删掉出口' \
+    '.proxies = []' \
+    '[可自动修复] 分流 s1 的规则或出口配置不完整'
+  # 派发被删掉时整块分流一条都不生效，而配置本身完全合法、服务照常运行。
+  break_and_expect '删掉顶层那条派发' \
+    '.rules = []' \
+    '[可自动修复] 托管分流的派发规则与分流内容不一致'
+
+  # 覆盖不全：把用户专属那一行换成不限入口的写法，规则集与出口都还在，
+  # 因此「配置完不完整」不该报，只该报「尚未覆盖用户的全部连接」。
+  cp "$work_2e/config.good.json" "$MIHOMO_CONFIG"
+  jq -c '.["sub-rules"]["managed-splits"] = ["RULE-SET,s1-rule,s1-out"]' "$work_2e/config.good.json" > "$MIHOMO_CONFIG.tmp"
+  mv "$MIHOMO_CONFIG.tmp" "$MIHOMO_CONFIG"
+  audit_consistency > "$work_2e/audit.coverage"
+  if ! grep -Fq '[可自动修复] 分流 s1 尚未覆盖用户 shadow 的全部连接' "$work_2e/audit.coverage" ||
+     [[ "$AUDIT_ISSUES" != 1 ]]; then
+    echo '用户专属分流退化成不限入口时必须报出「尚未覆盖用户的全部连接」' >&2
+    cat "$work_2e/audit.coverage" >&2
+    exit 1
+  fi
+
+  # 已停用的分流不该还留着规则。
+  cp "$work_2e/config.good.json" "$MIHOMO_CONFIG"
+  jq -c '.splits[0].status = "disabled"' "$STATE_FILE" > "$work_2e/state.tmp" && mv "$work_2e/state.tmp" "$STATE_FILE"
+  audit_consistency > "$work_2e/audit.disabled"
+  if ! grep -Fq '[可自动修复] 已停用分流 s1 仍有连接规则生效' "$work_2e/audit.disabled"; then
+    echo '已停用的分流仍有规则时必须报出来' >&2
+    cat "$work_2e/audit.disabled" >&2
+    exit 1
+  fi
+  # 对照：按状态重建之后，同一份状态必须报零问题。
+  rebuild_all_split_configs
+  audit_consistency > "$work_2e/audit.disabled-clean"
+  if [[ "$AUDIT_ISSUES" != 0 ]]; then
+    echo '对照失败：分流停用并重建之后审计应当报零问题' >&2
+    cat "$work_2e/audit.disabled-clean" >&2
+    exit 1
+  fi
+
+  # 审计的 jq 调用次数不得随用户数增长。sing-box 侧那条门禁锁的是一个具体数字，
+  # 这里换成「加两个用户，次数一个不变」——数字会随分流条数变，而真正要防住的
+  # 是「有人把用户检查拆成逐用户一次调用」这件事，这条写法直接说的就是它。
+  cp "$work_2e/config.good.json" "$MIHOMO_CONFIG"
+  jq -c '.splits[0].status = "active"' "$STATE_FILE" > "$work_2e/state.tmp" && mv "$work_2e/state.tmp" "$STATE_FILE"
+  audit_call_count() {
+    local marker="$1"
+    : > "$marker"
+    jq() { printf 'jq\n' >> "$marker"; command jq "$@"; }
+    audit_consistency > /dev/null
+    unset -f jq
+    wc -l < "$marker" | tr -d ' '
+  }
+  two_user_calls="$(audit_call_count "$work_2e/calls.two")"
+  jq -c '.users += [
+    {name:"extra1",status:"active",metered:false,endpoints:[{protocol:"ss2022",transport:"direct",port:20011,ss2022_password:"x",method:"2022-blake3-aes-128-gcm"}]},
+    {name:"extra2",status:"active",metered:false,endpoints:[{protocol:"ss2022",transport:"direct",port:20012,ss2022_password:"y",method:"2022-blake3-aes-128-gcm"}]}]' \
+    "$STATE_FILE" > "$work_2e/state.tmp" && mv "$work_2e/state.tmp" "$STATE_FILE"
+  nfuse() {
+    [[ "${1:-}" == list && "${2:-}" == --json ]] || return 1
+    printf '%s\n' '[{"name":"shadow","tier":"c","ports":[{"start":20001,"end":20001}]},
+                    {"name":"plain","tier":"c","ports":[{"start":20002,"end":20002}]},
+                    {"name":"extra1","tier":"c","ports":[{"start":20011,"end":20011}]},
+                    {"name":"extra2","tier":"c","ports":[{"start":20012,"end":20012}]}]'
+  }
+  rebuild_protocol_inbounds ss2022
+  four_user_calls="$(audit_call_count "$work_2e/calls.four")"
+  if [[ "$two_user_calls" != "$four_user_calls" ]]; then
+    printf '审计的 jq 调用次数随用户数增长了：两个用户 %s 次，四个用户 %s 次\n' \
+      "$two_user_calls" "$four_user_calls" >&2
+    exit 1
+  fi
+
+  # 骨架检查：mihomo 侧不能套用 sing-box 那条「空容器不报」的排除，
+  # 否则一台丢了 listeners 的机器会被说成一切正常（公开 Issue #189 有实测）。
+  printf '%s\n' '{"schema_version":7,"users":[],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
+  printf '%s\n' '{"log-level":"info","mode":"rule","proxies":[],"proxy-groups":[],"rules":[]}' > "$MIHOMO_CONFIG"
+  nfuse() { [[ "${1:-}" == list && "${2:-}" == --json ]] || return 1; printf '[]\n'; }
+  audit_consistency > "$work_2e/audit.skeleton"
+  if ! grep -Fq '[需要处理] 运行配置缺少骨架项 listeners' "$work_2e/audit.skeleton"; then
+    echo 'mihomo 上丢掉 listeners 必须报成骨架缺项，不能被「空容器不报」放过' >&2
+    cat "$work_2e/audit.skeleton" >&2
+    exit 1
+  fi
+  # 对照：补回去之后不再报。
+  printf '%s\n' '{"log-level":"info","mode":"rule","listeners":[],"proxies":[],"proxy-groups":[],"rules":[]}' > "$MIHOMO_CONFIG"
+  audit_consistency > "$work_2e/audit.skeleton-clean"
+  if [[ "$AUDIT_ISSUES" != 0 ]]; then
+    echo '对照失败：骨架完整的空 mihomo 配置应当报零问题' >&2
+    cat "$work_2e/audit.skeleton-clean" >&2
+    exit 1
+  fi
 )
 
 echo 'unit checks passed'
