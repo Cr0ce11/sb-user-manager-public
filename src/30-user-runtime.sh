@@ -297,18 +297,6 @@ rewrite_kernel_config() {
   unregister_temp_path "$tmp" || return 1
 }
 
-# 分流的运行配置改写。分流的 mihomo 侧要到第二步 2d 才有，因此这里是
-# sing-box 专用的，并带一条大声的兜底——2c 之后 mihomo 机器第一次会有用户，
-# 分流菜单随之变得可达，若没有这一条，它会往一个 mihomo 根本不读的文件里写东西，
-# 而且不产生任何提示。真正面向使用者的拒绝在菜单入口处，这里只是最后一道。
-rewrite_singbox_config() {
-  [[ "$PROXY_KERNEL" == singbox ]] || {
-    kernel_unsupported '改写分流运行配置'
-    return 1
-  }
-  rewrite_kernel_config "$@"
-}
-
 append_inbounds_from_new_user_snapshot() {
   local config_json="$1" expected_source="$2" fragment="$3"
   local config_path config_dir current_source tmp container

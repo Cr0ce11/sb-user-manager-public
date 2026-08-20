@@ -443,7 +443,7 @@ grep -Fq '内部错误：不支持的新增用户协议：unknown' <<<"$unknown_
   anytls_certificate_ready() { return 0; }
 
   # 旧通用重写助手作为黄金基准；新路径必须生成逐字节相同的配置。
-  SB_JQ_NEW_INBOUNDS="$fragment" rewrite_singbox_config \
+  SB_JQ_NEW_INBOUNDS="$fragment" rewrite_kernel_config \
     '($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_inbounds |
      .inbounds = ((.inbounds // []) + $new_inbounds)'
   cp "$SINGBOX_CONFIG" "$expected_config"
@@ -3102,7 +3102,13 @@ jq -e '
 
 split_upstream='{"protocol":"ss_shadowtls","server":"upstream.example.com","server_port":443,"method":"2022-blake3-aes-128-gcm","ss_password":"split-secret","shadowtls_password":"transport-secret","sni":"upstream.example.com","insecure":false}'
 printf '%s\n' '{"schema_version":6,"users":[{"name":"stored-at","port":20008,"protocol":"anytls","status":"active","metered":false,"anytls_password":"stored-at-secret","tls_sni":"client.example.com","endpoints":[{"protocol":"anytls","port":20008,"anytls_password":"stored-at-secret","tls_sni":"client.example.com"},{"protocol":"ss2022","transport":"direct","port":20009,"ss2022_password":"stored-direct-secret","method":"2022-blake3-aes-128-gcm"}]}],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
-apply_split_config unit-split https://rules.example.com/unit.srs user stored-at "$split_upstream" unit-out unit-rule
+SB_JQ_SPLIT="$split_upstream" jq -c '
+  ($ENV.SB_JQ_SPLIT | fromjson) as $upstream |
+  .splits = [{name:"unit-split",url:"https://rules.example.com/unit.srs",scope:"user",user:"stored-at",
+    upstream:$upstream,outbound_tag:"unit-out",rule_set_tag:"unit-rule",status:"active"}]' \
+  "$STATE_FILE" > "$work/unit-split-state.json"
+mv "$work/unit-split-state.json" "$STATE_FILE"
+rebuild_all_split_configs
 jq -e '
   any(.outbounds[]; .tag == "direct") and
   any(.outbounds[]; .tag == "unit-out" and .server == "upstream.example.com") and
@@ -3150,8 +3156,8 @@ jq -e '
     fi
   }
   SINGBOX_BIN=ruleset_singbox
-  validate_remote_rule_set https://rules.example.com/valid.json
-  validate_remote_rule_set https://rules.example.com/valid.srs
+  validate_split_rule_source https://rules.example.com/valid.json
+  validate_split_rule_source https://rules.example.com/valid.srs
 )
 set +e
 (
@@ -3167,7 +3173,7 @@ set +e
     printf '%s\n' '{"not":"a-rule-set"}' > "$output"
   }
   SINGBOX_BIN=true
-  validate_remote_rule_set https://rules.example.com/invalid.json
+  validate_split_rule_source https://rules.example.com/invalid.json
 ) >/dev/null 2>&1
 invalid_ruleset_rc=$?
 set -e
@@ -3349,7 +3355,7 @@ MERGEORDER
     fi
   )
 
-  validate_remote_rule_set() { :; }
+  validate_split_rule_source() { :; }
   start_managed_operation() { :; }
   finish_managed_operation() { :; }
   check_singbox_and_restart() { :; }
@@ -3425,7 +3431,8 @@ MERGEORDER
   prepare_core() { :; }
   prompt_select_rule_preset() {
     SELECTED_RULE_PRESET=AI
-    SELECTED_RULE_URL=https://rules.example.com/ai.srs
+    SELECTED_RULE_SOURCE=https://rules.example.com/ai.srs
+    SELECTED_RULE_BEHAVIOR=''
   }
   prompt_split_scope_user() {
     PROMPTED_SPLIT_USER=alice
@@ -3534,7 +3541,7 @@ MERGEORDER
   rebuild_calls=0
   restart_calls=0
   validate_upstream_candidate() { :; }
-  validate_remote_rule_set() { :; }
+  validate_split_rule_source() { :; }
   ensure_safe_ssh_for_kernel_restart() { :; }
   start_managed_operation() { :; }
   rebuild_all_split_configs() { rebuild_calls=$((rebuild_calls + 1)); }
@@ -3633,7 +3640,7 @@ MERGEORDER
   }
   validate_outbound_tag() { :; }
   split_rule_format() { printf 'binary'; }
-  validate_remote_rule_set() { :; }
+  validate_split_rule_source() { :; }
   start_managed_operation() { :; }
   remove_split_config() { :; }
   state_replace_split() { :; }
@@ -3657,7 +3664,7 @@ MOCK_SINGBOX_FORMAT_FAIL=true
 set +e
 (
   trap 'printf "triggered\n" > "$rollback_marker"' ERR
-  rewrite_singbox_config '.'
+  rewrite_kernel_config '.'
 ) >/dev/null 2>&1
 format_failure_rc=$?
 set -e
@@ -3678,7 +3685,7 @@ rm -f "$rollback_marker"
   printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rules":[],"rule_set":[]}}' > "$SINGBOX_CONFIG"
   for iteration in 1 2 3 4 5 6 7 8 9 10; do
     atomic_state_update '.counter += 1'
-    rewrite_singbox_config '.'
+    rewrite_kernel_config '.'
     [[ "$RUNTIME_TEMP_PATH_COUNT" == 0 ]]
   done
   [[ "$(jq -r '.counter' "$STATE_FILE")" == 10 ]]
@@ -3695,7 +3702,7 @@ rm -f "$rollback_marker"
     [[ "${*: -1}" != *'/.normalized.'* ]] || return 77
     command rm "$@"
   }
-  if rewrite_singbox_config '.' >/dev/null 2>&1; then
+  if rewrite_kernel_config '.' >/dev/null 2>&1; then
     echo 'config rewrite should fail when the normalized staging file cannot be removed' >&2
     exit 1
   fi
@@ -3708,7 +3715,7 @@ rm -f "$rollback_marker"
 set +e
 (
   trap 'printf "triggered\n" > "$rollback_marker"' ERR
-  rewrite_singbox_config '.inbounds, error("forced jq failure")'
+  rewrite_kernel_config '.inbounds, error("forced jq failure")'
 ) >/dev/null 2>&1
 jq_failure_rc=$?
 set -e
@@ -3730,7 +3737,7 @@ fi
   MOCK_SINGBOX_FORMAT_FAIL=false
   chmod() { return 77; }
   chown() { return 0; }
-  if rewrite_singbox_config '.inbounds += [{"tag":"must-not-commit"}]' >/dev/null 2>&1; then
+  if rewrite_kernel_config '.inbounds += [{"tag":"must-not-commit"}]' >/dev/null 2>&1; then
     echo 'config rewrite should fail when both permission updates fail' >&2
     exit 1
   fi
@@ -8269,7 +8276,7 @@ STATE_FILE="'"$work"'/kernel-state.json"'
   split_probe_config="$work/split-guard-config.json"
   printf '%s' '{"inbounds":[],"outbounds":[]}' > "$split_probe_config"
   if ( PROXY_KERNEL=mihomo; SINGBOX_CONFIG="$split_probe_config"
-       rewrite_singbox_config '.' >/dev/null 2>&1 ); then
+       rewrite_kernel_config '.' >/dev/null 2>&1 ); then
     echo 'mihomo 部署上改写分流运行配置必须失败' >&2
     exit 1
   fi
@@ -8277,7 +8284,7 @@ STATE_FILE="'"$work"'/kernel-state.json"'
   if ! ( PROXY_KERNEL=singbox; SINGBOX_CONFIG="$split_probe_config"
          MIHOMO_CONFIG="$split_probe_config"
          kernel_normalized_config() { cat "$SINGBOX_CONFIG"; }
-         rewrite_singbox_config '.' >/dev/null 2>&1 ); then
+         rewrite_kernel_config '.' >/dev/null 2>&1 ); then
     echo 'sing-box 部署上改写分流运行配置必须照常工作' >&2
     exit 1
   fi
@@ -8334,7 +8341,7 @@ ANYTLS_SNI="b.example.com"'
     # （公开 Issue #154 实测：mihomo 拒绝加载 SAFE_PATHS 之外的证书，
     # 而 mihomo -t 完全测不出这个问题）。
     write_mihomo_unit || exit 1
-    grep -Fxq 'Environment=SAFE_PATHS=/etc/sb-user-manager/cert' \
+    grep -Fxq 'Environment=SAFE_PATHS=/etc/sb-user-manager/cert:/etc/mihomo/rules' \
       "$moved_root/etc/systemd/system/mihomo.service" || exit 1
     # 四组路径集合：漏掉任何一组，改值之后就会出现「备份里没有用户数据」
     # 或「卸载后用户资料还留在盘上」这类静默后果。
@@ -8579,8 +8586,10 @@ FAKE
 )
 
 # systemd 单元内容。sing-box 一侧必须与升级前一字不变，mihomo 一侧必须带上
-# SAFE_PATHS——公开 Issue #154 实测确认 mihomo 拒绝加载工作目录之外的证书，
-# 而这个限制在 `mihomo -t` 阶段完全不暴露，只有真正启动监听器时才报错。
+# 两条 SAFE_PATHS：证书目录（公开 Issue #154 实测确认 mihomo 拒绝加载工作目录
+# 之外的证书，而这个限制在 `mihomo -t` 阶段完全不暴露，只有真正启动监听器时
+# 才报错）与使用者的分流规则目录（公开 Issue #186 实测，这一条反而在
+# `mihomo -t` 阶段就当场拒绝）。分隔符是冒号，实测逗号不认。
 (
   unit_root="$work/kernel-units"
   mkdir -p "$unit_root/etc/systemd/system"
@@ -8628,7 +8637,7 @@ Wants=network-online.target
 Type=simple
 User=root
 StateDirectory=mihomo
-Environment=SAFE_PATHS=/etc/sing-box/cert
+Environment=SAFE_PATHS=/etc/sing-box/cert:/etc/mihomo/rules
 ExecStart=/usr/local/bin/mihomo -d /var/lib/mihomo -f /etc/mihomo/config.json
 Restart=on-failure
 RestartSec=10s
@@ -8844,5 +8853,224 @@ STATE_FILE="'"$resolve_state"'"'
   fi
 )
 
+
+# ============================================================
+# 第二步 2d：分流的 mihomo 生成
+# ============================================================
+# 这一组全部在 PROXY_KERNEL=mihomo 下跑，并且每条都配一个 sing-box 侧或
+# 「不该生效」的对照——只断言 mihomo 那一半，分不清「生成对了」与「整段没跑」。
+(
+  work_2d="$work/mihomo-split"
+  mkdir -p "$work_2d/rules"
+  PROXY_KERNEL=mihomo
+  MIHOMO_CONFIG="$work_2d/config.json"
+  MIHOMO_RULES_DIR="$work_2d/rules"
+  STATE_FILE="$work_2d/state.json"
+
+  # --- 一、上游出口的形状 ---
+  anytls_upstream='{"protocol":"anytls","server":"up.example.com","server_port":443,"password":"pw","sni":"up.example.com","insecure":false}'
+  ss_upstream='{"protocol":"shadowsocks","server":"up.example.com","server_port":8388,"method":"2022-blake3-aes-128-gcm","password":"pw"}'
+  sst_upstream='{"protocol":"ss_shadowtls","server":"up.example.com","server_port":443,"method":"2022-blake3-aes-128-gcm","ss_password":"sspw","shadowtls_password":"stpw","sni":"up.example.com","insecure":true}'
+
+  out="$(kernel_split_outbounds demo "$anytls_upstream" mso-demo mpt-demo)"
+  jq -e 'length == 1 and .[0] == {name:"mso-demo",type:"anytls",server:"up.example.com",port:443,
+    password:"pw",sni:"up.example.com","skip-cert-verify":false,udp:true}' <<<"$out" >/dev/null || {
+    echo 'mihomo 的 AnyTLS 上游出口形状不对' >&2; exit 1; }
+
+  out="$(kernel_split_outbounds demo "$ss_upstream" mso-demo mpt-demo)"
+  jq -e 'length == 1 and .[0] == {name:"mso-demo",type:"ss",server:"up.example.com",port:8388,
+    cipher:"2022-blake3-aes-128-gcm",password:"pw",udp:true}' <<<"$out" >/dev/null || {
+    echo 'mihomo 的 Shadowsocks 上游出口形状不对' >&2; exit 1; }
+
+  # ShadowTLS 在 mihomo 客户端一侧是 ss 的插件，一个 proxy 就够；
+  # sing-box 侧同一份上游要两个出站。条目数不同这件事必须锁住。
+  out="$(kernel_split_outbounds demo "$sst_upstream" mso-demo mpt-demo)"
+  jq -e 'length == 1 and .[0] == {name:"mso-demo",type:"ss",server:"up.example.com",port:443,
+    cipher:"2022-blake3-aes-128-gcm",password:"sspw",udp:false,plugin:"shadow-tls",
+    "plugin-opts":{host:"up.example.com",password:"stpw",version:3,"skip-cert-verify":true}}' <<<"$out" >/dev/null || {
+    echo 'mihomo 的 SS2022 + ShadowTLS 上游出口形状不对' >&2; exit 1; }
+  ( PROXY_KERNEL=singbox
+    out="$(kernel_split_outbounds demo "$sst_upstream" mso-demo mpt-demo)"
+    [[ "$(jq 'length' <<<"$out")" == 2 ]] ) || {
+    echo '对照失败：sing-box 侧同一份上游应当是两个出站' >&2; exit 1; }
+
+  # ShadowTLS 只承载 TCP，udp 必须是 false；写成 true 是给出上游不提供的承诺。
+  # 这一条与上面那条整体比对重复，单独再断言一次是因为它是安全/可用性语义，
+  # 将来有人「顺手统一成 true」时要单独变红。
+  [[ "$(jq -r '.[0].udp' <<<"$out")" == false ]] || {
+    echo 'ShadowTLS 上游出口不得声明支持 UDP' >&2; exit 1; }
+
+  # --- 二、计划渲染 ---
+  plan_of() {
+    jq -cn --argjson routes "$1" '{outbound_groups:[],rule_sets:[],routes:$routes}'
+  }
+  rendered="$(kernel_render_split_plan "$(plan_of '[{"rule_set":"mpr-a","outbound":"mpo-a","scope_all":true,"users":[],"inbound":[]}]')")"
+  [[ "$(jq -r '.sub_rules[0]' <<<"$rendered")" == 'RULE-SET,mpr-a,mpo-a' ]] || {
+    echo '全部用户的分流应当渲染成一条 RULE-SET 规则' >&2; exit 1; }
+
+  rendered="$(kernel_render_split_plan "$(plan_of '[{"rule_set":"mpr-a","outbound":"mpo-a","scope_all":false,"users":["u"],"inbound":["st-u"]}]')")"
+  [[ "$(jq -r '.sub_rules[0]' <<<"$rendered")" == 'AND,((RULE-SET,mpr-a),(IN-NAME,st-u)),mpo-a' ]] || {
+    echo '单个入口的用户专属分流应当用 IN-NAME 直接限定' >&2; exit 1; }
+
+  # 多个入口必须用 OR 嵌套。IN-NAME,a,b 会被 mihomo 当成「出口叫 b」而报错，
+  # 这是实测过的（公开 Issue #186），不能图省事并列。
+  rendered="$(kernel_render_split_plan "$(plan_of '[{"rule_set":"mpr-a","outbound":"mpo-a","scope_all":false,"users":["u"],"inbound":["st-u","anytls-u"]}]')")"
+  [[ "$(jq -r '.sub_rules[0]' <<<"$rendered")" == 'AND,((RULE-SET,mpr-a),(OR,((IN-NAME,st-u),(IN-NAME,anytls-u)))),mpo-a' ]] || {
+    echo '多个入口的用户专属分流应当用 OR 嵌套' >&2; exit 1; }
+
+  # 入口为空的用户专属条目谁都作用不到，而 OR,(()) 这种空集合 mihomo 不接受。
+  rendered="$(kernel_render_split_plan "$(plan_of '[{"rule_set":"mpr-a","outbound":"mpo-a","scope_all":false,"users":["u"],"inbound":[]}]')")"
+  [[ "$(jq '.sub_rules | length' <<<"$rendered")" == 0 ]] || {
+    echo '没有任何入口的用户专属分流不应当被渲染出来' >&2; exit 1; }
+
+  # 名字里带逗号或括号会把一条规则拼成另一条，而 mihomo 只会说「规则类型不支持」。
+  if kernel_render_split_plan "$(plan_of '[{"rule_set":"bad,name","outbound":"mpo-a","scope_all":true,"users":[],"inbound":[]}]')" >/dev/null 2>&1; then
+    echo '名字里带逗号时渲染必须失败，不能拼出一条坏规则' >&2; exit 1
+  fi
+
+  # --- 三、用户入口名：两个内核条目数不同 ---
+  printf '%s\n' '{"schema_version":7,"users":[{"name":"u","status":"active","endpoints":[{"protocol":"ss2022","transport":"shadowtls","port":20001}]}],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
+  [[ "$(split_user_inbound_tags u)" == '["st-u"]' ]] || {
+    echo 'mihomo 上一个 SS2022 + ShadowTLS 用户只有一个托管入口' >&2; exit 1; }
+  ( PROXY_KERNEL=singbox
+    [[ "$(split_user_inbound_tags u)" == '["ss-u","ss-udp-u","st-u"]' ]] ) || {
+    echo '对照失败：sing-box 上同一个用户应当有三个托管入口' >&2; exit 1; }
+
+  # --- 四、规则文件与写法的核对 ---
+  cat > "$work_2d/rules/classical.yaml" <<'EOF'
+payload:
+  # 从社区抄来的片段
+  - DOMAIN-SUFFIX,openai.com
+  - 'IP-CIDR,1.2.3.0/24,no-resolve'
+EOF
+  cat > "$work_2d/rules/domain.yaml" <<'EOF'
+payload:
+  - '+.openai.com'
+  - anthropic.com
+EOF
+  cat > "$work_2d/rules/ipcidr.yaml" <<'EOF'
+payload:
+  - 192.168.1.0/24
+  - '2001:db8::/32'
+EOF
+  printf -- '- DOMAIN-SUFFIX,openai.com\n' > "$work_2d/rules/nopayload.yaml"
+  printf 'payload:\n' > "$work_2d/rules/empty.yaml"
+
+  # 对照：写法与内容相符时必须一个字都不说，否则这条护栏会变成「狼来了」。
+  for pair in classical:classical domain:domain ipcidr:ipcidr; do
+    if [[ -n "$(mihomo_rule_file_mismatch "$work_2d/rules/${pair%%:*}.yaml" "${pair##*:}")" ]]; then
+      echo "写法相符的规则文件不应当报出不一致：$pair" >&2; exit 1
+    fi
+  done
+  # 错配必须报出来：mihomo 这一侧是完全静默的，报不报只看管理器。
+  [[ -n "$(mihomo_rule_file_mismatch "$work_2d/rules/classical.yaml" domain)" ]] || {
+    echo '完整规则行按域名列表读时必须报出不一致' >&2; exit 1; }
+  [[ -n "$(mihomo_rule_file_mismatch "$work_2d/rules/domain.yaml" classical)" ]] || {
+    echo '域名列表按完整规则行读时必须报出不一致' >&2; exit 1; }
+  [[ -n "$(mihomo_rule_file_mismatch "$work_2d/rules/domain.yaml" ipcidr)" ]] || {
+    echo '域名列表按 IP 段读时必须报出不一致' >&2; exit 1; }
+  # 缺 payload 与空 payload 都是 mihomo 一句话都不说、规则完全不生效的情形。
+  [[ -n "$(mihomo_rule_file_mismatch "$work_2d/rules/nopayload.yaml" classical)" ]] || {
+    echo '没有 payload 键的文件必须报出来' >&2; exit 1; }
+  [[ -n "$(mihomo_rule_file_mismatch "$work_2d/rules/empty.yaml" classical)" ]] || {
+    echo 'payload 下没有任何规则的文件必须报出来' >&2; exit 1; }
+
+  # --- 五、来源校验 ---
+  validate_mihomo_rule_set classical.yaml classical
+  for bad in 'classical.yaml:notabehavior' 'nosuchfile.yaml:classical' '../escape.yaml:classical' '.hidden:classical'; do
+    if ( validate_mihomo_rule_set "${bad%%:*}" "${bad##*:}" ) >/dev/null 2>&1; then
+      echo "无效的规则来源必须被拒绝：$bad" >&2; exit 1
+    fi
+  done
+  ln -sf "$work_2d/rules/classical.yaml" "$work_2d/rules/link.yaml"
+  if ( validate_mihomo_rule_set link.yaml classical ) >/dev/null 2>&1; then
+    echo '规则文件是符号链接时必须被拒绝' >&2; exit 1
+  fi
+  rm -f "$work_2d/rules/link.yaml"
+
+  # --- 六、整体重建：管理器只替换自己那几块 ---
+  printf '%s\n' '{"schema_version":7,"users":[{"name":"u","status":"active","endpoints":[{"protocol":"ss2022","transport":"shadowtls","port":20001}]}],"splits":[{"name":"s1","rule_file":"classical.yaml","rule_behavior":"classical","scope":"user","user":"u","upstream":{"protocol":"shadowsocks","server":"up.example.com","server_port":8388,"method":"2022-blake3-aes-128-gcm","password":"pw"},"outbound_tag":"s1-out","rule_set_tag":"s1-rule","status":"active"}],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
+  # 使用者自己写在配置里的东西：一个外来 proxy、一个外来 rule-provider、
+  # 两条自己的 rules、一个自己的 sub-rule。这些在管理器操作后必须原样保留。
+  printf '%s\n' '{"log-level":"info","mode":"rule","listeners":[{"name":"st-u","type":"shadowsocks"}],"proxies":[{"name":"my-own","type":"ss"}],"rule-providers":{"my-list":{"type":"file","behavior":"classical","format":"yaml","path":"./mine.yaml"}},"sub-rules":{"my-block":["MATCH,DIRECT"]},"rules":["DOMAIN-SUFFIX,my.example.com,my-own","MATCH,DIRECT"],"dns":{"enable":false},"my-hand-written-key":123}' > "$MIHOMO_CONFIG"
+  rebuild_all_split_configs
+  jq -e '
+    (.proxies | length) == 2 and
+    any(.proxies[]; .name == "my-own") and
+    any(.proxies[]; .name == "s1-out" and .type == "ss") and
+    (.["rule-providers"] | keys | sort) == ["my-list","s1-rule"] and
+    .["rule-providers"]["s1-rule"] == {type:"file",behavior:"classical",format:"yaml",path:$rule_path} and
+    .["sub-rules"]["managed-splits"] == ["AND,((RULE-SET,s1-rule),(IN-NAME,st-u)),s1-out"] and
+    .["sub-rules"]["my-block"] == ["MATCH,DIRECT"] and
+    .rules == ["SUB-RULE,(DST-PORT,0-65535),managed-splits","DOMAIN-SUFFIX,my.example.com,my-own","MATCH,DIRECT"] and
+    .dns == {enable:false} and
+    .["my-hand-written-key"] == 123
+  ' --arg rule_path "$work_2d/rules/classical.yaml" "$MIHOMO_CONFIG" >/dev/null || {
+    echo 'mihomo 的分流重建没有正确地只替换管理器自己那几块' >&2; exit 1; }
+
+  # 派发必须在使用者自己的规则**之前**：放在后面时使用者的 MATCH 会把整块盖掉。
+  [[ "$(jq -r '.rules[0]' "$MIHOMO_CONFIG")" == 'SUB-RULE,(DST-PORT,0-65535),managed-splits' ]] || {
+    echo '托管分流的派发必须排在使用者自己的规则之前' >&2; exit 1; }
+
+  # 再跑一次必须幂等，不能每次都往 rules 里多塞一条派发。
+  cp "$MIHOMO_CONFIG" "$work_2d/config.first.json"
+  rebuild_all_split_configs
+  cmp -s "$work_2d/config.first.json" "$MIHOMO_CONFIG" || {
+    echo '重复重建应当得到逐字节相同的配置' >&2; exit 1; }
+
+  # --- 六之二、规则文件被删掉之后不许静静地把流量改走直连 ---
+  # 这是 mihomo -t 唯一测不出的一项：文件不在时配置检查照样通过、服务也起得来。
+  cp "$MIHOMO_CONFIG" "$work_2d/config.before-missing.json"
+  mv "$work_2d/rules/classical.yaml" "$work_2d/rules/classical.away"
+  if rebuild_all_split_configs >/dev/null 2>&1; then
+    echo '规则文件不存在时，分流重建必须失败而不是照常写出去' >&2; exit 1
+  fi
+  # 计划在任何改动之前生成，因此失败不得留下改了一半的运行配置。
+  cmp -s "$work_2d/config.before-missing.json" "$MIHOMO_CONFIG" || {
+    echo '重建失败时不得改动运行配置' >&2; exit 1; }
+  mv "$work_2d/rules/classical.away" "$work_2d/rules/classical.yaml"
+  rebuild_all_split_configs
+  cmp -s "$work_2d/config.before-missing.json" "$MIHOMO_CONFIG" || {
+    echo '对照失败：文件放回去之后应当重新生成出同一份配置' >&2; exit 1; }
+
+  # --- 七、没有启用中的分流时不留残骸 ---
+  # 一条指向已不存在 sub-rule 的派发会让 mihomo 直接拒绝加载配置，
+  # 那等于把机器停在起不来的状态上。
+  jq -c '.splits[0].status = "disabled"' "$STATE_FILE" > "$work_2d/state.tmp" && mv "$work_2d/state.tmp" "$STATE_FILE"
+  rebuild_all_split_configs
+  jq -e '
+    (.rules == ["DOMAIN-SUFFIX,my.example.com,my-own","MATCH,DIRECT"]) and
+    ((.["sub-rules"] // {}) | has("managed-splits") | not) and
+    (.["sub-rules"]["my-block"] == ["MATCH,DIRECT"]) and
+    ((.["rule-providers"] | keys) == ["my-list"]) and
+    ((.proxies | length) == 1 and .proxies[0].name == "my-own")
+  ' "$MIHOMO_CONFIG" >/dev/null || {
+    echo '分流全部停用后，管理器的派发、sub-rule、规则集与出口都必须撤干净' >&2; exit 1; }
+
+  # --- 八、单条删除 ---
+  jq -c '.splits[0].status = "active"' "$STATE_FILE" > "$work_2d/state.tmp" && mv "$work_2d/state.tmp" "$STATE_FILE"
+  rebuild_all_split_configs
+  remove_split_config s1
+  jq -e '
+    (all(.proxies[]; .name != "s1-out")) and
+    ((.["rule-providers"] | has("s1-rule")) | not) and
+    (.["sub-rules"]["managed-splits"] == []) and
+    (.["sub-rules"]["my-block"] == ["MATCH,DIRECT"]) and
+    any(.proxies[]; .name == "my-own")
+  ' "$MIHOMO_CONFIG" >/dev/null || {
+    echo '单条分流删除必须只拿掉自己那几处' >&2; exit 1; }
+
+  # --- 九、状态里存的键名随内核不同 ---
+  printf '%s\n' '{"schema_version":7,"users":[],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
+  atomic_state_update() { jq -c "$1" "${@:2}" "$STATE_FILE" > "$work_2d/state.tmp" && mv "$work_2d/state.tmp" "$STATE_FILE"; }
+  state_add_rule_preset demo classical.yaml classical
+  jq -e '.rule_presets[0] | .rule_file == "classical.yaml" and .rule_behavior == "classical" and (has("url") | not)' "$STATE_FILE" >/dev/null || {
+    echo 'mihomo 上的预置规则必须存成 rule_file 加写法' >&2; exit 1; }
+  ( PROXY_KERNEL=singbox
+    printf '%s\n' '{"schema_version":7,"users":[],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
+    state_add_rule_preset demo https://example.com/a.srs ''
+    jq -e '.rule_presets[0] | .url == "https://example.com/a.srs" and (has("rule_file") | not) and (has("rule_behavior") | not)' "$STATE_FILE" >/dev/null ) || {
+    echo '对照失败：sing-box 上的预置规则必须仍然只存 url' >&2; exit 1; }
+)
 
 echo 'unit checks passed'

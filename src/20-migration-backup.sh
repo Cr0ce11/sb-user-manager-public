@@ -578,6 +578,15 @@ validate_migration_payload_structure() {
        else
          (has("shadowtls_password") | not) and (has("shadowtls_sni") | not)
        end);
+    # 规则集来源。两个内核存的东西不同：sing-box 是公网 HTTPS 上的 .srs / .json，
+    # mihomo 是使用者自己那个本地块状 yaml 文件的文件名。
+    # 迁移包不带那个文件，所以这里只校验写法——文件在不在由恢复之后的分流重建报。
+    # 文件名限制成不含斜杠、不含 ..，迁移包里的内容因此不可能指到目录之外。
+    def valid_rule_source:
+      ((.url | type == "string" and test("^https://") and test("\\.(srs|json)([?#].*)?$")) or
+       ((.rule_file | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
+        (.rule_behavior == "classical" or .rule_behavior == "domain" or .rule_behavior == "ipcidr")));
+
     def valid_upstream:
       (type == "object") and
       (.server | type == "string" and length > 0) and
@@ -651,7 +660,7 @@ validate_migration_payload_structure() {
       else false end) and
     all(.state.splits[];
       (.name|type=="string" and test("^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$")) and
-      (.url|type=="string" and test("^https://") and test("\\.(srs|json)([?#].*)?$")) and
+      valid_rule_source and
       (.scope=="all" or .scope=="user") and
       ((.scope=="all") or ((.user|type=="string") and (.user as $user | ($user_names | index($user)) != null))) and
       (.status=="active" or .status=="disabled") and
@@ -667,16 +676,19 @@ validate_migration_payload_structure() {
       (.upstream | valid_upstream)) and
     all(.state.rule_presets[];
       (.name | type == "string" and test("^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$")) and
-      (.url | type == "string" and test("^https://") and test("\\.(srs|json)([?#].*)?$"))) and
+      valid_rule_source) and
     all(.nfuse_usage[];
       (.name|type=="string" and length>0) and
       (.used_bytes|type=="number") and
       (.used_bytes == (.used_bytes|floor)) and .used_bytes>=0)
   ' "$payload" >/dev/null || return 1
+  # 远程地址要逐条确认指向公网；本机规则文件名没有这个问题，
+  # 结构校验里已经把它限制成一个文件名（不含斜杠、不含 ..），
+  # 而「文件在不在」由恢复之后的分流重建负责报，迁移包里本来就不带那个文件。
   while IFS= read -r rule_url; do
     [[ -n "$rule_url" ]] || continue
     validate_public_rule_set_url "$rule_url" || return 1
-  done < <(jq -r '.state.splits[]?.url, .state.rule_presets[]?.url' "$payload")
+  done < <(jq -r '.state.splits[]?.url // empty, .state.rule_presets[]?.url // empty' "$payload")
 }
 
 inspect_migration_bundle_with_password() {
@@ -1039,7 +1051,7 @@ build_merge_migration_payload() {
     preset_name="$(jq -r '.name' <<<"$incoming")"
     mapped_preset="$preset_name"
     if jq -e --arg name "$preset_name" '.state.rule_presets[]? | select(.name == $name)' "$output" >/dev/null; then
-      if SB_JQ_INCOMING="$incoming" jq -e --arg name "$preset_name" '($ENV.SB_JQ_INCOMING | fromjson) as $incoming | .state.rule_presets[] | select(.name == $name and .url == $incoming.url)' "$output" >/dev/null; then
+      if SB_JQ_INCOMING="$incoming" jq -e --arg name "$preset_name" '($ENV.SB_JQ_INCOMING | fromjson) as $incoming | .state.rule_presets[] | select(.name == $name and (.url // .rule_file) == ($incoming.url // $incoming.rule_file) and (.rule_behavior // "") == ($incoming.rule_behavior // ""))' "$output" >/dev/null; then
         migration_update_json_file "$output" '.merge_summary.rule_presets.deduplicated += 1' || return 1
       else
         unique_name="$(migration_unique_preset_name "$output" rule_presets "$preset_name")" || return 1

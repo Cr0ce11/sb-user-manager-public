@@ -122,14 +122,19 @@ EOF
 
 # mihomo 的服务单元。与 sing-box 单元的三处实质差别：
 # 1. 命令行是 `-d 工作目录 -f 配置`，不是 `-c 配置`。
-# 2. 需要 SAFE_PATHS：mihomo 默认拒绝加载工作目录之外的证书，而管理器的
-#    AnyTLS 证书目录早于 mihomo 支持存在（公开 Issue #154 实测确认，
-#    且该限制在 `mihomo -t` 阶段完全不暴露，只有真正启动监听器时才报错）。
+# 2. 需要 SAFE_PATHS，而且是两条：mihomo 默认拒绝加载工作目录之外的文件。
+#    一条是管理器的 AnyTLS 证书目录（公开 Issue #154，该限制只在真正启动
+#    监听器时才报错，`mihomo -t` 完全测不出）；另一条是使用者自己的分流规则
+#    目录（公开 Issue #186，这一条反而在 `mihomo -t` 阶段就当场拒绝）。
+#    分隔符是冒号——实测逗号不认，会被当成路径的一部分。
 # 3. 不写 ExecReload：本项目从不执行 systemctl reload，写一条未经验证的重载
 #    命令等于给出一个没验过的承诺。
-# heredoc 刻意不加引号：SAFE_PATHS 要跟着证书目录走，来源与别处同一个。
+# heredoc 刻意不加引号：SAFE_PATHS 的取值来自 mihomo_safe_paths，与管理器自己
+# 跑 `mihomo -t` 时用的是同一份。
 # 因此往这段单元里加内容时不能出现 $ —— sing-box 单元里的 $MAINPID 就是反例。
 write_mihomo_unit() {
+  local safe_paths
+  safe_paths="$(mihomo_safe_paths)" || return 1
   cat > "$(system_path /etc/systemd/system/mihomo.service)" <<EOF || return 1
 [Unit]
 Description=mihomo service
@@ -139,7 +144,7 @@ Wants=network-online.target
 Type=simple
 User=root
 StateDirectory=mihomo
-Environment=SAFE_PATHS=$CERT_DIR
+Environment=SAFE_PATHS=$safe_paths
 ExecStart=/usr/local/bin/mihomo -d /var/lib/mihomo -f /etc/mihomo/config.json
 Restart=on-failure
 RestartSec=10s
@@ -2179,6 +2184,10 @@ deploy_environment() {
     # 目录会由 `mihomo -t` 顺手创建，权限与创建时机都不在我们手里。
     run_step_or_rollback rollback_deploy install -d -m 700 /etc/mihomo || return 1
     run_step_or_rollback rollback_deploy install -d -m 755 "$MIHOMO_WORK_DIR" || return 1
+    # 使用者自己放分流规则文件的目录。管理器建它、读它，但永远不写里面的文件。
+    # 它必须与单元里 SAFE_PATHS 的第二条一字不差，否则 mihomo 当场拒绝加载配置。
+    # 权限 755 而不是 700：这些是使用者要自己放进来的文件，不是管理器的数据。
+    run_step_or_rollback rollback_deploy install -d -m 755 "$MIHOMO_RULES_DIR" || return 1
   fi
   if [[ "$fresh" == true ]]; then
     run_step_or_rollback rollback_deploy write_manager_config || return 1

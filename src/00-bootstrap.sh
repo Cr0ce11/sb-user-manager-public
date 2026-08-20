@@ -78,6 +78,27 @@ resolve_manager_data_paths() {
 }
 resolve_manager_data_paths
 
+# mihomo 部署下，使用者自己的分流规则文件放在这里。管理器建这个目录、
+# 读里面的文件，但**永远不写它们**——那是使用者从社区抄来的片段。
+# 与 mihomo 配置文件同目录派生，不单独做成配置项：这个目录必须与 systemd
+# 单元里的 SAFE_PATHS 一字不差，而 mihomo 会当场拒绝加载允许范围之外的
+# 规则文件（公开 Issue #186 实测；这一点比证书那条严，证书要到启动才报）。
+# 两个可以各自设置的值迟早会不一致，而不一致的后果是配置根本加载不了。
+resolve_mihomo_paths() {
+  MIHOMO_RULES_DIR="${MIHOMO_CONFIG%/*}/rules"
+}
+resolve_mihomo_paths
+
+# mihomo 允许读取的目录清单，冒号分隔（实测逗号不认，会被当成路径的一部分）。
+# systemd 单元与管理器自己跑的配置校验必须用**同一份**：单元给服务用，
+# 这一份给 `mihomo -t` 用。两边不一致会出现自相矛盾的失败——管理器说配置
+# 不可用、拒绝操作，而服务其实跑得起来。证书那条从来没暴露过这个问题，
+# 因为 `mihomo -t` 根本不检查证书路径；规则文件路径它却当场就查
+# （公开 Issue #186）。
+mihomo_safe_paths() {
+  printf '%s:%s' "$CERT_DIR" "$MIHOMO_RULES_DIR"
+}
+
 manager_file_uid() {
   stat -c '%u' -- "$1" 2>/dev/null || stat -f '%u' "$1" 2>/dev/null
 }
@@ -178,6 +199,7 @@ load_runtime_config() {
   : "${MIHOMO_CONFIG:=/etc/mihomo/config.json}"
   : "${MIHOMO_SERVICE:=mihomo}"
   : "${MIHOMO_WORK_DIR:=/var/lib/mihomo}"
+  resolve_mihomo_paths
   : "${NFUSE_BIN:=/usr/local/bin/nfuse}"
   : "${NFUSE_SOCKET:=/run/nfuse.sock}"
   : "${NFUSE_DB:=/var/lib/nfuse/nfuse.db}"
