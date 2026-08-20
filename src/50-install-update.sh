@@ -215,6 +215,78 @@ write_systemd_units() {
   write_expiry_units || return 1
 }
 
+# 机器上活着的 systemd 单元与「当前版本应该写出的」是否一致。
+#
+# 单元只在全新部署、接管既有安装、以及「修复缺失内容」这三条路径上写出，
+# **升级脚本从来不会刷新它们**：一台完整部署的机器进「安装或修复环境」会被
+# 直接告知「安装完整，无需重复部署」然后原样返回（公开 Issue #190）。
+# 因此新版本改了单元内容时，存量机器会静静地落在旧单元上，而管理器按新单元的
+# 假设行事——第二步 2d 撞到过一次这个形状的问题（mihomo 单元的 SAFE_PATHS）。
+#
+# 这里只查不改：重写单元必然意味着一次服务重启，那不能在只读的审计里做，
+# 交给「自动修复」那条通路——它本来就会先做完整环境备份、再改、再重启。
+#
+# 输出每行一个不一致的单元路径；全部一致时无输出。
+# 返回 2 表示查不了（识别不出默认网络接口），调用点据此报「未能核对」而不是
+# 报「不一致」——把「不知道」说成「不一致」会让人去修一个并不存在的问题。
+collect_unit_drift_rows() {
+  local iface work path live expected rc=0 any_unit=false previous_root
+  # 一个托管单元都没有的机器不是「漂移」，是没部署——那由环境分类那一侧管。
+  # 这条判断同时让这项检查在没有部署环境的场合安静下来，不去报一堆
+  # 「单元与当前版本不一致」，那种输出只会把真正的问题淹掉。
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    [[ -f "$(system_path "$path")" ]] || continue
+    any_unit=true
+    break
+  done <<<"$(managed_unit_paths)"
+  [[ "$any_unit" == true ]] || return 0
+  iface="$(default_network_interface)" || return 2
+  [[ -n "$iface" ]] || return 2
+  work="$(mktemp -d /tmp/sb-unit-drift.XXXXXX)" || return 1
+  register_temp_path "$work"
+  # 借 SB_SYSTEM_ROOT 把生成结果落到临时目录，而不是另写一份「期望的单元」
+  # ——那等于把单元内容抄成两份，迟早只改一处。
+  # 不放在子 shell 里改这个变量：那样 shellcheck 会认为函数外面对它的读取
+  # 「可能拿不到修改」（SC2030/SC2031），而这里本来就不该影响外面。
+  # 因此显式存回原值，失败路径也要走到那一步，所以先收 rc 再判断。
+  previous_root="${SB_SYSTEM_ROOT:-}"
+  SB_SYSTEM_ROOT="$work"
+  install -d -m 755 "$work/etc/systemd/system" && write_systemd_units "$iface"
+  rc=$?
+  SB_SYSTEM_ROOT="$previous_root"
+  if ((rc != 0)); then
+    rm -rf -- "$work"
+    unregister_temp_path "$work" || true
+    return 1
+  fi
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    live="$(system_path "$path")"
+    expected="$work$path"
+    [[ -f "$expected" ]] || continue
+    if [[ ! -f "$live" ]] || ! cmp -s "$live" "$expected"; then
+      printf '%s
+' "$path"
+    fi
+  done <<<"$(managed_unit_paths)"
+  rm -rf -- "$work" || rc=1
+  unregister_temp_path "$work" || rc=1
+  return "$rc"
+}
+
+# write_systemd_units 会写出的全部单元。审计按这一份逐个比对，
+# 因此新增一个单元时**必须**同时加进这里，否则那个单元永远不会被核对到。
+# 单元测试对每一个都做过「改一处内容 → 审计必须报出来」。
+managed_unit_paths() {
+  local kernel_service
+  kernel_service="$(kernel_service_name)" || return 1
+  printf '/etc/systemd/system/%s.service\n' "$kernel_service"
+  printf '%s\n' /etc/systemd/system/nfuse.service \
+    /etc/systemd/system/sb-user-expiry.service \
+    /etc/systemd/system/sb-user-expiry.timer
+}
+
 install_prerequisites() {
   log "检查并安装系统依赖"
   apt-get update || return 1

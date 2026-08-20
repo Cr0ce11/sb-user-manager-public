@@ -8137,6 +8137,78 @@ write_systemd_units() {
   write_expiry_units || return 1
 }
 
+# 机器上活着的 systemd 单元与「当前版本应该写出的」是否一致。
+#
+# 单元只在全新部署、接管既有安装、以及「修复缺失内容」这三条路径上写出，
+# **升级脚本从来不会刷新它们**：一台完整部署的机器进「安装或修复环境」会被
+# 直接告知「安装完整，无需重复部署」然后原样返回（公开 Issue #190）。
+# 因此新版本改了单元内容时，存量机器会静静地落在旧单元上，而管理器按新单元的
+# 假设行事——第二步 2d 撞到过一次这个形状的问题（mihomo 单元的 SAFE_PATHS）。
+#
+# 这里只查不改：重写单元必然意味着一次服务重启，那不能在只读的审计里做，
+# 交给「自动修复」那条通路——它本来就会先做完整环境备份、再改、再重启。
+#
+# 输出每行一个不一致的单元路径；全部一致时无输出。
+# 返回 2 表示查不了（识别不出默认网络接口），调用点据此报「未能核对」而不是
+# 报「不一致」——把「不知道」说成「不一致」会让人去修一个并不存在的问题。
+collect_unit_drift_rows() {
+  local iface work path live expected rc=0 any_unit=false previous_root
+  # 一个托管单元都没有的机器不是「漂移」，是没部署——那由环境分类那一侧管。
+  # 这条判断同时让这项检查在没有部署环境的场合安静下来，不去报一堆
+  # 「单元与当前版本不一致」，那种输出只会把真正的问题淹掉。
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    [[ -f "$(system_path "$path")" ]] || continue
+    any_unit=true
+    break
+  done <<<"$(managed_unit_paths)"
+  [[ "$any_unit" == true ]] || return 0
+  iface="$(default_network_interface)" || return 2
+  [[ -n "$iface" ]] || return 2
+  work="$(mktemp -d /tmp/sb-unit-drift.XXXXXX)" || return 1
+  register_temp_path "$work"
+  # 借 SB_SYSTEM_ROOT 把生成结果落到临时目录，而不是另写一份「期望的单元」
+  # ——那等于把单元内容抄成两份，迟早只改一处。
+  # 不放在子 shell 里改这个变量：那样 shellcheck 会认为函数外面对它的读取
+  # 「可能拿不到修改」（SC2030/SC2031），而这里本来就不该影响外面。
+  # 因此显式存回原值，失败路径也要走到那一步，所以先收 rc 再判断。
+  previous_root="${SB_SYSTEM_ROOT:-}"
+  SB_SYSTEM_ROOT="$work"
+  install -d -m 755 "$work/etc/systemd/system" && write_systemd_units "$iface"
+  rc=$?
+  SB_SYSTEM_ROOT="$previous_root"
+  if ((rc != 0)); then
+    rm -rf -- "$work"
+    unregister_temp_path "$work" || true
+    return 1
+  fi
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    live="$(system_path "$path")"
+    expected="$work$path"
+    [[ -f "$expected" ]] || continue
+    if [[ ! -f "$live" ]] || ! cmp -s "$live" "$expected"; then
+      printf '%s
+' "$path"
+    fi
+  done <<<"$(managed_unit_paths)"
+  rm -rf -- "$work" || rc=1
+  unregister_temp_path "$work" || rc=1
+  return "$rc"
+}
+
+# write_systemd_units 会写出的全部单元。审计按这一份逐个比对，
+# 因此新增一个单元时**必须**同时加进这里，否则那个单元永远不会被核对到。
+# 单元测试对每一个都做过「改一处内容 → 审计必须报出来」。
+managed_unit_paths() {
+  local kernel_service
+  kernel_service="$(kernel_service_name)" || return 1
+  printf '/etc/systemd/system/%s.service\n' "$kernel_service"
+  printf '%s\n' /etc/systemd/system/nfuse.service \
+    /etc/systemd/system/sb-user-expiry.service \
+    /etc/systemd/system/sb-user-expiry.timer
+}
+
 install_prerequisites() {
   log "检查并安装系统依赖"
   apt-get update || return 1
@@ -11578,6 +11650,7 @@ audit_consistency() {
   local config_json nfuse_json skeleton_missing_rows skeleton_path user_issue_rows issue_repairable issue_message expiry_rows split_rows split name split_status rule_tag out_tag scope scope_user scope_user_status scope_tags expires
   local preset_link_rows preset_kind preset_reason managed_tags legacy_cleanup legacy_count
   local normalise_program skeleton_program skeleton_filter sub_rule_name managed_lines
+  local unit_drift_rows unit_path unit_drift_rc=0
   AUDIT_ISSUES=0
   AUDIT_REPAIRABLE=0
   config_json="$(kernel_normalized_config)" || return 1
@@ -11737,6 +11810,24 @@ audit_consistency() {
     ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
   fi
 
+  # systemd 单元只在部署、接管与修复三条路径上写出，升级脚本从来不刷新它们
+  # （公开 Issue #190）。因此新版本改了单元内容时，存量机器会静静地落在旧单元
+  # 上；这里把差异查出来，改由「自动修复」去写——重写单元必然要重启服务。
+  unit_drift_rows="$(collect_unit_drift_rows)" || unit_drift_rc=$?
+  if [[ "${unit_drift_rc:-0}" == 2 ]]; then
+    printf '  [需要处理] 无法识别默认网络接口，未能核对服务单元\n'
+    ((AUDIT_ISSUES+=1))
+  elif [[ "${unit_drift_rc:-0}" != 0 ]]; then
+    printf '  [需要处理] 未能生成用于比对的服务单元，本项未执行\n'
+    ((AUDIT_ISSUES+=1))
+  else
+    while IFS= read -r unit_path; do
+      [[ -n "$unit_path" ]] || continue
+      printf '  [可自动修复] 服务单元 %s 与当前版本不一致\n' "$unit_path"
+      ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
+    done <<<"$unit_drift_rows"
+  fi
+
   if ((AUDIT_ISSUES==0)); then echo '  一切正常：用户、分流、连接配置和流量统计相互一致。'
   else printf '\n共发现 %d 个问题，其中 %d 个可以自动修复。\n' "$AUDIT_ISSUES" "$AUDIT_REPAIRABLE"
   fi
@@ -11745,6 +11836,15 @@ audit_consistency() {
 repair_consistency() {
   local environment_backup nfuse_json user_rows split_rows parsed user name status port metered fragment limit anchor expected_tier
   local split split_status scope scope_user url upstream out_tag rule_tag
+  local unit_drift="" unit_iface=""
+  # 单元的比对在改动任何东西之前做完：修复流程后面会重启服务，
+  # 那时再去比对读到的已经不是「修复前的样子」。
+  if unit_drift="$(collect_unit_drift_rows)" && [[ -n "$unit_drift" ]]; then
+    unit_iface="$(default_network_interface)" || unit_drift=""
+    [[ -n "$unit_iface" ]] || unit_drift=""
+  else
+    unit_drift=""
+  fi
   nfuse_json="$(nfuse list --json)" || return 1
   jq -e 'type == "array"' <<<"$nfuse_json" >/dev/null || return 1
   user_rows="$(jq -c '.users[]' "$STATE_FILE")" || return 1
@@ -11822,6 +11922,14 @@ repair_consistency() {
   done <<<"$split_rows"
   run_managed_step rebuild_all_split_configs || return 1
   run_managed_step nfuse persist || return 1
+  # 单元与当前版本不一致时重写它们。写完必须 daemon-reload 并重新激活，
+  # 否则 systemd 仍按旧单元跑，审计下一次还会报同一条——「修了但没生效」
+  # 比没修更难查。重新激活走的正是部署时用的那一套顺序。
+  # 识别不出默认网络接口时不写：那种情况下 nfuse 的单元会指向一个错的接口。
+  if [[ -n "$unit_drift" ]]; then
+    run_managed_step write_systemd_units "$unit_iface" || return 1
+    run_managed_step activate_managed_services || return 1
+  fi
   run_managed_step check_singbox_and_restart || return 1
   finish_managed_operation || return 1
   log "服务与配置已自动修复；修复前完整备份：$environment_backup"

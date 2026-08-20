@@ -840,6 +840,7 @@ audit_consistency() {
   local config_json nfuse_json skeleton_missing_rows skeleton_path user_issue_rows issue_repairable issue_message expiry_rows split_rows split name split_status rule_tag out_tag scope scope_user scope_user_status scope_tags expires
   local preset_link_rows preset_kind preset_reason managed_tags legacy_cleanup legacy_count
   local normalise_program skeleton_program skeleton_filter sub_rule_name managed_lines
+  local unit_drift_rows unit_path unit_drift_rc=0
   AUDIT_ISSUES=0
   AUDIT_REPAIRABLE=0
   config_json="$(kernel_normalized_config)" || return 1
@@ -999,6 +1000,24 @@ audit_consistency() {
     ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
   fi
 
+  # systemd 单元只在部署、接管与修复三条路径上写出，升级脚本从来不刷新它们
+  # （公开 Issue #190）。因此新版本改了单元内容时，存量机器会静静地落在旧单元
+  # 上；这里把差异查出来，改由「自动修复」去写——重写单元必然要重启服务。
+  unit_drift_rows="$(collect_unit_drift_rows)" || unit_drift_rc=$?
+  if [[ "${unit_drift_rc:-0}" == 2 ]]; then
+    printf '  [需要处理] 无法识别默认网络接口，未能核对服务单元\n'
+    ((AUDIT_ISSUES+=1))
+  elif [[ "${unit_drift_rc:-0}" != 0 ]]; then
+    printf '  [需要处理] 未能生成用于比对的服务单元，本项未执行\n'
+    ((AUDIT_ISSUES+=1))
+  else
+    while IFS= read -r unit_path; do
+      [[ -n "$unit_path" ]] || continue
+      printf '  [可自动修复] 服务单元 %s 与当前版本不一致\n' "$unit_path"
+      ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
+    done <<<"$unit_drift_rows"
+  fi
+
   if ((AUDIT_ISSUES==0)); then echo '  一切正常：用户、分流、连接配置和流量统计相互一致。'
   else printf '\n共发现 %d 个问题，其中 %d 个可以自动修复。\n' "$AUDIT_ISSUES" "$AUDIT_REPAIRABLE"
   fi
@@ -1007,6 +1026,15 @@ audit_consistency() {
 repair_consistency() {
   local environment_backup nfuse_json user_rows split_rows parsed user name status port metered fragment limit anchor expected_tier
   local split split_status scope scope_user url upstream out_tag rule_tag
+  local unit_drift="" unit_iface=""
+  # 单元的比对在改动任何东西之前做完：修复流程后面会重启服务，
+  # 那时再去比对读到的已经不是「修复前的样子」。
+  if unit_drift="$(collect_unit_drift_rows)" && [[ -n "$unit_drift" ]]; then
+    unit_iface="$(default_network_interface)" || unit_drift=""
+    [[ -n "$unit_iface" ]] || unit_drift=""
+  else
+    unit_drift=""
+  fi
   nfuse_json="$(nfuse list --json)" || return 1
   jq -e 'type == "array"' <<<"$nfuse_json" >/dev/null || return 1
   user_rows="$(jq -c '.users[]' "$STATE_FILE")" || return 1
@@ -1084,6 +1112,14 @@ repair_consistency() {
   done <<<"$split_rows"
   run_managed_step rebuild_all_split_configs || return 1
   run_managed_step nfuse persist || return 1
+  # 单元与当前版本不一致时重写它们。写完必须 daemon-reload 并重新激活，
+  # 否则 systemd 仍按旧单元跑，审计下一次还会报同一条——「修了但没生效」
+  # 比没修更难查。重新激活走的正是部署时用的那一套顺序。
+  # 识别不出默认网络接口时不写：那种情况下 nfuse 的单元会指向一个错的接口。
+  if [[ -n "$unit_drift" ]]; then
+    run_managed_step write_systemd_units "$unit_iface" || return 1
+    run_managed_step activate_managed_services || return 1
+  fi
   run_managed_step check_singbox_and_restart || return 1
   finish_managed_operation || return 1
   log "服务与配置已自动修复；修复前完整备份：$environment_backup"

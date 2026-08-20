@@ -9266,4 +9266,99 @@ YAML
   fi
 )
 
+# ============================================================
+# 服务单元漂移的检查与修复（公开 Issue #190）
+# ============================================================
+# 单元只在部署、接管与「修复缺失内容」三条路径上写出，升级脚本从来不刷新它们。
+# 因此新版本改了单元内容时，存量机器会静静地落在旧单元上。这一组锁住三件事：
+# 一致时不报（否则每台正常机器天天喊）、四个单元各自改一处都报得出来、
+# 以及识别不出网络接口时说「未能核对」而不是说「不一致」。
+(
+  unit_root="$work/unit-drift"
+  mkdir -p "$unit_root/etc/systemd/system"
+  SB_SYSTEM_ROOT="$unit_root"
+  PROXY_KERNEL=singbox
+  STATE_FILE="$work/unit-drift-state.json"
+  SINGBOX_CONFIG="$work/unit-drift-config.json"
+  SINGBOX_BIN=unit_drift_singbox
+  unit_drift_singbox() {
+    [[ "${1:-}" == format && "${2:-}" == -c && "${3:-}" == "$SINGBOX_CONFIG" ]] || return 1
+    command cat "$SINGBOX_CONFIG"
+  }
+  nfuse() { [[ "${1:-}" == list && "${2:-}" == --json ]] || return 1; printf '[]\n'; }
+  default_network_interface() { printf 'eth0\n'; }
+  printf '%s\n' '{"schema_version":7,"users":[],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
+  printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rule_set":[],"rules":[]}}' > "$SINGBOX_CONFIG"
+  apply_skeleton_to_test_config
+  write_systemd_units eth0
+
+  # 对照：单元与生成结果一致时一个字都不该说。
+  audit_consistency > "$work/unit-drift-clean"
+  if [[ "$AUDIT_ISSUES" != 0 ]]; then
+    echo '单元与当前版本一致时，审计不得报出任何东西' >&2
+    cat "$work/unit-drift-clean" >&2
+    exit 1
+  fi
+
+  # 四个单元逐个改一处，每次都必须精确报出被改的那一个。
+  # 漏掉任何一个就意味着它永远不会被核对到——这正是 Issue #190 要防的事。
+  while IFS= read -r unit_path; do
+    [[ -n "$unit_path" ]] || continue
+    printf '# drifted\n' >> "$unit_root$unit_path"
+    audit_consistency > "$work/unit-drift-broken"
+    if [[ "$AUDIT_ISSUES" != 1 ]] ||
+       ! grep -Fq "[可自动修复] 服务单元 $unit_path 与当前版本不一致" "$work/unit-drift-broken"; then
+      printf '改动单元 %s 之后审计必须精确报出它：\n' "$unit_path" >&2
+      cat "$work/unit-drift-broken" >&2
+      exit 1
+    fi
+    write_systemd_units eth0
+  done <<<"$(managed_unit_paths)"
+
+  # 单元整个不见时同样要报——只要机器上还有别的托管单元在，就说明这台机器是
+  # 部署过的，那个不见的就是真缺项。
+  rm -f "$unit_root/etc/systemd/system/nfuse.service"
+  audit_consistency > "$work/unit-drift-missing"
+  if ! grep -Fq '[可自动修复] 服务单元 /etc/systemd/system/nfuse.service 与当前版本不一致' "$work/unit-drift-missing"; then
+    echo '单元文件缺失时必须报出来' >&2
+    cat "$work/unit-drift-missing" >&2
+    exit 1
+  fi
+  write_systemd_units eth0
+
+  # 但一个托管单元都没有时必须安静：那不是漂移，是没部署，由环境分类那一侧管。
+  # 不这样分，任何没有部署环境的场合都会被刷一屏「单元与当前版本不一致」，
+  # 把真正的问题淹掉。
+  rm -f "$unit_root/etc/systemd/system/"*.service "$unit_root/etc/systemd/system/"*.timer
+  audit_consistency > "$work/unit-drift-none"
+  if [[ "$AUDIT_ISSUES" != 0 ]]; then
+    echo '一个托管单元都没有时，单元核对必须安静' >&2
+    cat "$work/unit-drift-none" >&2
+    exit 1
+  fi
+  write_systemd_units eth0
+
+  # 识别不出默认网络接口时，说的必须是「未能核对」而不是「不一致」——
+  # 把「不知道」说成「不一致」会让人去修一个并不存在的问题。
+  default_network_interface() { return 1; }
+  audit_consistency > "$work/unit-drift-noiface"
+  if ! grep -Fq '[需要处理] 无法识别默认网络接口，未能核对服务单元' "$work/unit-drift-noiface" ||
+     grep -Fq '与当前版本不一致' "$work/unit-drift-noiface"; then
+    echo '识别不出网络接口时必须说「未能核对」，不得报成不一致' >&2
+    cat "$work/unit-drift-noiface" >&2
+    exit 1
+  fi
+  default_network_interface() { printf 'eth0\n'; }
+
+  # 核对清单必须随内核变：两个内核的内核服务单元不是同一个文件。
+  singbox_units="$(managed_unit_paths)"
+  mihomo_units="$(PROXY_KERNEL=mihomo; managed_unit_paths)"
+  if [[ "$singbox_units" == "$mihomo_units" ]] ||
+     ! grep -Fxq /etc/systemd/system/sing-box.service <<<"$singbox_units" ||
+     ! grep -Fxq /etc/systemd/system/mihomo.service <<<"$mihomo_units"; then
+    echo '要核对的单元清单必须随内核变，且各自包含自己的内核服务单元' >&2
+    exit 1
+  fi
+)
+
 echo 'unit checks passed'
