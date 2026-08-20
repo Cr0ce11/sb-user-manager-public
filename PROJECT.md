@@ -40,7 +40,7 @@
 | 最新正式版 | v4.25.13 |
 | 主开发分支 | `main` |
 | 正式支持环境 | Debian 12 x86_64 |
-| 测试环境 | 当前没有专用测试服务器；发布采用本地门禁与公开仓库 GitHub CI 验收 |
+| 测试环境 | 开发机上的本地 OrbStack 测试机（Debian 12 x86_64，完整 systemd）；已验证安装、服务启停、Nfuse 的 nftables 计量与配额规则、一致性检查，`lifecycle`、`full` 与迁移恢复演练尚未在其中实测，能力范围与限制见 [公开 Issue #139](https://github.com/Cr0ce11/sb-user-manager-public/issues/139)。发布仍以本地门禁与公开仓库 GitHub CI 为基础 |
 | 正式环境 | 各服务器已统一升级到 v4.25.11，并已确认「分流尚未覆盖用户的全部连接」误报不再出现（[公开 Issue #120](https://github.com/Cr0ce11/sb-user-manager-public/issues/120)）；此前 v4.25.8 的升级与迁移备份验证记录见 [公开 Issue #100](https://github.com/Cr0ce11/sb-user-manager-public/issues/100)，v4.25.7 的升级与只读自检记录见 [公开 Issue #69](https://github.com/Cr0ce11/sb-user-manager-public/issues/69)。历次升级均由项目所有者自行执行，仓库侧未登录复核，因此没有仓库可核对的验收报告。首次上线记录见 Issue #96（地址和凭据不进入仓库） |
 | 发布形态 | `Cr0ce11/sb-user-manager-public` 是唯一正式仓库；开发、Issue、Pull Request、完整 CI、匿名在线更新和不可变 Release 全部在这里完成 |
 | 阶段 0 | 已完成（Issue #46，经 PR #47 合并） |
@@ -61,7 +61,7 @@
 
 ## 上线状态
 
-v4.18.1 已按原私有 Issue #96 完成首台正式服务器上线。上线前预检、固定 Release 全新部署、真实 AnyTLS 与 SS2022 + ShadowTLS 客户端 TCP/UDP、Nfuse 用量联动、上线后 30 分钟和 24 小时观察均已通过；最终 `release` 只读验收失败项为 0，观察期内没有服务异常重启或相关错误。首次上线任务已经关闭，项目进入阶段 3 的上线后维护。此后各服务器于 v4.25.7 发布后由项目所有者统一升级并确认只读自检正常（[公开 Issue #69](https://github.com/Cr0ce11/sb-user-manager-public/issues/69)），于 v4.25.8 发布后再次统一升级、验证迁移备份可正常生成（[公开 Issue #100](https://github.com/Cr0ce11/sb-user-manager-public/issues/100)），并于 v4.25.11 发布后再次统一升级、确认一致性检查误报不再出现（[公开 Issue #120](https://github.com/Cr0ce11/sb-user-manager-public/issues/120)）；专用测试服务器已经弃用，v4.23.0 至 v4.25.13 仅采用本地门禁与 GitHub CI 验收，仓库侧没有在本轮治理中登录或修改服务器。当前公开仓库没有已知未解决的 P0/P1 运行缺陷；Mihomo 导出候选需求已迁到公开 [Issue #16](https://github.com/Cr0ce11/sb-user-manager-public/issues/16)，SEC-001 继续暂缓。后续正式环境变更仍需建立独立公开 Issue、准备回退方式并取得项目所有者明确授权。
+v4.18.1 已按原私有 Issue #96 完成首台正式服务器上线。上线前预检、固定 Release 全新部署、真实 AnyTLS 与 SS2022 + ShadowTLS 客户端 TCP/UDP、Nfuse 用量联动、上线后 30 分钟和 24 小时观察均已通过；最终 `release` 只读验收失败项为 0，观察期内没有服务异常重启或相关错误。首次上线任务已经关闭，项目进入阶段 3 的上线后维护。此后各服务器于 v4.25.7 发布后由项目所有者统一升级并确认只读自检正常（[公开 Issue #69](https://github.com/Cr0ce11/sb-user-manager-public/issues/69)），于 v4.25.8 发布后再次统一升级、验证迁移备份可正常生成（[公开 Issue #100](https://github.com/Cr0ce11/sb-user-manager-public/issues/100)），并于 v4.25.11 发布后再次统一升级、确认一致性检查误报不再出现（[公开 Issue #120](https://github.com/Cr0ce11/sb-user-manager-public/issues/120)）；远程专用测试服务器已经弃用，v4.23.0 至 v4.25.13 采用本地门禁与 GitHub CI 验收；自 v4.25.13 起另有开发机上的本地 OrbStack 测试机可用于真机验收（[公开 Issue #139](https://github.com/Cr0ce11/sb-user-manager-public/issues/139)），仓库侧没有在本轮治理中登录或修改服务器。当前公开仓库没有已知未解决的 P0/P1 运行缺陷；Mihomo 导出候选需求已迁到公开 [Issue #16](https://github.com/Cr0ce11/sb-user-manager-public/issues/16)，SEC-001 继续暂缓。后续正式环境变更仍需建立独立公开 Issue、准备回退方式并取得项目所有者明确授权。
 
 ## 如何更新本文件
 
