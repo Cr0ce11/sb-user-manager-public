@@ -6939,11 +6939,27 @@ EOF
   fi
 }
 
+# 查询 GitHub API。所有 API 请求都必须经过这里，静态门禁看守该约定。
+# --retry-all-errors 是必需的：curl 的 --retry 只覆盖超时、连接被拒和部分 5xx，
+# 不覆盖退出码 35 一类的 TLS 握手失败。链路中有代理客户端时这种瞬时失败并不罕见，
+# 而安装与更新是长流程，一次抖动会让整个已开启的事务回滚重来。
+# 第一个参数是 URL，其余参数原样传给 curl；URL 保持在 argv 末尾，
+# 便于调用点追加额外请求头而不改变参数顺序。
 github_api_get() {
   local url="$1"
+  shift
   curl --proto '=https' --proto-redir '=https' --max-redirs 5 \
-    --connect-timeout 10 --max-time 30 -fsSL --retry 3 \
-    -H 'Accept: application/vnd.github+json' "$url"
+    --connect-timeout 10 --max-time 30 -fsSL --retry 3 --retry-all-errors \
+    -H 'Accept: application/vnd.github+json' "$@" "$url"
+}
+
+# 下载 Release 资产到指定路径。与 API 查询同理需要覆盖 TLS 瞬时失败；
+# 超时放宽到 300 秒是因为附件有几十兆。
+github_download_to() {
+  local target="$1" url="$2"
+  curl --proto '=https' --proto-redir '=https' --max-redirs 5 \
+    --connect-timeout 10 --max-time 300 -fL --retry 3 --retry-all-errors \
+    -o "$target" "$url"
 }
 
 singbox_release_metadata() {
@@ -7130,8 +7146,7 @@ prepare_singbox_release_binary() {
   install -d -m 700 "$target_dir" || return 1
   archive="$target_dir/$asset"
   binary="$target_dir/sing-box"
-  if ! curl --proto '=https' --proto-redir '=https' --max-redirs 5 \
-     --connect-timeout 10 --max-time 300 -fL --retry 3 -o "$archive" "$url" ||
+  if ! github_download_to "$archive" "$url" ||
      ! printf '%s  %s\n' "$sha256" "$archive" | sha256sum -c - >/dev/null; then
     return 1
   fi
@@ -7355,11 +7370,9 @@ EOF
 
 fetch_latest_manager_release() {
   local manager_json
-  manager_json="$(curl --proto '=https' --proto-redir '=https' --max-redirs 5 \
-    --connect-timeout 10 --max-time 30 -fsSL --retry 3 \
-    -H 'Accept: application/vnd.github+json' \
-    -H 'X-GitHub-Api-Version: 2022-11-28' \
-    "https://api.github.com/repos/${MANAGER_REPOSITORY}/releases/latest")" ||
+  manager_json="$(github_api_get \
+    "https://api.github.com/repos/${MANAGER_REPOSITORY}/releases/latest" \
+    -H 'X-GitHub-Api-Version: 2022-11-28')" ||
     die "无法查询管理脚本最新版本"
   LATEST_MANAGER_VERSION="$(jq -r '.tag_name // empty | sub("^v"; "")' <<<"$manager_json")"
   [[ -n "$LATEST_MANAGER_VERSION" ]] || die "管理脚本 Release 版本信息无效"
@@ -7369,12 +7382,8 @@ fetch_latest_manager_release() {
 
 fetch_latest_releases() {
   local include_manager="${1:-true}" sing_json nfuse_json sing_asset nfuse_asset
-  sing_json="$(curl --proto '=https' --proto-redir '=https' --max-redirs 5 \
-    --connect-timeout 10 --max-time 30 -fsSL --retry 3 \
-    -H 'Accept: application/vnd.github+json' https://api.github.com/repos/SagerNet/sing-box/releases/latest)" || die "无法查询 sing-box 最新版本"
-  nfuse_json="$(curl --proto '=https' --proto-redir '=https' --max-redirs 5 \
-    --connect-timeout 10 --max-time 30 -fsSL --retry 3 \
-    -H 'Accept: application/vnd.github+json' https://api.github.com/repos/sketchain/Nfuse/releases/latest)" || die "无法查询 Nfuse 最新版本"
+  sing_json="$(github_api_get https://api.github.com/repos/SagerNet/sing-box/releases/latest)" || die "无法查询 sing-box 最新版本"
+  nfuse_json="$(github_api_get https://api.github.com/repos/sketchain/Nfuse/releases/latest)" || die "无法查询 Nfuse 最新版本"
   LATEST_SINGBOX_VERSION="$(jq -r '.tag_name // empty | sub("^v"; "")' <<<"$sing_json")"
   LATEST_NFUSE_VERSION="$(jq -r '.tag_name // empty | sub("^v"; "")' <<<"$nfuse_json")"
   [[ -n "$LATEST_SINGBOX_VERSION" && -n "$LATEST_NFUSE_VERSION" ]] || die "GitHub Release 返回的版本信息无效"
@@ -7955,8 +7964,7 @@ download_binaries() {
   if [[ "$sing_current" != "$LATEST_SINGBOX_VERSION" ]]; then
     [[ "$LATEST_SINGBOX_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || return 1
     archive="sing-box-${LATEST_SINGBOX_VERSION}-linux-amd64.tar.gz"
-    curl --proto '=https' --proto-redir '=https' --max-redirs 5 \
-      --connect-timeout 10 --max-time 300 -fL --retry 3 -o "$work/$archive" "$LATEST_SINGBOX_URL" || return 1
+    github_download_to "$work/$archive" "$LATEST_SINGBOX_URL" || return 1
     printf '%s  %s\n' "$LATEST_SINGBOX_SHA256" "$work/$archive" | sha256sum -c - >/dev/null || return 1
     tar -xzf "$work/$archive" -C "$work" --no-same-owner \
       "sing-box-${LATEST_SINGBOX_VERSION}-linux-amd64/sing-box" || return 1
@@ -7966,8 +7974,7 @@ download_binaries() {
   fi
   if [[ "$nfuse_current" != "$LATEST_NFUSE_VERSION" ]]; then
     [[ "$LATEST_NFUSE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || return 1
-    curl --proto '=https' --proto-redir '=https' --max-redirs 5 \
-      --connect-timeout 10 --max-time 300 -fL --retry 3 -o "$work/nfuse.tar.gz" "$LATEST_NFUSE_URL" || return 1
+    github_download_to "$work/nfuse.tar.gz" "$LATEST_NFUSE_URL" || return 1
     printf '%s  %s\n' "$LATEST_NFUSE_SHA256" "$work/nfuse.tar.gz" | sha256sum -c - >/dev/null || return 1
     install -d -m 700 "$work/nfuse" || return 1
     tar -xzf "$work/nfuse.tar.gz" -C "$work/nfuse" --no-same-owner nfuse || return 1
@@ -7979,9 +7986,7 @@ download_binaries() {
 download_manager() {
   local work="$1" target="$2" downloaded_version
   [[ -n "${LATEST_MANAGER_URL:-}" ]] || die "最新 Release 缺少 ${MANAGER_ASSET} 附件"
-  curl --proto '=https' --proto-redir '=https' --max-redirs 5 \
-    --connect-timeout 10 --max-time 300 -fL --retry 3 \
-    -o "$work/$MANAGER_ASSET" "$LATEST_MANAGER_URL" || return 1
+  github_download_to "$work/$MANAGER_ASSET" "$LATEST_MANAGER_URL" || return 1
   printf '%s  %s\n' "$LATEST_MANAGER_SHA256" "$work/$MANAGER_ASSET" | sha256sum -c - >/dev/null || return 1
   bash -n "$work/$MANAGER_ASSET" || return 1
   downloaded_version="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)"/\1/p' "$work/$MANAGER_ASSET" | head -n1)"

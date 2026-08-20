@@ -124,7 +124,7 @@ awk '
   }
 
   function inspect(statement, line_number, next_statement) {
-    if (statement !~ /(^|[[:space:];|&!])(cat|chmod|chown|clear_environment_transaction|cp|curl|download_manager|install|ln|mv|register_temp_path|rm|sha256sum|sync_transaction_path|systemctl|tar|write_expiry_units|write_nfuse_unit|write_singbox_unit)([[:space:]]|$)/ &&
+    if (statement !~ /(^|[[:space:];|&!])(cat|chmod|chown|clear_environment_transaction|cp|curl|download_manager|github_api_get|github_download_to|install|ln|mv|register_temp_path|rm|sha256sum|sync_transaction_path|systemctl|tar|write_expiry_units|write_nfuse_unit|write_singbox_unit)([[:space:]]|$)/ &&
         statement !~ /openssl[[:space:]]+enc([[:space:]]|$)/) {
       return
     }
