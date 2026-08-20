@@ -28,6 +28,8 @@ init_state
 initialize_deployed_state
 install_manager_binary
 install_manager_shortcut
+kernel_check_config
+kernel_check_default_install
 load_runtime_config
 nfuse
 rebuild_all_split_configs

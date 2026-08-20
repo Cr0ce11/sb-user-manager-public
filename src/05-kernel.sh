@@ -9,3 +9,23 @@
 kernel_normalized_config() {
   "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG"
 }
+
+# 用当前安装的内核校验指定的配置文件。
+# 不内建输出重定向：各调用点对错误输出的处理不同（向用户显示、静默、捕获），
+# 由调用点自行决定。
+kernel_check_config() {
+  kernel_check_config_with "$SINGBOX_BIN" "$1" || return 1
+}
+
+# 用指定的内核可执行文件校验配置文件。
+# 切换正式版与测试版通道、以及接管既有安装时，需要用非当前的二进制校验。
+kernel_check_config_with() {
+  "$1" check -c "$2" || return 1
+}
+
+# 按标准绝对路径校验既有安装的配置。
+# 这里刻意不使用运行时配置里的路径：调用发生在环境探测与部署流程中，
+# 那时运行时配置可能尚未加载，而且这里要确认的正是标准位置上的部署是否可用。
+kernel_check_default_install() {
+  /usr/local/bin/sing-box check -c /etc/sing-box/config.json || return 1
+}

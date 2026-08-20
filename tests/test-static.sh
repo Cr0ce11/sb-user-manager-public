@@ -59,19 +59,22 @@ trap 'rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fix
 # 上游在小版本之间修改配置规范时，只应改适配层一处，而不是逐个模块跟进。
 # 说明：tests/ 下的直接调用是有意的，那里测的就是内核自身的行为。
 kernel_adapter_violations() {
-  grep -REn --include='*.sh' '"\$SINGBOX_BIN" format' "$1" | grep -v '/05-kernel\.sh:' || true
+  grep -REn --include='*.sh' '"\$SINGBOX_BIN" format|check -c' "$1" | grep -v '/05-kernel\.sh:' || true
 }
 if [[ -n "$(kernel_adapter_violations src)" ]]; then
   kernel_adapter_violations src >&2
-  echo 'kernel config reads must go through kernel_normalized_config in src/05-kernel.sh' >&2
+  echo 'kernel invocations must go through src/05-kernel.sh (kernel_normalized_config / kernel_check_config*)' >&2
   exit 1
 fi
 # 反面样本：确认该门禁在有人绕过适配层时确实会失败，而不是恒真断言。
-printf 'x() {\n  "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG"\n}\n' > "$kernel_adapter_fixture/90-bypass.sh"
-if [[ -z "$(kernel_adapter_violations "$kernel_adapter_fixture")" ]]; then
-  echo 'kernel adapter check must reject a direct kernel invocation outside the adapter' >&2
-  exit 1
-fi
+for kernel_adapter_bypass in '"$SINGBOX_BIN" format -c "$SINGBOX_CONFIG"' '"$SINGBOX_BIN" check -c "$SINGBOX_CONFIG"' '/usr/local/bin/sing-box check -c /etc/sing-box/config.json'; do
+  printf 'x() {\n  %s\n}\n' "$kernel_adapter_bypass" > "$kernel_adapter_fixture/90-bypass.sh"
+  if [[ -z "$(kernel_adapter_violations "$kernel_adapter_fixture")" ]]; then
+    printf 'kernel adapter check must reject a direct kernel invocation outside the adapter: %s\n' "$kernel_adapter_bypass" >&2
+    exit 1
+  fi
+done
+rm -f -- "$kernel_adapter_fixture/90-bypass.sh"
 
 sed '/^download_binaries() {/,/^}$/ {
   /LATEST_SINGBOX_URL/ s/ || return 1//

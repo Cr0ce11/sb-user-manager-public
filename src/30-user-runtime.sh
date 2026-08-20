@@ -1,7 +1,7 @@
 
 check_singbox_and_restart() {
   ensure_safe_ssh_for_singbox_restart rollback || return 1
-  "$SINGBOX_BIN" check -c "$SINGBOX_CONFIG" || return 1
+  kernel_check_config "$SINGBOX_CONFIG" || return 1
   systemctl reset-failed "$SINGBOX_SERVICE" 2>/dev/null || true
   systemctl restart "$SINGBOX_SERVICE" || return 1
   if ! systemctl is-active --quiet "$SINGBOX_SERVICE"; then

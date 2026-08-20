@@ -389,6 +389,26 @@ kernel_normalized_config() {
   "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG"
 }
 
+# 用当前安装的内核校验指定的配置文件。
+# 不内建输出重定向：各调用点对错误输出的处理不同（向用户显示、静默、捕获），
+# 由调用点自行决定。
+kernel_check_config() {
+  kernel_check_config_with "$SINGBOX_BIN" "$1" || return 1
+}
+
+# 用指定的内核可执行文件校验配置文件。
+# 切换正式版与测试版通道、以及接管既有安装时，需要用非当前的二进制校验。
+kernel_check_config_with() {
+  "$1" check -c "$2" || return 1
+}
+
+# 按标准绝对路径校验既有安装的配置。
+# 这里刻意不使用运行时配置里的路径：调用发生在环境探测与部署流程中，
+# 那时运行时配置可能尚未加载，而且这里要确认的正是标准位置上的部署是否可用。
+kernel_check_default_install() {
+  /usr/local/bin/sing-box check -c /etc/sing-box/config.json || return 1
+}
+
 is_ipv4_address() {
   local a b c d extra
   IFS=. read -r a b c d extra <<<"$1"
@@ -1045,7 +1065,7 @@ restore_backup() {
     log "严重错误：无法阶段化管理配置备份"
     return 1
   fi
-  if ! "$SINGBOX_BIN" check -c "$config_tmp"; then
+  if ! kernel_check_config "$config_tmp"; then
     rm -f -- "$config_tmp" "$state_tmp" "$previous_state" "$manager_tmp"
     log "严重错误：备份中的 sing-box 配置校验失败"
     return 1
@@ -1077,7 +1097,7 @@ restore_backup() {
       return 1
     fi
   fi
-  if ! "$SINGBOX_BIN" check -c "$SINGBOX_CONFIG"; then
+  if ! kernel_check_config "$SINGBOX_CONFIG"; then
     log "严重错误：备份已恢复，但备份配置校验失败"
     return 1
   fi
@@ -3540,7 +3560,7 @@ cleanup_backup_retention() {
 
 check_singbox_and_restart() {
   ensure_safe_ssh_for_singbox_restart rollback || return 1
-  "$SINGBOX_BIN" check -c "$SINGBOX_CONFIG" || return 1
+  kernel_check_config "$SINGBOX_CONFIG" || return 1
   systemctl reset-failed "$SINGBOX_SERVICE" 2>/dev/null || true
   systemctl restart "$SINGBOX_SERVICE" || return 1
   if ! systemctl is-active --quiet "$SINGBOX_SERVICE"; then
@@ -5691,7 +5711,7 @@ validate_upstream_candidate() {
   candidate="$(mktemp /tmp/sb-preset-outbound.XXXXXX.json)" || return 1
   register_temp_path "$candidate"
   if ! SB_JQ_OUTBOUNDS="$outbounds" jq '($ENV.SB_JQ_OUTBOUNDS | fromjson) as $outbounds | .outbounds += $outbounds' "$SINGBOX_CONFIG" > "$candidate" ||
-     ! "$SINGBOX_BIN" check -c "$candidate" >/dev/null 2>&1; then
+     ! kernel_check_config "$candidate" >/dev/null 2>&1; then
     rm -f -- "$candidate"
     die "预置出口无法通过当前 sing-box 检查，请确认协议和连接参数"
   fi
@@ -6839,7 +6859,7 @@ classify_environment() {
   if ((managed==0 && core==0)); then ENVIRONMENT_CLASS=fresh
   elif [[ "$complete" == true ]]; then
     if [[ -z "${SB_SYSTEM_ROOT:-}" ]]; then
-      /usr/local/bin/sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1 || runtime_ok=false
+      kernel_check_default_install >/dev/null 2>&1 || runtime_ok=false
       systemctl is-active --quiet sing-box || runtime_ok=false
       systemctl is-active --quiet nfuse || runtime_ok=false
       [[ -S /run/nfuse.sock ]] || runtime_ok=false
@@ -7124,7 +7144,7 @@ check_singbox_release_compatibility() {
     return 0
   fi
   binary="$PREPARED_SINGBOX_BINARY"
-  if ! output="$($binary check -c "$SINGBOX_CONFIG" 2>&1)"; then
+  if ! output="$(kernel_check_config_with "$binary" "$SINGBOX_CONFIG" 2>&1)"; then
     echo "检查结果：暂时不能切换到 sing-box ${version}。"
     echo "原因：现有连接配置不被该版本接受。"
     [[ -n "$output" ]] && printf '详细信息：%s\n' "$(tail -n 1 <<<"$output")"
@@ -7134,7 +7154,7 @@ check_singbox_release_compatibility() {
   fi
   normalized="$work/target-formatted-config.json"
   if ! output="$($binary format -c "$SINGBOX_CONFIG" 2>&1 >"$normalized")" ||
-     ! output="$($binary check -c "$normalized" 2>&1)"; then
+     ! output="$(kernel_check_config_with "$binary" "$normalized" 2>&1)"; then
     echo "检查结果：暂时不能切换到 sing-box ${version}。"
     echo "原因：目标版本无法安全解析并重新生成现有配置。"
     [[ -n "$output" ]] && printf '详细信息：%s\n' "$(tail -n 1 <<<"$output")"
@@ -7163,7 +7183,7 @@ check_singbox_release_compatibility() {
       return 0
     fi
     stable_binary="$PREPARED_SINGBOX_BINARY"
-    if ! output="$($stable_binary check -c "$normalized" 2>&1)"; then
+    if ! output="$(kernel_check_config_with "$stable_binary" "$normalized" 2>&1)"; then
       echo "检查结果：测试版可以读取当前配置，但不满足安全往返要求。"
       echo "原因：测试版重新整理配置后，最新正式版无法读取。"
       [[ -n "$output" ]] && printf '详细信息：%s\n' "$(tail -n 1 <<<"$output")"
@@ -7199,7 +7219,7 @@ perform_singbox_channel_switch() {
   prepare_core
   current_channel="$(current_singbox_channel)"
   current_version="$(installed_singbox_version)"
-  if ! "$binary" check -c "$SINGBOX_CONFIG" >/dev/null 2>&1; then
+  if ! kernel_check_config_with "$binary" "$SINGBOX_CONFIG" >/dev/null 2>&1; then
     echo "写入前复检失败，现有配置已经发生变化；本次切换已取消。"
     release_operation_lock
     rm -rf -- "$work"
@@ -7226,7 +7246,7 @@ perform_singbox_channel_switch() {
   run_step_or_rollback rollback_channel_switch atomic_install_file "$SINGBOX_BIN" "$current_dir/sing-box" 755 || return 1
   run_step_or_rollback rollback_channel_switch atomic_install_file "$binary" "$target_dir/sing-box" 755 || return 1
   run_step_or_rollback rollback_channel_switch atomic_install_file "$binary" "$SINGBOX_BIN" 755 || return 1
-  run_step_or_rollback rollback_channel_switch "$SINGBOX_BIN" check -c "$SINGBOX_CONFIG" || return 1
+  run_step_or_rollback rollback_channel_switch kernel_check_config "$SINGBOX_CONFIG" || return 1
   run_step_or_rollback rollback_channel_switch systemctl restart sing-box || return 1
   run_step_or_rollback rollback_channel_switch systemctl is-active --quiet sing-box || return 1
   run_step_or_rollback rollback_channel_switch systemctl is-active --quiet nfuse || return 1
@@ -8645,7 +8665,7 @@ deploy_environment() {
   fi
   run_step_or_rollback rollback_deploy write_deployed_versions "$deployed_manager_version" || return 1
   run_step_or_rollback rollback_deploy write_systemd_units "$iface" || return 1
-  run_step_or_rollback rollback_deploy /usr/local/bin/sing-box check -c /etc/sing-box/config.json || return 1
+  run_step_or_rollback rollback_deploy kernel_check_default_install || return 1
   run_step_or_rollback rollback_deploy activate_managed_services || return 1
   run_step_or_rollback rollback_deploy complete_environment_change "$work" || return 1
   if [[ "$update_manager" == true ]]; then
@@ -8672,7 +8692,7 @@ takeover_existing_environment() {
     release_operation_lock
     die "保留配置接管要求现有 sing-box 配置和 PATH 中可执行的 sing-box 均存在"
   }
-  "$existing_singbox_bin" check -c /etc/sing-box/config.json || {
+  kernel_check_config_with "$existing_singbox_bin" /etc/sing-box/config.json || {
     release_operation_lock
     die "现有 sing-box 配置校验失败，拒绝接管"
   }
@@ -8753,7 +8773,7 @@ takeover_existing_environment() {
   fi
   chown --reference=/etc/sing-box/config.json "$tmp" 2>/dev/null || true
   run_step_or_rollback rollback_takeover mv "$tmp" /etc/sing-box/config.json || return 1
-  run_step_or_rollback rollback_takeover /usr/local/bin/sing-box check -c /etc/sing-box/config.json || return 1
+  run_step_or_rollback rollback_takeover kernel_check_default_install || return 1
 
   if [[ ! -f "$CONF_FILE" ]]; then run_step_or_rollback rollback_takeover write_manager_config || return 1; fi
   run_step_or_rollback rollback_takeover load_runtime_config || return 1
@@ -10593,7 +10613,7 @@ create_diagnostic_report() {
   sing_state="$(diagnostic_service_state sing-box.service)"
   nfuse_state="$(diagnostic_service_state nfuse.service)"
   expiry_state="$(diagnostic_service_state sb-user-expiry.timer)"
-  if [[ -x "$SINGBOX_BIN" && -r "$SINGBOX_CONFIG" ]] && "$SINGBOX_BIN" check -c "$SINGBOX_CONFIG" >/dev/null 2>&1; then config_result='通过'
+  if [[ -x "$SINGBOX_BIN" && -r "$SINGBOX_CONFIG" ]] && kernel_check_config "$SINGBOX_CONFIG" >/dev/null 2>&1; then config_result='通过'
   else config_result='未通过'; fi
   if diagnostic_nfuse_healthy; then nfuse_result='正常'
   else nfuse_result='异常'; fi
