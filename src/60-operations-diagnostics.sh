@@ -1466,10 +1466,11 @@ create_diagnostic_report() {
     printf '管理脚本：%s\n' "$SCRIPT_VERSION"
     printf '安装版本记录：%s\n' "$recorded_version"
     printf 'root 启动副本：%s\n' "$launcher_result"
+    printf '代理内核：%s\n' "$PROXY_KERNEL"
     printf 'sing-box：%s（%s）\n' "$singbox_version" "$channel"
     printf 'Nfuse：%s\n' "$nfuse_version"
     printf '系统：%s\n' "${os_name:-未知}"
-    printf '内核：%s｜架构：%s\n' "$(uname -r 2>/dev/null || echo 未知)" "$(uname -m 2>/dev/null || echo 未知)"
+    printf '系统内核：%s｜架构：%s\n' "$(uname -r 2>/dev/null || echo 未知)" "$(uname -m 2>/dev/null || echo 未知)"
     echo
     echo '== 服务与基础检查 =='
     printf '连接服务（sing-box）：%s\n' "$sing_state"
@@ -1850,10 +1851,12 @@ cmd_readonly_status() {
   fi
   if [[ "$as_json" == true ]]; then
     jq -n --arg at "$(readonly_now)" --arg conclusion "$conclusion" --argjson code "$code" \
+      --arg kernel "$PROXY_KERNEL" \
       --argjson problems "$problems" --argjson notices "$notices" \
       --argjson issues "$issues" --argjson repairable "$repairable" \
       --argjson users "$users" --arg services "$services" '
       {generated_at:$at, conclusion:$conclusion, exit_code:$code,
+       kernel:$kernel,
        services:($services | split("\n") | map(select(length > 0) | split("\t") | {name:.[0], state:.[1]})),
        consistency:{issues:$issues, repairable:$repairable},
        users:{total:($users|length),
@@ -1868,6 +1871,7 @@ cmd_readonly_status() {
     problem) echo '结论：异常';;
   esac
   printf '检查时间：%s\n' "$(readonly_now)"
+  printf '代理内核：%s\n' "$PROXY_KERNEL"
   printf '服务：'
   printf '%s' "$(jq -rn --arg s "$services" '$s | split("\n") | map(select(length>0) | split("\t") |
     .[0] + " " + .[2]) | join(" / ")')"

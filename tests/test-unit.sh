@@ -8012,4 +8012,46 @@ if ! grep -Fq 'SINGBOX_SKELETON_ENSURE_PROGRAM' <<<"$(declare -f takeover_existi
   exit 1
 fi
 
+# 部署声明的代理内核。缺失即 sing-box，这是既有部署与所有 sing-box 新装机器的形态；
+# 该键不写进管理配置，正是为了让回退到旧脚本时配置内容一字不变。
+(
+  kernel_conf="$work/kernel.conf"
+  read_kernel() {
+    ( CONF_FILE="$kernel_conf"
+      unset PROXY_KERNEL
+      load_runtime_config >/dev/null 2>&1 || return 1
+      printf '%s' "$PROXY_KERNEL" )
+  }
+  base='HANDSHAKE_PORT=443
+SHADOWTLS_STRICT_MODE=true
+SS2022_SHADOWTLS_SNI="a.example.com"
+ANYTLS_SNI="b.example.com"
+STATE_FILE="'"$work"'/kernel-state.json"'
+  printf '%s\n' '{"schema_version":7,"users":[],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$work/kernel-state.json"
+
+  printf '%s\n' "$base" > "$kernel_conf"
+  if [[ "$(read_kernel)" != singbox ]]; then
+    echo '旧配置缺少 PROXY_KERNEL 时应视为 singbox' >&2
+    exit 1
+  fi
+  printf '%s\nPROXY_KERNEL="singbox"\n' "$base" > "$kernel_conf"
+  if [[ "$(read_kernel)" != singbox ]]; then
+    echo '显式写 singbox 时应被接受' >&2
+    exit 1
+  fi
+  # 未知内核名必须报错退出，不得静默降级——静默降级会让本该跑其它内核的机器
+  # 悄悄跑成 sing-box，而使用者从界面上看不出任何异常。
+  printf '%s\nPROXY_KERNEL="nosuchkernel"\n' "$base" > "$kernel_conf"
+  if read_kernel >/dev/null 2>&1; then
+    echo '未知内核名必须被拒绝，不得静默降级为 singbox' >&2
+    exit 1
+  fi
+)
+# sing-box 部署写出的管理配置不得包含 PROXY_KERNEL。写进去会让回退到旧脚本时
+# 因「未知配置项」而无法启动，而 sing-box 部署本来完全不需要这一项。
+if grep -Fq 'PROXY_KERNEL' <<<"$(declare -f write_manager_config)"; then
+  echo 'write_manager_config must not write PROXY_KERNEL for sing-box deployments' >&2
+  exit 1
+fi
+
 echo 'unit checks passed'
