@@ -7872,4 +7872,63 @@ fi
   fi
 )
 
+# 内核配置骨架只有一处定义，全新安装与接管既有安装共用它。
+# 两处各写一套正是 v4.25.11 所修缺陷的成因，所以这里既锁定行为也锁定「共用」本身。
+(
+  # 对空对象应用得到全新安装的初始配置，内容必须与历史一致
+  skeleton_fresh="$(jq -n "{} | $SINGBOX_SKELETON_ENSURE_PROGRAM" | jq -S -c .)"
+  skeleton_expected="$(jq -n '{
+    log:{level:"info",timestamp:true},
+    dns:{servers:[{type:"local",tag:"local"}],final:"local"},
+    inbounds:[],
+    outbounds:[{type:"direct",tag:"direct"}],
+    route:{rules:[],rule_set:[],final:"direct",default_domain_resolver:"local"},
+    experimental:{cache_file:{enabled:true}}
+  }' | jq -S -c .)"
+  if [[ "$skeleton_fresh" != "$skeleton_expected" ]]; then
+    printf '骨架对空对象的展开结果已变化\n实际: %s\n期望: %s\n' "$skeleton_fresh" "$skeleton_expected" >&2
+    exit 1
+  fi
+  # 幂等：对已完整的配置再应用一次不得有任何变化
+  skeleton_again="$(jq -c "$SINGBOX_SKELETON_ENSURE_PROGRAM" <<<"$skeleton_fresh" | jq -S -c .)"
+  if [[ "$skeleton_again" != "$skeleton_fresh" ]]; then
+    echo '骨架补齐不是幂等的，重复应用会改变配置' >&2
+    exit 1
+  fi
+  # 补齐但不覆盖：已有值必须原样保留，缺的才补
+  skeleton_partial='{"log":{"level":"debug"},"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"custom-out"}}'
+  skeleton_filled="$(jq -c "$SINGBOX_SKELETON_ENSURE_PROGRAM" <<<"$skeleton_partial")"
+  if [[ "$(jq -r '.log.level' <<<"$skeleton_filled")" != debug ]]; then
+    echo '骨架补齐覆盖了使用者已设置的日志级别' >&2
+    exit 1
+  fi
+  if [[ "$(jq -r '.route.final' <<<"$skeleton_filled")" != custom-out ]]; then
+    echo '骨架补齐覆盖了已有的 route.final' >&2
+    exit 1
+  fi
+  if [[ "$(jq -r '.experimental.cache_file.enabled' <<<"$skeleton_filled")" != true ]]; then
+    echo '骨架补齐没有补上缺失的 experimental.cache_file.enabled' >&2
+    exit 1
+  fi
+  if [[ "$(jq -r '.dns.servers[0].tag' <<<"$skeleton_filled")" != local ]]; then
+    echo '骨架补齐没有补上缺失的 local DNS 服务器' >&2
+    exit 1
+  fi
+  # 对照：只验「能补齐」不够，直接返回完整骨架的实现也能通过上面几条。
+  # 这条确认它保留的是输入里的内容，而不是丢弃输入重新造一份。
+  if [[ "$(jq -r '.outbounds | length' <<<"$skeleton_filled")" != 1 ]]; then
+    echo '骨架补齐改变了已有的 outbounds 内容' >&2
+    exit 1
+  fi
+)
+# 全新安装与接管既有安装必须引用同一份骨架来源，不能各写一套
+if ! grep -Fq 'SINGBOX_SKELETON_ENSURE_PROGRAM' <<<"$(declare -f write_base_config)"; then
+  echo 'write_base_config must use the shared kernel skeleton program' >&2
+  exit 1
+fi
+if ! grep -Fq 'SINGBOX_SKELETON_ENSURE_PROGRAM' <<<"$(declare -f takeover_existing_environment)"; then
+  echo 'takeover_existing_environment must use the shared kernel skeleton program' >&2
+  exit 1
+fi
+
 echo 'unit checks passed'
