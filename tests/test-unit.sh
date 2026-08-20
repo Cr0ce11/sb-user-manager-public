@@ -8109,6 +8109,43 @@ STATE_FILE="'"$work"'/kernel-state.json"'
   rm -f -- "$conf_check"
 )
 
+# 四组「哪些路径属于本项目」的清单必须都覆盖两个内核（公开 Issue #175）。
+# 漏掉一个内核的后果各不相同，但都是静默的：环境备份漏了，失败回滚还原不了被
+# 覆盖的内核文件；卸载漏了，卸载完还留在盘上；事务白名单漏了，清理被挡在门外；
+# 部署跟踪漏了，失败之后留下半成品。#175 就是环境备份那一处漏了整个 mihomo。
+(
+  for kernel_owned_path in \
+      /etc/sing-box /var/lib/sing-box /usr/local/bin/sing-box \
+      /etc/systemd/system/sing-box.service \
+      /etc/systemd/system/multi-user.target.wants/sing-box.service \
+      /etc/mihomo /var/lib/mihomo /usr/local/bin/mihomo \
+      /etc/systemd/system/mihomo.service \
+      /etc/systemd/system/multi-user.target.wants/mihomo.service; do
+    for kernel_path_list in environment_backup_paths managed_uninstall_paths deploy_tracked_paths; do
+      if ! ( CONF_FILE=/etc/sb-user-manager.conf; "$kernel_path_list" ) |
+          grep -Fxq "$kernel_owned_path"; then
+        printf '%s 的清单里缺少 %s\n' "$kernel_path_list" "$kernel_owned_path" >&2
+        exit 1
+      fi
+    done
+    if ! is_environment_recovery_path "$kernel_owned_path"; then
+      printf '事务白名单不允许属于本项目的路径：%s\n' "$kernel_owned_path" >&2
+      exit 1
+    fi
+  done
+  # 对照：不属于本项目的路径不能因为上面这条要求而被一起放行。
+  if is_environment_recovery_path /etc/passwd; then
+    echo '事务白名单不应放行 /etc/passwd' >&2
+    exit 1
+  fi
+  for kernel_path_list in environment_backup_paths managed_uninstall_paths deploy_tracked_paths; do
+    if ( CONF_FILE=/etc/sb-user-manager.conf; "$kernel_path_list" ) | grep -Fxq /etc/passwd; then
+      printf '%s 的清单里不应出现 /etc/passwd\n' "$kernel_path_list" >&2
+      exit 1
+    fi
+  done
+)
+
 # ============================================================
 # 管理器数据路径的单一来源（公开 Issue #172、#173）
 # ============================================================

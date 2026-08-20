@@ -8610,6 +8610,12 @@ environment_backup_paths() {
 /usr/local/bin/sing-box
 /usr/local/bin/nfuse
 EOF
+    # 两个内核的全部部署路径取并集，与部署跟踪、卸载、事务白名单三处同源。
+    # 放在最后追加：上面已经出现过的条目会被去重丢掉，因此 sing-box 机器上
+    # 这份清单的内容与顺序一字不变，只在末尾多出 mihomo 的五条。
+    # 这里不手抄一份 mihomo 路径——手抄的那份下次加内核时会再漏一遍，
+    # 而漏掉的后果是失败回滚还原不了被覆盖的内核文件（公开 Issue #175）。
+    all_kernel_deployment_paths
   } | awk 'NF && !seen[$0]++'
 }
 
