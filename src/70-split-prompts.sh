@@ -782,6 +782,7 @@ rule_preset_management_menu() {
 
 split_management_menu() {
   ensure_management_environment_ready || return 0
+  ensure_split_supported_by_kernel || return 0
   while true; do
     prepare_menu_screen
     ui_menu_begin

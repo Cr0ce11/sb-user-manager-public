@@ -1,11 +1,16 @@
 
 check_singbox_and_restart() {
+  local runtime_config
   ensure_safe_ssh_for_kernel_restart rollback || return 1
-  kernel_check_config "$SINGBOX_CONFIG" || return 1
+  # 校验的必须是当前内核自己的配置文件。此前这里写死 SINGBOX_CONFIG，
+  # 在 mihomo 机器上会用 mihomo 去校验一份 sing-box 的配置——2c 之前
+  # mihomo 机器不可能有用户，走不到这里；本片让它可达，因此一并改对。
+  runtime_config="$(kernel_runtime_config_path)" || return 1
+  kernel_check_config "$runtime_config" || return 1
   kernel_service_reset_failed
   kernel_service_restart || return 1
   if ! kernel_service_is_active; then
-    log "错误：sing-box 重启后未处于 active 状态"
+    log "错误：$(kernel_display_name) 重启后未处于 active 状态"
     return 1
   fi
 }
@@ -19,19 +24,23 @@ port_in_state() {
 }
 
 tag_exists_in_config() {
-  local tag="$1"
+  local tag="$1" container entry_key
+  container="$(kernel_managed_container)" || return 1
+  entry_key="$(kernel_managed_key)" || return 1
   kernel_normalized_config |
-    jq -e --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' >/dev/null
+    jq -e --arg tag "$tag" --arg container "$container" --arg entry_key "$entry_key" \
+      '.[$container][]? | select(.[$entry_key] == $tag)' >/dev/null
 }
 
 read_singbox_config_source() {
-  local output_name="$1" content=""
+  local output_name="$1" content="" config_path
+  config_path="$(kernel_runtime_config_path)" || return 1
   # `read -d ''` reads through EOF without command substitution, so trailing
   # newlines remain part of the snapshot. A successful read means an embedded
   # NUL was found; that is not valid JSON and must be rejected.
-  if IFS= read -r -d '' content < "$SINGBOX_CONFIG"; then
+  if IFS= read -r -d '' content < "$config_path"; then
     return 1
-  elif [[ ! -r "$SINGBOX_CONFIG" ]]; then
+  elif [[ ! -r "$config_path" ]]; then
     return 1
   fi
   printf -v "$output_name" '%s' "$content"
@@ -84,69 +93,16 @@ generate_st_password() {
   generate_random_base64 32
 }
 
+# 三个入口的托管条目形状由适配层给出，每个内核各一份（公开 Issue #180）。
+# 这里保留原有的函数名与参数，只把形状那一层挪走：调用点不必知道当前内核
+# 生成的是几个条目——sing-box 的 SS2022 + ShadowTLS 是三个入站，mihomo 是
+# 一个同时承载 TCP 与 UDP 的监听器。
 make_user_inbounds() {
-  local name="$1" port="$2" st_password="$3" ss_password="$4" method="$5" shadowtls_sni="$6"
-  SB_JQ_ST_PASSWORD="$st_password" SB_JQ_SS_PASSWORD="$ss_password" jq -n \
-    --arg name "$name" \
-    --argjson port "$port" \
-    --arg method "$method" \
-    --arg hs_server "$shadowtls_sni" \
-    --argjson hs_port "$HANDSHAKE_PORT" \
-    --argjson strict "$SHADOWTLS_STRICT_MODE" \
-    '[
-      {
-        "type": "shadowtls",
-        "tag": ("st-" + $name),
-        "listen": "::",
-        "listen_port": $port,
-        "version": 3,
-        "users": [
-          {
-            "name": $name,
-            "password": $ENV.SB_JQ_ST_PASSWORD
-          }
-        ],
-        "handshake": {
-          "server": $hs_server,
-          "server_port": $hs_port
-        },
-        "strict_mode": $strict,
-        "detour": ("ss-" + $name)
-      },
-      {
-        "type": "shadowsocks",
-        "tag": ("ss-" + $name),
-        "network": "tcp",
-        "method": $method,
-        "password": $ENV.SB_JQ_SS_PASSWORD
-      },
-      {
-        "type": "shadowsocks",
-        "tag": ("ss-udp-" + $name),
-        "listen": "::",
-        "listen_port": $port,
-        "network": "udp",
-        "method": $method,
-        "password": $ENV.SB_JQ_SS_PASSWORD
-      }
-    ]'
+  kernel_entries_ss2022_shadowtls "$1" "$2" "$3" "$4" "$5" "$6"
 }
 
 make_ss2022_inbound() {
-  local name="$1" port="$2" ss_password="$3" method="$4" tag="${5:-ss-$1}"
-  SB_JQ_SS_PASSWORD="$ss_password" jq -n \
-    --arg name "$name" \
-    --arg tag "$tag" \
-    --argjson port "$port" \
-    --arg method "$method" \
-    '[{
-      "type": "shadowsocks",
-      "tag": $tag,
-      "listen": "::",
-      "listen_port": $port,
-      "method": $method,
-      "password": $ENV.SB_JQ_SS_PASSWORD
-    }]'
+  kernel_entries_ss2022_direct "$1" "$2" "$3" "$4" "${5:-ss-$1}"
 }
 
 build_user_inbound_payload() {
@@ -288,17 +244,25 @@ rebuild_protocol_inbounds_with_shell_tools() {
     {name:$user.name,status:$user.status,endpoint:.,
      has_legacy_ss2022:(any($user.endpoints[]?; .protocol == "ss2022" and .transport == "shadowtls"))}
   ' "$STATE_FILE")
-  SB_JQ_NEW_INBOUNDS="$fragments" rewrite_singbox_config '
-    ($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_inbounds |
-    .inbounds = ([((.inbounds // [])[]) |
-      .tag as $tag | select(($managed_tags | index($tag)) == null)] + $new_inbounds)
+  SB_JQ_NEW_INBOUNDS="$fragments" rewrite_kernel_config '
+    ($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_entries |
+    .[$managed_container] = ([((.[$managed_container] // [])[]) |
+      .[$managed_key] as $entry_name | select(($managed_tags | index($entry_name)) == null)] + $new_entries)
   ' --argjson managed_tags "$managed_tags_json"
 }
 
-rewrite_singbox_config() {
-  local filter="$1" config_dir tmp normalized
+# 原子改写当前内核的运行配置。
+#
+# 过滤器里可以直接用 ${managed_container} 与 ${managed_key}，本函数总是注入这两个值：
+# sing-box 把托管条目放在 .inbounds[] 并用 .tag 标识，mihomo 放在 .listeners[]
+# 并用 .name 标识。让每个调用点各取一遍，等于同一段判断散在十来处。
+rewrite_kernel_config() {
+  local filter="$1" config_path config_dir container entry_key tmp normalized
   shift
-  config_dir="$(dirname "$SINGBOX_CONFIG")"
+  config_path="$(kernel_runtime_config_path)" || return 1
+  container="$(kernel_managed_container)" || return 1
+  entry_key="$(kernel_managed_key)" || return 1
+  config_dir="$(dirname "$config_path")"
   tmp="$(mktemp "$config_dir/.config.XXXXXX")" || return 1
   register_temp_path "$tmp"
   normalized="$(mktemp "$config_dir/.normalized.XXXXXX")" || {
@@ -308,47 +272,62 @@ rewrite_singbox_config() {
   register_temp_path "$normalized"
   if ! kernel_normalized_config > "$normalized"; then
     rm -f -- "$tmp" "$normalized"
-    printf '错误：无法解析或格式化 sing-box 配置：%s\n' "$SINGBOX_CONFIG" >&2
+    printf '错误：无法解析或格式化运行配置：%s\n' "$config_path" >&2
     return 1
   fi
-  if ! jq "$@" "$filter" "$normalized" > "$tmp"; then
+  if ! jq --arg managed_container "$container" --arg managed_key "$entry_key" \
+      "$@" "$filter" "$normalized" > "$tmp"; then
     rm -f -- "$tmp" "$normalized"
-    printf '错误：无法生成新的 sing-box 配置\n' >&2
+    printf '错误：无法生成新的运行配置\n' >&2
     return 1
   fi
   rm -f -- "$normalized" || return 1
   unregister_temp_path "$normalized" || return 1
-  if ! chmod --reference="$SINGBOX_CONFIG" "$tmp" 2>/dev/null; then
+  if ! chmod --reference="$config_path" "$tmp" 2>/dev/null; then
     if ! chmod 600 "$tmp"; then
       rm -f -- "$tmp"
       return 1
     fi
   fi
-  chown --reference="$SINGBOX_CONFIG" "$tmp" 2>/dev/null || true
-  if ! mv -- "$tmp" "$SINGBOX_CONFIG"; then
+  chown --reference="$config_path" "$tmp" 2>/dev/null || true
+  if ! mv -- "$tmp" "$config_path"; then
     rm -f -- "$tmp"
     return 1
   fi
   unregister_temp_path "$tmp" || return 1
 }
 
+# 分流的运行配置改写。分流的 mihomo 侧要到第二步 2d 才有，因此这里是
+# sing-box 专用的，并带一条大声的兜底——2c 之后 mihomo 机器第一次会有用户，
+# 分流菜单随之变得可达，若没有这一条，它会往一个 mihomo 根本不读的文件里写东西，
+# 而且不产生任何提示。真正面向使用者的拒绝在菜单入口处，这里只是最后一道。
+rewrite_singbox_config() {
+  [[ "$PROXY_KERNEL" == singbox ]] || {
+    kernel_unsupported '改写分流运行配置'
+    return 1
+  }
+  rewrite_kernel_config "$@"
+}
+
 append_inbounds_from_new_user_snapshot() {
   local config_json="$1" expected_source="$2" fragment="$3"
-  local config_dir current_source tmp
-  config_dir="$(dirname "$SINGBOX_CONFIG")" || return 1
+  local config_path config_dir current_source tmp container
+  config_path="$(kernel_runtime_config_path)" || return 1
+  container="$(kernel_managed_container)" || return 1
+  config_dir="$(dirname "$config_path")" || return 1
   tmp="$(mktemp "$config_dir/.config.XXXXXX")" || return 1
   register_temp_path "$tmp" || { rm -f -- "$tmp" || true; return 1; }
-  if ! SB_JQ_NEW_INBOUNDS="$fragment" jq '
-    ($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_inbounds |
-    .inbounds = ((.inbounds // []) + $new_inbounds)
+  if ! SB_JQ_NEW_INBOUNDS="$fragment" jq --arg container "$container" '
+    ($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_entries |
+    .[$container] = ((.[$container] // []) + $new_entries)
   ' <<<"$config_json" > "$tmp"; then
     if rm -f -- "$tmp"; then
       unregister_temp_path "$tmp" || return 1
     fi
-    printf '错误：无法生成新的 sing-box 配置\n' >&2
+    printf '错误：无法生成新的运行配置\n' >&2
     return 1
   fi
-  if ! chmod --reference="$SINGBOX_CONFIG" "$tmp" 2>/dev/null; then
+  if ! chmod --reference="$config_path" "$tmp" 2>/dev/null; then
     if ! chmod 600 "$tmp"; then
       if rm -f -- "$tmp"; then
         unregister_temp_path "$tmp" || return 1
@@ -356,7 +335,7 @@ append_inbounds_from_new_user_snapshot() {
       return 1
     fi
   fi
-  chown --reference="$SINGBOX_CONFIG" "$tmp" 2>/dev/null || true
+  chown --reference="$config_path" "$tmp" 2>/dev/null || true
   read_singbox_config_source current_source || {
     if rm -f -- "$tmp"; then
       unregister_temp_path "$tmp" || return 1
@@ -367,10 +346,10 @@ append_inbounds_from_new_user_snapshot() {
     if rm -f -- "$tmp"; then
       unregister_temp_path "$tmp" || return 1
     fi
-    printf '错误：sing-box 配置在新增用户预检后发生变化，请重新操作\n' >&2
+    printf '错误：运行配置在新增用户预检后发生变化，请重新操作\n' >&2
     return 1
   fi
-  if ! mv -- "$tmp" "$SINGBOX_CONFIG"; then
+  if ! mv -- "$tmp" "$config_path"; then
     if rm -f -- "$tmp"; then
       unregister_temp_path "$tmp" || return 1
     fi
@@ -381,39 +360,61 @@ append_inbounds_from_new_user_snapshot() {
 
 append_inbounds() {
   local fragment="$1"
-  SB_JQ_NEW_INBOUNDS="$fragment" rewrite_singbox_config \
-    '($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_inbounds |
-     .inbounds = ((.inbounds // []) + $new_inbounds)'
+  SB_JQ_NEW_INBOUNDS="$fragment" rewrite_kernel_config \
+    '($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_entries |
+     .[$managed_container] = ((.[$managed_container] // []) + $new_entries)'
 }
 
 remove_user_inbounds() {
   local name="$1"
-  rewrite_singbox_config \
-    '.inbounds = [(.inbounds // [])[] | select(.tag != $st and .tag != $ss and .tag != $ss_direct and .tag != $ss_udp and .tag != $at and .tag != $sn)]' \
+  rewrite_kernel_config \
+    '.[$managed_container] = [(.[$managed_container] // [])[] |
+       .[$managed_key] as $entry_name |
+       select($entry_name != $st and $entry_name != $ss and $entry_name != $ss_direct and
+              $entry_name != $ss_udp and $entry_name != $at and $entry_name != $sn)]' \
     --arg st "st-$name" --arg ss "ss-$name" --arg ss_direct "ss-direct-$name" \
     --arg ss_udp "ss-udp-$name" --arg at "anytls-$name" --arg sn "snell-$name"
 }
 
 replace_user_inbounds() {
   local name="$1" fragment="$2"
-  SB_JQ_NEW_INBOUNDS="$fragment" rewrite_singbox_config \
-     '($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_inbounds |
-     .inbounds = ([((.inbounds // [])[]) | select(.tag != $st and .tag != $ss and .tag != $ss_direct and .tag != $ss_udp and .tag != $at and .tag != $sn)] + $new_inbounds)' \
+  SB_JQ_NEW_INBOUNDS="$fragment" rewrite_kernel_config \
+     '($ENV.SB_JQ_NEW_INBOUNDS | fromjson) as $new_entries |
+      .[$managed_container] = ([((.[$managed_container] // [])[]) |
+        .[$managed_key] as $entry_name |
+        select($entry_name != $st and $entry_name != $ss and $entry_name != $ss_direct and
+               $entry_name != $ss_udp and $entry_name != $at and $entry_name != $sn)] + $new_entries)' \
     --arg st "st-$name" --arg ss "ss-$name" --arg ss_direct "ss-direct-$name" \
     --arg ss_udp "ss-udp-$name" --arg at "anytls-$name" --arg sn "snell-$name"
 }
 
+# 重建某个协议的全部托管条目。
+#
+# sing-box 有一条整体 jq 快路径（build_user_inbound_payload），一次 jq 调用算出
+# 所有用户的入站；状态里还是旧格式时回落到逐条生成。
+# **mihomo 一律走逐条生成那条路**，不另写一份整体 jq 程序：托管条目的形状只在
+# 适配层写一遍，再写一份等于同一份判断存在两处——v4.25.11 修的缺陷正是这么来的。
+# 代价是每个端点一次 jq 调用，在 mihomo 部署上是可以接受的。
 rebuild_protocol_inbounds() {
   local protocol="$1" rebuild_payload
+  case "$PROXY_KERNEL" in
+    singbox) ;;
+    mihomo)
+      rebuild_protocol_inbounds_with_shell_tools "$protocol"
+      return
+      ;;
+    *) kernel_unknown; return 1 ;;
+  esac
   rebuild_payload="$(build_user_inbound_payload rebuild "$protocol" "$STATE_FILE")" || return 1
   if [[ "$rebuild_payload" == '{"legacy_fallback":true}' ]]; then
     rebuild_protocol_inbounds_with_shell_tools "$protocol"
     return
   fi
-  SB_JQ_PROTOCOL_REBUILD="$rebuild_payload" rewrite_singbox_config '
+  SB_JQ_PROTOCOL_REBUILD="$rebuild_payload" rewrite_kernel_config '
     ($ENV.SB_JQ_PROTOCOL_REBUILD | fromjson) as $payload |
-    .inbounds = ([((.inbounds // [])[]) |
-      .tag as $tag | select(($payload.managed_tags | index($tag)) == null)] + $payload.inbounds)
+    .[$managed_container] = ([((.[$managed_container] // [])[]) |
+      .[$managed_key] as $entry_name |
+      select(($payload.managed_tags | index($entry_name)) == null)] + $payload.inbounds)
   '
 }
 
@@ -501,10 +502,7 @@ migrate_legacy_ss2022_udp_inbounds() {
 }
 
 make_anytls_inbound() {
-  local name="$1" port="$2" password="$3"
-  SB_JQ_PASSWORD="$password" jq -n --arg name "$name" --argjson port "$port" \
-    --arg cert_path "$ANYTLS_CERT_FILE" --arg key_path "$ANYTLS_KEY_FILE" \
-    '[{"type":"anytls","tag":("anytls-" + $name),"listen":"::","listen_port":$port,"users":[{"name":$name,"password":$ENV.SB_JQ_PASSWORD}],"tls":{"enabled":true,"certificate_path":$cert_path,"key_path":$key_path}}]'
+  kernel_entries_anytls "$1" "$2" "$3"
 }
 
 make_endpoint_inbounds_from_state() {
@@ -536,9 +534,44 @@ make_endpoint_inbounds_from_state() {
   fi
 }
 
+# 一个用户在当前内核下的全部托管条目。
+# 与 rebuild_protocol_inbounds 同理：sing-box 用整体 jq 快路径，
+# mihomo 逐个端点调用适配层的生成函数，形状只有一份。
 make_user_inbounds_from_state() {
   local user="$1"
-  build_user_inbound_payload user "" - <<<"$user"
+  case "$PROXY_KERNEL" in
+    singbox) build_user_inbound_payload user "" - <<<"$user" ;;
+    mihomo) make_user_entries_per_endpoint "$user" ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 逐个端点生成一个用户的托管条目。与 rebuild_protocol_inbounds_with_shell_tools
+# 里那段循环共用同一套判断（是否需要 ss-direct- 前缀），不各写一遍。
+make_user_entries_per_endpoint() {
+  local user="$1" name endpoint direct_tag fragment entries='[]' has_legacy
+  name="$(jq -er '.name' <<<"$user")" || return 1
+  has_legacy="$(jq -r 'any(.endpoints[]?; .protocol == "ss2022" and .transport == "shadowtls")' <<<"$user")" || return 1
+  while IFS= read -r endpoint; do
+    [[ -n "$endpoint" ]] || continue
+    direct_tag=""
+    if [[ "$has_legacy" == true &&
+          "$(jq -r '.protocol == "ss2022" and (.transport // "shadowtls") == "direct"' <<<"$endpoint")" == true ]]; then
+      direct_tag="ss-direct-$name"
+    fi
+    fragment="$(make_endpoint_inbounds_from_state "$name" "$endpoint" "$direct_tag")" || return 1
+    entries="$(SB_JQ_CURRENT="$entries" SB_JQ_ADDED="$fragment" jq -cn \
+      '($ENV.SB_JQ_CURRENT | fromjson) + ($ENV.SB_JQ_ADDED | fromjson)')" || return 1
+  done < <(jq -c '
+    if (.endpoints | type) == "array" then .endpoints[]
+    elif (.protocol // "ss2022") == "anytls" then
+      {protocol:"anytls",port:.port,anytls_password:.anytls_password,tls_sni:.tls_sni}
+    else
+      {protocol:"ss2022",transport:(.transport // "shadowtls"),port:.port,
+       shadowtls_password:.shadowtls_password,ss2022_password:.ss2022_password,
+       method:.method,shadowtls_sni:.shadowtls_sni}
+    end' <<<"$user")
+  printf '%s' "$entries"
 }
 
 state_add_user() {
@@ -784,7 +817,7 @@ check_new_user_conflicts() {
   config_json="${!config_output_name:-}"
   source_snapshot="${!source_output_name:-}"
   if [[ -n "$config_json" && -n "$source_snapshot" ]]; then
-    read_singbox_config_source current_source || die "无法解析或格式化 sing-box 配置：$SINGBOX_CONFIG"
+    read_singbox_config_source current_source || die "无法解析或格式化运行配置：$(kernel_runtime_config_path)"
     if [[ "$current_source" != "$source_snapshot" ]]; then
       config_json=""
       source_snapshot=""
@@ -792,7 +825,7 @@ check_new_user_conflicts() {
   fi
   if [[ -z "$config_json" || -z "$source_snapshot" ]]; then
     load_new_user_config_snapshot config_json source_snapshot ||
-      die "无法解析或格式化 sing-box 配置：$SINGBOX_CONFIG"
+      die "无法解析或格式化运行配置：$(kernel_runtime_config_path)"
     printf -v "$config_output_name" '%s' "$config_json"
     printf -v "$source_output_name" '%s' "$source_snapshot"
   fi
@@ -801,9 +834,10 @@ check_new_user_conflicts() {
   else
     tags_json="[\"anytls-$name\"]"
   fi
-  conflict_tag="$(jq -r --argjson tags "$tags_json" '
-    [$tags[] as $wanted | select(any(.inbounds[]?; .tag == $wanted)) | $wanted][0] // empty
-  ' <<<"$config_json")" || die "无法解析或格式化 sing-box 配置：$SINGBOX_CONFIG"
+  conflict_tag="$(jq -r --argjson tags "$tags_json" \
+    --arg container "$(kernel_managed_container)" --arg entry_key "$(kernel_managed_key)" '
+    [$tags[] as $wanted | select(any(.[$container][]?; .[$entry_key] == $wanted)) | $wanted][0] // empty
+  ' <<<"$config_json")" || die "无法解析或格式化运行配置：$(kernel_runtime_config_path)"
   if [[ -n "$conflict_tag" ]]; then
     if [[ "$protocol" == ss2022 ]]; then
       die "sing-box 已存在 tag：$conflict_tag"

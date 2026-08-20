@@ -79,6 +79,24 @@ ensure_management_environment_ready() {
   return 1
 }
 
+# 分流的 mihomo 侧要到第二步 2d 才有。2c 让 mihomo 机器第一次能有用户，
+# 分流菜单随之变得可达——在护栏就位之前把界面交出去，等于让人往一个
+# mihomo 根本不读的文件里写东西，而且不产生任何提示。
+# 这里明确拒绝，不回落到 sing-box 的实现（公开 Issue #180）。
+ensure_split_supported_by_kernel() {
+  case "$PROXY_KERNEL" in
+    singbox) return 0 ;;
+    mihomo)
+      echo
+      echo "当前部署使用 $(kernel_display_name)，分流功能尚未支持这个内核，本菜单暂不可用。"
+      echo '用户管理不受影响。'
+      pause_menu
+      return 1
+      ;;
+    *) kernel_unknown; pause_menu; return 1 ;;
+  esac
+}
+
 user_management_menu() {
   ensure_management_environment_ready || return 0
   while true; do

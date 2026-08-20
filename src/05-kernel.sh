@@ -88,15 +88,57 @@ kernel_normalized_default_install() {
   esac
 }
 
-# 读取当前部署的内核配置，输出内核自身规范化后的 JSON 到标准输出。
+# 当前部署的运行配置文件。托管内容读写都经这里取路径，不各自写一遍 case。
+kernel_runtime_config_path() {
+  case "$PROXY_KERNEL" in
+    singbox) printf '%s' "$SINGBOX_CONFIG" ;;
+    mihomo) printf '%s' "$MIHOMO_CONFIG" ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 托管内容在运行配置里所处的容器与它的标识字段。
+# sing-box 把用户入口放在 .inbounds[] 并用 .tag 标识，mihomo 放在 .listeners[]
+# 并用 .name 标识。两者只是名字不同，语义一致，因此抽成取值函数而不是各写一套
+# 过滤器——同一段 jq 逻辑写两遍，迟早只改一遍。
+kernel_managed_container() {
+  case "$PROXY_KERNEL" in
+    singbox) printf 'inbounds' ;;
+    mihomo) printf 'listeners' ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+kernel_managed_key() {
+  case "$PROXY_KERNEL" in
+    singbox) printf 'tag' ;;
+    mihomo) printf 'name' ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 读取当前部署的内核配置，输出规范化后的 JSON 到标准输出。
 # 调用方可以重定向到文件、用命令替换取值，或直接接管道，三种形态都适用。
-# 失败时按内核的退出码返回，由调用方决定如何处理。
-# mihomo 没有对应的子命令，且它的调用点全部属于用户与分流的配置生成，
-# 那些还没有 mihomo 实现，因此这里明确报错而不是给出一个半成品。
+#
+# 两个内核的规范化来源不同，这是一处有代价的取舍：
+# sing-box 的 `format` 同时做两件事——确认配置能被内核解析，以及给出**内核自己
+# 视角**的规范化形式。mihomo 没有等价子命令，只能拆成两步：内核负责校验
+# （kernel_check_config），jq 负责规范化。代价是规范化结果是我们的视角而不是
+# 内核的视角。
+#
+# 因此 mihomo 这一支在 jq 读不了时**失败而不是将就**：那说明配置不是 JSON
+# （例如有人手工改成了带锚点与注释的真 YAML），此时把它重写成 JSON 会毁掉
+# 人家的东西。宁可拒绝改写，让使用者自己决定。
+# 退路：将来 mihomo 若提供等价的规范化输出，换掉这一支即可，接口不变。
 kernel_normalized_config() {
   case "$PROXY_KERNEL" in
     singbox) "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" ;;
-    mihomo) kernel_unsupported '读取规范化后的运行配置' ;;
+    mihomo)
+      jq . "$MIHOMO_CONFIG" 2>/dev/null || {
+        printf '错误：mihomo 运行配置不是 JSON，管理器不会改写它：%s\n' "$MIHOMO_CONFIG" >&2
+        return 1
+      }
+      ;;
     *) kernel_unknown ;;
   esac
 }
@@ -170,6 +212,103 @@ MIHOMO_SKELETON_ENSURE_PROGRAM='
   | .proxies = (.proxies // [])
   | .["proxy-groups"] = (.["proxy-groups"] // [])
   | .rules = (.rules // [])'
+
+# ============================================================
+# 用户入口的生成：一个用户在当前内核下的托管条目
+# ============================================================
+# 返回 JSON 数组。**条目数量本来就随内核不同**，调用点不得假设：
+# sing-box 的 SS2022 + ShadowTLS 需要三个入站（ShadowTLS 独立入站、detour 指向的
+# shadowsocks、以及单独承载 UDP 的那个），mihomo 一个监听器就同时承载 TCP 与 UDP。
+# 后者是实测结论：一个 shadowsocks 监听器默认就开 tcp 与 udp，加上 shadow-tls
+# 之后仍然如此；显式写 "udp": false 时 UDP 套接字消失（公开 Issue #180）。
+#
+# 名字沿用 sing-box 那套前缀（st- / ss- / ss-direct- / anytls-），两个内核共用，
+# 因此按前缀识别与删除托管内容的逻辑不必分内核各写一遍。
+#
+# 涉密内容一律经环境变量传给 jq，不进命令行参数。
+
+kernel_entries_ss2022_shadowtls() {
+  local name="$1" port="$2" st_password="$3" ss_password="$4" method="$5" shadowtls_sni="$6"
+  case "$PROXY_KERNEL" in
+    singbox)
+      SB_JQ_ST_PASSWORD="$st_password" SB_JQ_SS_PASSWORD="$ss_password" jq -n \
+        --arg name "$name" --argjson port "$port" --arg method "$method" \
+        --arg hs_server "$shadowtls_sni" --argjson hs_port "$HANDSHAKE_PORT" \
+        --argjson strict "$SHADOWTLS_STRICT_MODE" \
+        '[{"type":"shadowtls","tag":("st-" + $name),"listen":"::","listen_port":$port,"version":3,
+           "users":[{"name":$name,"password":$ENV.SB_JQ_ST_PASSWORD}],
+           "handshake":{"server":$hs_server,"server_port":$hs_port},
+           "strict_mode":$strict,"detour":("ss-" + $name)},
+          {"type":"shadowsocks","tag":("ss-" + $name),"network":"tcp","method":$method,
+           "password":$ENV.SB_JQ_SS_PASSWORD},
+          {"type":"shadowsocks","tag":("ss-udp-" + $name),"listen":"::","listen_port":$port,
+           "network":"udp","method":$method,"password":$ENV.SB_JQ_SS_PASSWORD}]'
+      ;;
+    mihomo)
+      # 严格模式的键名是 strict-mode，不是 strictmode——监听器配置走的是
+      # inbound 结构体标签而不是 yaml 标签，二进制里 strictmode 出现 0 次。
+      # 公开 Issue #154 正文那条相反的推导已在该 Issue 中更正。
+      # udp 显式写出而不是依赖默认值：这里不是「重申默认值的虚假安全感」，
+      # 因为它有可观测断言把守——监听套接字里 UDP 在不在是能直接看到的。
+      SB_JQ_ST_PASSWORD="$st_password" SB_JQ_SS_PASSWORD="$ss_password" jq -n \
+        --arg name "$name" --argjson port "$port" --arg method "$method" \
+        --arg hs_dest "${shadowtls_sni}:${HANDSHAKE_PORT}" \
+        --argjson strict "$SHADOWTLS_STRICT_MODE" \
+        '[{"name":("st-" + $name),"type":"shadowsocks","listen":"::","port":$port,
+           "cipher":$method,"password":$ENV.SB_JQ_SS_PASSWORD,"udp":true,
+           "shadow-tls":{"enable":true,"version":3,
+                         "users":[{"name":$name,"password":$ENV.SB_JQ_ST_PASSWORD}],
+                         "handshake":{"dest":$hs_dest},
+                         "strict-mode":$strict}}]'
+      ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+kernel_entries_ss2022_direct() {
+  local name="$1" port="$2" ss_password="$3" method="$4" entry_name="${5:-ss-$1}"
+  case "$PROXY_KERNEL" in
+    singbox)
+      SB_JQ_SS_PASSWORD="$ss_password" jq -n \
+        --arg tag "$entry_name" --argjson port "$port" --arg method "$method" \
+        '[{"type":"shadowsocks","tag":$tag,"listen":"::","listen_port":$port,
+           "method":$method,"password":$ENV.SB_JQ_SS_PASSWORD}]'
+      ;;
+    mihomo)
+      SB_JQ_SS_PASSWORD="$ss_password" jq -n \
+        --arg name "$entry_name" --argjson port "$port" --arg method "$method" \
+        '[{"name":$name,"type":"shadowsocks","listen":"::","port":$port,
+           "cipher":$method,"password":$ENV.SB_JQ_SS_PASSWORD,"udp":true}]'
+      ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+kernel_entries_anytls() {
+  local name="$1" port="$2" password="$3"
+  case "$PROXY_KERNEL" in
+    singbox)
+      SB_JQ_PASSWORD="$password" jq -n \
+        --arg name "$name" --argjson port "$port" \
+        --arg cert_path "$ANYTLS_CERT_FILE" --arg key_path "$ANYTLS_KEY_FILE" \
+        '[{"type":"anytls","tag":("anytls-" + $name),"listen":"::","listen_port":$port,
+           "users":[{"name":$name,"password":$ENV.SB_JQ_PASSWORD}],
+           "tls":{"enabled":true,"certificate_path":$cert_path,"key_path":$key_path}}]'
+      ;;
+    mihomo)
+      # mihomo 的 users 是映射（用户名 → 密码），不是数组；证书字段名也不同。
+      # 证书必须落在 systemd 单元 SAFE_PATHS 之内，否则监听器起不来，
+      # 而 mihomo -t 完全测不出这个问题（公开 Issue #154）。
+      SB_JQ_PASSWORD="$password" jq -n \
+        --arg name "$name" --argjson port "$port" \
+        --arg cert_path "$ANYTLS_CERT_FILE" --arg key_path "$ANYTLS_KEY_FILE" \
+        '[{"name":("anytls-" + $name),"type":"anytls","listen":"::","port":$port,
+           "users":{($name):$ENV.SB_JQ_PASSWORD},
+           "certificate":$cert_path,"private-key":$key_path}]'
+      ;;
+    *) kernel_unknown ;;
+  esac
+}
 
 kernel_skeleton_ensure_program() {
   case "$PROXY_KERNEL" in
