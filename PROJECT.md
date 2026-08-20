@@ -40,7 +40,7 @@
 | 最新正式版 | v4.25.14 |
 | 主开发分支 | `main` |
 | 正式支持环境 | Debian 12 x86_64 |
-| 测试环境 | 开发机上的本地 OrbStack 测试机（Debian 12 x86_64，完整 systemd）；已验证安装、服务启停、Nfuse 的 nftables 计量与配额规则、一致性检查，`lifecycle`、`full` 与迁移恢复演练尚未在其中实测，能力范围与限制见 [公开 Issue #139](https://github.com/Cr0ce11/sb-user-manager-public/issues/139)。发布仍以本地门禁与公开仓库 GitHub CI 为基础 |
+| 测试环境 | 开发机上的本地 OrbStack 测试机（Debian 12 x86_64，完整 systemd）；`audit`、`release`、`lifecycle`（含分流）、`full` 四种验收模式与跨机迁移恢复演练均已实测通过，能力范围与限制见 [公开 Issue #139](https://github.com/Cr0ce11/sb-user-manager-public/issues/139)。发布仍以本地门禁与公开仓库 GitHub CI 为基础 |
 | 正式环境 | 各服务器已统一升级到 v4.25.11，并已确认「分流尚未覆盖用户的全部连接」误报不再出现（[公开 Issue #120](https://github.com/Cr0ce11/sb-user-manager-public/issues/120)）；此前 v4.25.8 的升级与迁移备份验证记录见 [公开 Issue #100](https://github.com/Cr0ce11/sb-user-manager-public/issues/100)，v4.25.7 的升级与只读自检记录见 [公开 Issue #69](https://github.com/Cr0ce11/sb-user-manager-public/issues/69)。历次升级均由项目所有者自行执行，仓库侧未登录复核，因此没有仓库可核对的验收报告。首次上线记录见 Issue #96（地址和凭据不进入仓库） |
 | 发布形态 | `Cr0ce11/sb-user-manager-public` 是唯一正式仓库；开发、Issue、Pull Request、完整 CI、匿名在线更新和不可变 Release 全部在这里完成 |
 | 阶段 0 | 已完成（Issue #46，经 PR #47 合并） |

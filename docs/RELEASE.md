@@ -17,7 +17,9 @@
 
 ## 测试机验收
 
-当前的测试机是开发机上的本地 OrbStack 机器（Debian 12 x86_64，完整 systemd）。建立过程、已验证能力与未覆盖项见 [公开 Issue #139](https://github.com/Cr0ce11/sb-user-manager-public/issues/139)：安装、服务启停、Nfuse 的 nftables 计量与配额规则、一致性检查已实测通过；`lifecycle`、`full` 与迁移恢复演练尚未在其中实测，首次使用这些模式时需要逐项确认并把结果补记到该 Issue。
+当前的测试机是开发机上的本地 OrbStack 机器（Debian 12 x86_64，完整 systemd）。建立过程、已验证能力与未覆盖项见 [公开 Issue #139](https://github.com/Cr0ce11/sb-user-manager-public/issues/139)。四种验收模式与跨机迁移恢复演练均已在其中实测通过：`audit`、`release`、`lifecycle`（含分流）、`full`，以及从一台机器创建迁移备份、在另一台全新机器上恢复并确认恢复后的系统真实可用（服务运行、内核计量规则重建、真实流量被计入、用量历史正确迁移）。
+
+有两条使用前提必须知道：`full` 模式要求初始用户与分流均为零；宿主机的代理客户端工作在 fake-IP 模式，会使「远程地址必须是公网」的校验失败，运行分流相关验收前需要为规则集域名写入 `/etc/hosts`，做法见该 Issue。
 
 该环境覆盖不了真实公网客户端连通性、真实流量形态与 VPS 提供商的内核差异，这些仍只有正式环境能回答。
 
