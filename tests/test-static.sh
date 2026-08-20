@@ -63,8 +63,8 @@ trap 'rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fix
 # 注意不要误伤 Nfuse：它的版本查询与代理内核无关，刻意不纳入适配层。
 kernel_adapter_violations() {
   grep -REn --include='*.sh' \
-    '"\$SINGBOX_BIN" format|check -c|generate rand|rule-set (compile|decompile)|systemctl [a-z-]+ "\$SINGBOX_SERVICE"|version 2>/dev/null \| awk .NR==1' \
-    "$1" | grep -v '/05-kernel\.sh:' || true
+    '"\$SINGBOX_BIN" format|sing-box format|check -c|generate rand|rule-set (compile|decompile)|systemctl [a-z-]+ "\$(SINGBOX|MIHOMO)_SERVICE"|(version|-v) 2>/dev/null \| awk .NR==1|"\$MIHOMO_BIN" |mihomo -[tv]|-t -d ' \
+    "$1" | grep -v '/05-kernel\.sh:' | grep -Ev '^[^:]+:[0-9]+:[[:space:]]*#' || true
 }
 if [[ -n "$(kernel_adapter_violations src)" ]]; then
   kernel_adapter_violations src >&2
@@ -72,7 +72,7 @@ if [[ -n "$(kernel_adapter_violations src)" ]]; then
   exit 1
 fi
 # 反面样本：确认该门禁在有人绕过适配层时确实会失败，而不是恒真断言。
-for kernel_adapter_bypass in '"$SINGBOX_BIN" format -c "$SINGBOX_CONFIG"' '"$SINGBOX_BIN" check -c "$SINGBOX_CONFIG"' '/usr/local/bin/sing-box check -c /etc/sing-box/config.json' '"$SINGBOX_BIN" generate rand --base64 32' '"$1" rule-set compile --output "$2" "$3"' 'systemctl restart "$SINGBOX_SERVICE"' '"$1" version 2>/dev/null | awk '"'"'NR==1 {print $3}'"'"''; do
+for kernel_adapter_bypass in '"$SINGBOX_BIN" format -c "$SINGBOX_CONFIG"' '"$SINGBOX_BIN" check -c "$SINGBOX_CONFIG"' '/usr/local/bin/sing-box check -c /etc/sing-box/config.json' '/usr/local/bin/sing-box format -c /etc/sing-box/config.json' '"$SINGBOX_BIN" generate rand --base64 32' '"$1" rule-set compile --output "$2" "$3"' 'systemctl restart "$SINGBOX_SERVICE"' '"$1" version 2>/dev/null | awk '"'"'NR==1 {print $3}'"'"'' '"$MIHOMO_BIN" -t -f "$MIHOMO_CONFIG"' '/usr/local/bin/mihomo -t -d /var/lib/mihomo -f /etc/mihomo/config.json' 'systemctl restart "$MIHOMO_SERVICE"' '"$1" -v 2>/dev/null | awk '"'"'NR==1 {print $3}'"'"''; do
   printf 'x() {\n  %s\n}\n' "$kernel_adapter_bypass" > "$kernel_adapter_fixture/90-bypass.sh"
   if [[ -z "$(kernel_adapter_violations "$kernel_adapter_fixture")" ]]; then
     printf 'kernel adapter check must reject a direct kernel invocation outside the adapter: %s\n' "$kernel_adapter_bypass" >&2
@@ -80,6 +80,24 @@ for kernel_adapter_bypass in '"$SINGBOX_BIN" format -c "$SINGBOX_CONFIG"' '"$SIN
   fi
 done
 rm -f -- "$kernel_adapter_fixture/90-bypass.sh"
+
+# 适配层里凡是提到某个内核的函数，都必须同时提到另一个内核：
+# 只实现一个内核而让另一个悄悄走同一条路，产生的是坏数据而不是错误。
+# 尚未实现的操作也要写出该内核的分支并在其中明确报错。
+if ! python3 tests/check-kernel-dispatch.py src/05-kernel.sh; then
+  echo 'every kernel adapter function naming one proxy kernel must also handle the other' >&2
+  exit 1
+fi
+# 反面样本：只实现 sing-box 的适配层函数必须被拒绝。
+{
+  cat src/05-kernel.sh
+  printf '\nkernel_only_singbox_probe() {\n  case "$PROXY_KERNEL" in\n    singbox) "$SINGBOX_BIN" whatever ;;\n  esac\n}\n'
+} > "$kernel_adapter_fixture/05-kernel-probe.sh"
+if python3 tests/check-kernel-dispatch.py "$kernel_adapter_fixture/05-kernel-probe.sh" >/dev/null; then
+  echo 'kernel dispatch check must reject an adapter function that implements only one kernel' >&2
+  exit 1
+fi
+rm -f -- "$kernel_adapter_fixture/05-kernel-probe.sh"
 
 # GitHub 的 API 查询与资产下载必须经 github_api_get / github_download_to，
 # 不得在调用点各写一份 curl。散落时一旦要调整重试或超时策略就得逐处跟进，
@@ -122,23 +140,44 @@ if [[ -z "$(retry_without_all_errors "$kernel_adapter_fixture")" ]]; then
 fi
 rm -f -- "$kernel_adapter_fixture/91-retry.sh"
 
-sed '/^download_binaries() {/,/^}$/ {
-  /LATEST_SINGBOX_URL/ s/ || return 1//
+sed '/^download_singbox_binary() {/,/^}$/ {
+  /LATEST_KERNEL_URL/ s/ || return 1//
 }' sb-user-manager.sh > "$managed_step_fixture"
 if bash tests/check-managed-step-errexit.sh "$managed_step_fixture" >"$managed_step_output" 2>&1; then
   echo 'managed-step check must reject an unguarded download command' >&2
   exit 1
 fi
-grep -Fq 'managed function download_binaries has an unguarded command' "$managed_step_output"
+grep -Fq 'managed function download_singbox_binary has an unguarded command' "$managed_step_output"
 
-sed '/^write_systemd_units() {/,/^}$/ {
+# 同一条负面样本对 mihomo 分支再做一次。两个内核各有一份下载与单元写入实现，
+# 只验证其中一份等于把另一份留在安全网之外——第一步的教训正是
+# 「给操作换个名字就可能绕过按名字工作的检查器」。
+sed '/^download_mihomo_binary() {/,/^}$/ {
+  /gzip -dc/ s/ || return 1//
+}' sb-user-manager.sh > "$managed_step_fixture"
+if bash tests/check-managed-step-errexit.sh "$managed_step_fixture" >"$managed_step_output" 2>&1; then
+  echo 'managed-step check must reject an unguarded mihomo download command' >&2
+  exit 1
+fi
+grep -Fq 'managed function download_mihomo_binary has an unguarded command' "$managed_step_output"
+
+sed '/^write_kernel_unit() {/,/^}$/ {
   /write_singbox_unit || return 1/ s/ || return 1//
 }' sb-user-manager.sh > "$managed_step_fixture"
 if bash tests/check-managed-step-errexit.sh "$managed_step_fixture" >"$managed_step_output" 2>&1; then
   echo 'managed-step check must reject an unguarded mutation helper' >&2
   exit 1
 fi
-grep -Fq 'managed function write_systemd_units has an unguarded command' "$managed_step_output"
+grep -Fq 'managed function write_kernel_unit has an unguarded command' "$managed_step_output"
+
+sed '/^write_kernel_unit() {/,/^}$/ {
+  /write_mihomo_unit || return 1/ s/ || return 1//
+}' sb-user-manager.sh > "$managed_step_fixture"
+if bash tests/check-managed-step-errexit.sh "$managed_step_fixture" >"$managed_step_output" 2>&1; then
+  echo 'managed-step check must reject an unguarded mihomo mutation helper' >&2
+  exit 1
+fi
+grep -Fq 'managed function write_kernel_unit has an unguarded command' "$managed_step_output"
 
 cp sb-user-manager.sh "$managed_step_fixture"
 printf '\nunclassified_managed_step() {\n  :\n}\nmanaged_step_manifest_fixture() {\n  run_managed_step unclassified_managed_step\n}\n' >> "$managed_step_fixture"
@@ -480,7 +519,7 @@ grep -Fq 'shadowrocket_anytls_url()' sb-user-manager.sh
 grep -Fq 'shadowrocket_ss2022_url()' sb-user-manager.sh
 grep -Fq 'shadowrocket_ss2022_direct_url()' sb-user-manager.sh
 grep -Fq 'printf '"'"'%s'"'"' "$1" | qrencode -t ANSIUTF8 -l L -m 1' sb-user-manager.sh
-grep -Fq 'apt-get install -y ca-certificates curl jq nftables iproute2 util-linux bsdextrautils tar openssl python3 qrencode' sb-user-manager.sh
+grep -Fq 'apt-get install -y ca-certificates curl jq nftables iproute2 util-linux bsdextrautils tar gzip openssl python3 qrencode' sb-user-manager.sh
 if grep -Fq "printf '%s=ss,%s,%s,encrypt-method=%s" sb-user-manager.sh || grep -Fq '%s=anytls,%s,%s,password=%s' sb-user-manager.sh; then
   echo 'legacy Shadowrocket text export must not remain in the manager' >&2
   exit 1
@@ -527,7 +566,7 @@ grep -Fq 'uninstall_managed_environment()' sb-user-manager.sh
 grep -Fq 'managed_uninstall_paths()' sb-user-manager.sh
 grep -Fq 'ensure_safe_ssh_for_complete_uninstall()' sb-user-manager.sh
 grep -Fq 'cleanup_internal_material_after_uninstall()' sb-user-manager.sh
-grep -Fq '完整卸载需要停止 sing-box' sb-user-manager.sh
+grep -Fq '完整卸载需要停止 %s，继续会立即中断当前连接' sb-user-manager.sh
 grep -Fq '加密迁移备份已保留在' sb-user-manager.sh
 grep -Fq "channel 'sing-box 版本管理'" sb-user-manager.sh
 grep -Fq 'audit_consistency()' sb-user-manager.sh
@@ -626,16 +665,16 @@ grep -Fq -- '--max-redirs 0' sb-user-manager.sh
 grep -Fq -- '--connect-timeout 10 --max-time 30' sb-user-manager.sh
 grep -Fq -- '--connect-timeout 10 --max-time 300' sb-user-manager.sh
 grep -Fq 'apt-get update || return 1' sb-user-manager.sh
-grep -Fq 'apt-get install -y ca-certificates curl jq nftables iproute2 util-linux bsdextrautils tar openssl python3 qrencode || return 1' sb-user-manager.sh
+grep -Fq 'apt-get install -y ca-certificates curl jq nftables iproute2 util-linux bsdextrautils tar gzip openssl python3 qrencode || return 1' sb-user-manager.sh
 grep -Fq 'openssl enc -aes-256-cbc -md sha256 -pbkdf2' sb-user-manager.sh
 grep -Fq 'echo '\''用户列表暂时无法格式化，敏感字段已隐藏。'\''' sb-user-manager.sh
 grep -Fq 'prepare_menu_screen()' sb-user-manager.sh
 grep -Fq 'handoff_to_newer_installed_manager()' sb-user-manager.sh
-grep -Fq 'ssh_connection_uses_local_singbox()' sb-user-manager.sh
-grep -Fq 'ensure_safe_ssh_for_singbox_restart()' sb-user-manager.sh
+grep -Fq 'ssh_connection_uses_local_kernel()' sb-user-manager.sh
+grep -Fq 'ensure_safe_ssh_for_kernel_restart()' sb-user-manager.sh
 grep -Fq 'ss -Htnp state established' sb-user-manager.sh
-grep -Fq 'ensure_safe_ssh_for_singbox_restart || return 0' sb-user-manager.sh
-grep -A3 -F 'prompt_add_node()' sb-user-manager.sh | grep -Fq 'ensure_safe_ssh_for_singbox_restart || return 0'
+grep -Fq 'ensure_safe_ssh_for_kernel_restart || return 0' sb-user-manager.sh
+grep -A3 -F 'prompt_add_node()' sb-user-manager.sh | grep -Fq 'ensure_safe_ssh_for_kernel_restart || return 0'
 grep -Fq 'sync_manager_launch_copy()' sb-user-manager.sh
 grep -Fq 'initialize_deployed_state()' sb-user-manager.sh
 grep -Fq 'deployed_state_path()' sb-user-manager.sh

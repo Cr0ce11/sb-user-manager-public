@@ -1,6 +1,6 @@
 
 check_singbox_and_restart() {
-  ensure_safe_ssh_for_singbox_restart rollback || return 1
+  ensure_safe_ssh_for_kernel_restart rollback || return 1
   kernel_check_config "$SINGBOX_CONFIG" || return 1
   kernel_service_reset_failed
   kernel_service_restart || return 1
@@ -460,6 +460,10 @@ migrate_legacy_ss2022_udp_inbounds() {
   command -v jq >/dev/null || return 0
   command -v flock >/dev/null || return 0
   load_runtime_config || return 1
+  # 这是一次性整理历史 sing-box 数据的流程，其它内核的部署里没有对应的历史包袱。
+  # 显式判断而不是依赖「sing-box 文件恰好不存在」——那种依赖在一台两个内核
+  # 的二进制都还留着的机器上会失效。
+  [[ "$PROXY_KERNEL" == singbox ]] || return 0
   [[ -f "$STATE_FILE" && -f "$SINGBOX_CONFIG" && -x "$SINGBOX_BIN" && -x "$NFUSE_BIN" && -S "$NFUSE_SOCKET" ]] || return 0
   ss2022_udp_inbounds_are_current && return 0
 
@@ -476,7 +480,7 @@ migrate_legacy_ss2022_udp_inbounds() {
     release_operation_lock
     return 0
   fi
-  if ! ensure_safe_ssh_for_singbox_restart; then
+  if ! ensure_safe_ssh_for_kernel_restart; then
     release_operation_lock
     return 0
   fi
@@ -896,7 +900,7 @@ cmd_add() {
   local ss_password fragment
   ss_password="$(generate_ss_password "$method")" || return 1
   fragment="$(make_ss2022_inbound "$name" "$port" "$ss_password" "$method")" || return 1
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "add-user:$name" || return 1
 
   run_managed_step state_add_user "$name" "$port" "$ss_password" "$limit" "$anchor" "$metered" "$expires_at" "$method" || return 1
@@ -926,7 +930,7 @@ cmd_add_anytls() {
   local password fragment
   password="$(generate_st_password)"
   fragment="$(make_anytls_inbound "$name" "$port" "$password")"
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "add-anytls-user:$name" || return 1
   run_managed_step state_add_anytls "$name" "$port" "$password" "$limit" "$anchor" "$metered" "$expires_at" "$tls_sni" || return 1
   register_new_user_nfuse "$name" "$port" "$metered" "$limit" "$anchor" || return 1
@@ -979,7 +983,7 @@ cmd_add_multi() {
         {protocol:"anytls",port:$anytls_port,anytls_password:$ENV.SB_JQ_ANYTLS_PASSWORD,tls_sni:$tls_sni}
       ]}')" || return 1
   fragment="$(make_user_inbounds_from_state "$prospective")" || return 1
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "add-multi-user:$name" || return 1
 
   # 先登记可回滚的账户状态，再把两个端口纳入同一流量账户，最后才开放认证入口。
@@ -1072,7 +1076,7 @@ cmd_add_user_endpoint() {
   prospective="$(SB_JQ_ENDPOINT="$endpoint" jq -c '.endpoints += [($ENV.SB_JQ_ENDPOINT | fromjson)]' <<<"$user")" || return 1
   if [[ "$status" == active ]]; then
     fragment="$(make_user_inbounds_from_state "$prospective")" || return 1
-    ensure_safe_ssh_for_singbox_restart || return 0
+    ensure_safe_ssh_for_kernel_restart || return 0
   fi
   start_managed_operation "add-user-endpoint:$name:$kind" || return 1
   run_managed_step nfuse port add "$name" "$port" || return 1
@@ -1131,7 +1135,7 @@ cmd_remove_user_endpoint() {
   status="$(jq -er '.status | select(. == "active" or . == "disabled")' <<<"$user")" || return 1
   if [[ "$status" == active ]]; then
     fragment="$(make_user_inbounds_from_state "$prospective")" || return 1
-    ensure_safe_ssh_for_singbox_restart || return 0
+    ensure_safe_ssh_for_kernel_restart || return 0
   fi
   start_managed_operation "remove-user-endpoint:$name:$kind" || return 1
   run_managed_step state_remove_user_endpoint "$name" "$kind" || return 1
@@ -1171,7 +1175,7 @@ cmd_disable() {
   local status
   status="$(get_user_json "$name" | jq -r '.status')"
   [[ "$status" != "disabled" ]] || die "用户已经停用：$name"
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "disable-user:$name" || return 1
 
   run_managed_step remove_user_inbounds "$name" || return 1
@@ -1229,7 +1233,7 @@ prepare_user_enable() {
       return 1
     fi
   done < <(jq -r 'if (.endpoints | type) == "array" then .endpoints[].port else .port end' <<<"$user")
-  if ! ensure_safe_ssh_for_singbox_restart; then
+  if ! ensure_safe_ssh_for_kernel_restart; then
     printf '错误：为保护当前 SSH 连接，用户没有启用：%s\n' "$name" >&2
     return 1
   fi
@@ -1518,7 +1522,7 @@ cmd_edit_user() {
     fragment="$(make_user_inbounds_from_state "$new_user")" || return 1
   fi
 
-  if [[ "$config_changed" == true ]]; then ensure_safe_ssh_for_singbox_restart || return 0; fi
+  if [[ "$config_changed" == true ]]; then ensure_safe_ssh_for_kernel_restart || return 0; fi
   start_managed_operation "edit-user:$name" || return 1
   if [[ "$new_port" != "$old_port" ]]; then
     # 先持久化新端口的流量统计，再开放新监听；旧端口在服务切换完成前继续受控。
@@ -1577,7 +1581,7 @@ cmd_set_global_sni() {
     return 0
   fi
 
-  if [[ "$protocol" == ss2022 ]] && ((active_count > 0)); then ensure_safe_ssh_for_singbox_restart || return 0; fi
+  if [[ "$protocol" == ss2022 ]] && ((active_count > 0)); then ensure_safe_ssh_for_kernel_restart || return 0; fi
   start_managed_operation "set-global-sni:$protocol" || return 1
   if [[ "$protocol" == ss2022 ]]; then
     run_managed_step write_global_sni_config "$new_sni" "$ANYTLS_SNI" update || return 1
@@ -1602,7 +1606,7 @@ cmd_remove() {
   user_exists "$name" || die "用户不存在：$name"
 
   local split_name split_names split_count=0 nfuse_json
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "remove-user:$name" || return 1
 
   if ! split_names="$(jq -r --arg name "$name" '.splits[]? | select(.scope == "user" and .user == $name) | .name' "$STATE_FILE")"; then
@@ -1701,7 +1705,7 @@ cmd_expire() {
     fi
     if ((expires_epoch <= now)); then
       log "用户已到期，正在停用：$name"
-      ensure_safe_ssh_for_singbox_restart || return 0
+      ensure_safe_ssh_for_kernel_restart || return 0
       start_managed_operation "expire-user:$name" || return 1
       if nfuse_account_exists "$name"; then
         local limit_bytes

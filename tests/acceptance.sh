@@ -152,11 +152,19 @@ run_audit() {
   expected_uid=0
   [[ "$TEST_MODE" != true ]] || expected_uid="$(id -u)"
   if [[ "$conf_uid" == "$expected_uid" && "$conf_mode" =~ ^[0-7]00$ ]]; then pass '管理配置权限' "$conf_mode"; else fail '管理配置权限' "$conf_mode"; fi
-  for service in sing-box.service nfuse.service sb-user-expiry.timer; do
+  # 内核相关的两项经适配层取值，命令写法只在 src/05-kernel.sh 定义一处；
+  # 验收工具自己再写一份 sing-box 的调用，换内核时就会漏掉。
+  for service in "$(kernel_service_name).service" nfuse.service sb-user-expiry.timer; do
     if systemctl is-active --quiet "$service"; then pass "服务 $service" 'active'; else fail "服务 $service" "$(systemctl is-active "$service" 2>/dev/null || printf unknown)"; fi
   done
   if systemctl is-enabled --quiet sb-user-expiry.timer; then pass '到期定时器开机启用'; else fail '到期定时器开机启用'; fi
-  if "$SINGBOX_BIN" check -c "$SINGBOX_CONFIG"; then pass 'sing-box 配置校验'; else fail 'sing-box 配置校验'; fi
+  # 输出先收进日志，只在失败时贴出来：mihomo 的配置校验即使成功也会打印若干行
+  # 启动信息，直接放进验收输出会把真正的失败信息埋掉。
+  if kernel_check_config "$(kernel_config_path)" > "$WORK/kernel-check.log" 2>&1; then
+    pass "$(kernel_display_name) 配置校验"
+  else
+    fail "$(kernel_display_name) 配置校验" "$(tail -n 3 "$WORK/kernel-check.log" | tr '\n' ' ')"
+  fi
   if [[ -S "$NFUSE_SOCKET" || ( "$TEST_MODE" == true && -e "$NFUSE_SOCKET" ) ]]; then pass 'Nfuse Socket'; else fail 'Nfuse Socket' "$NFUSE_SOCKET 不存在"; fi
   if nfuse list --json | jq -e 'type == "array"' >/dev/null; then pass 'Nfuse 数据读取'; else fail 'Nfuse 数据读取'; fi
   runtime_journal="${TRANSACTION_JOURNAL:-/var/lib/sb-user-manager/transactions/active.json}"
@@ -669,9 +677,9 @@ restore_acceptance_snapshot() {
   [[ "$LIVE_STARTED" == true && "$LIVE_CLEANED" != true && -n "$SNAPSHOT" ]] || return 0
   release_operation_lock
   if restore_environment_backup "$SNAPSHOT" > "$WORK/snapshot-restore.log" 2>&1; then
-    "$SINGBOX_BIN" check -c "$SINGBOX_CONFIG" >> "$WORK/snapshot-restore.log" 2>&1 || recovery_ok=false
+    kernel_check_config "$(kernel_config_path)" >> "$WORK/snapshot-restore.log" 2>&1 || recovery_ok=false
     nfuse list --json | jq -e 'type == "array"' >> "$WORK/snapshot-restore.log" 2>&1 || recovery_ok=false
-    for service in sing-box.service nfuse.service sb-user-expiry.timer; do
+    for service in "$(kernel_service_name).service" nfuse.service sb-user-expiry.timer; do
       systemctl is-active --quiet "$service" || recovery_ok=false
     done
     if [[ "$recovery_ok" == true ]]; then

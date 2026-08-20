@@ -84,7 +84,7 @@ chmod 600 "$legacy_config"
   release_operation_lock() { return 0; }
   fetch_latest_releases() {
     printf '%s\n' "$1" > "$WORK/fetch-mode"
-    LATEST_SINGBOX_VERSION=1.13.14
+    LATEST_KERNEL_VERSION=1.13.14
     LATEST_NFUSE_VERSION=0.1.13
     LATEST_MANAGER_VERSION=9.9.9
   }

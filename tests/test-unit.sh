@@ -170,7 +170,7 @@ EOF
 
   cp "$work/state-three-endpoints.json" "$work/state-three-edit-direct.json"
   STATE_FILE="$work/state-three-edit-direct.json"
-  ensure_safe_ssh_for_singbox_restart() { return 0; }
+  ensure_safe_ssh_for_kernel_restart() { return 0; }
   start_managed_operation() { :; }
   finish_managed_operation() { :; }
   generate_ss_password() { printf 'new-direct-secret\n'; }
@@ -230,7 +230,7 @@ EOF
     fi
   }
   generate_ss_password() { printf 'new-direct-secret\n'; }
-  ensure_safe_ssh_for_singbox_restart() { return 0; }
+  ensure_safe_ssh_for_kernel_restart() { return 0; }
   start_managed_operation() { printf 'start:%s\n' "$1" >> "$events"; }
   run_managed_step() { printf 'step:%s\n' "$*" >> "$events"; }
   rebuild_user_splits_if_needed() { return 0; }
@@ -284,7 +284,7 @@ multi_nfuse_remove_line="$(grep -n 'run_managed_step nfuse port rm' <<<"$multi_r
   check_new_user_conflicts() { printf 'preflight:%s:%s\n' "$1" "$3" >> "$events"; }
   generate_st_password() { printf 'test-st-password\n'; }
   generate_ss_password() { printf 'test-ss-password\n'; }
-  ensure_safe_ssh_for_singbox_restart() { return 0; }
+  ensure_safe_ssh_for_kernel_restart() { return 0; }
   start_managed_operation() { printf 'start:%s\n' "$1" >> "$events"; }
   finish_managed_operation() { printf 'finish\n' >> "$events"; }
   run_managed_step() { printf 'step:%s\n' "$1" >> "$events"; "$@"; }
@@ -749,15 +749,15 @@ done
 # 只有当前 SSH 的回连套接字确实归 sing-box 所有时才阻止重启；普通直连和无法判断的连接保持可用。
 (
   unset SSH_CONNECTION
-  if ssh_connection_uses_local_singbox; then
+  if ssh_connection_uses_local_kernel; then
     echo 'non-SSH sessions must not be classified as local sing-box connections' >&2
     exit 1
   fi
 )
 (
   export SSH_CONNECTION='203.0.113.9 54321 192.0.2.10 22'
-  list_singbox_owned_ssh_sockets() { printf '%s\n' 'ESTAB 0 0 192.0.2.10:54321 192.0.2.10:22 users:(("ssh",pid=10,fd=3))'; }
-  if ssh_connection_uses_local_singbox; then
+  list_kernel_owned_ssh_sockets() { printf '%s\n' 'ESTAB 0 0 192.0.2.10:54321 192.0.2.10:22 users:(("ssh",pid=10,fd=3))'; }
+  if ssh_connection_uses_local_kernel; then
     echo 'ordinary direct SSH must not be blocked' >&2
     exit 1
   fi
@@ -765,32 +765,32 @@ done
 (
   socket_probe="$work/ssh-loop-socket-probe"
   export SSH_CONNECTION='192.0.2.10 54321 192.0.2.10 22'
-  list_singbox_owned_ssh_sockets() {
+  list_kernel_owned_ssh_sockets() {
     printf '%s %s\n' "$1" "$2" > "$socket_probe"
     printf '%s\n' 'ESTAB 0 0 192.0.2.10:54321 192.0.2.10:22 users:(("sing-box",pid=20,fd=9))'
   }
-  ssh_connection_uses_local_singbox
+  ssh_connection_uses_local_kernel
   grep -Fxq '54321 22' "$socket_probe"
-  warning="$(ensure_safe_ssh_for_singbox_restart 2>&1 || true)"
+  warning="$(ensure_safe_ssh_for_kernel_restart 2>&1 || true)"
   grep -Fq '当前 SSH 连接正通过这台服务器自己的 sing-box 节点' <<<"$warning"
   grep -Fq '服务器数据尚未修改' <<<"$warning"
 )
 (
   export SSH_CONNECTION='2001:db8::10 60000 2001:db8::20 2222'
-  list_singbox_owned_ssh_sockets() { printf '%s\n' 'ESTAB 0 0 [2001:db8::20]:60000 [2001:db8::20]:2222 users:(("sing-box",pid=20,fd=9))'; }
-  ssh_connection_uses_local_singbox
+  list_kernel_owned_ssh_sockets() { printf '%s\n' 'ESTAB 0 0 [2001:db8::20]:60000 [2001:db8::20]:2222 users:(("sing-box",pid=20,fd=9))'; }
+  ssh_connection_uses_local_kernel
 )
 (
   export SSH_CONNECTION='malformed connection data'
-  list_singbox_owned_ssh_sockets() { echo 'socket lookup must not run for malformed SSH_CONNECTION' >&2; return 90; }
-  if ssh_connection_uses_local_singbox; then
+  list_kernel_owned_ssh_sockets() { echo 'socket lookup must not run for malformed SSH_CONNECTION' >&2; return 90; }
+  if ssh_connection_uses_local_kernel; then
     echo 'malformed SSH_CONNECTION must fail open' >&2
     exit 1
   fi
 )
 (
   later_marker="$work/ssh-loop-add-menu-later"
-  ensure_safe_ssh_for_singbox_restart() { printf '%s\n' blocked; return 1; }
+  ensure_safe_ssh_for_kernel_restart() { printf '%s\n' blocked; return 1; }
   load_runtime_config() { printf '%s\n' unexpected > "$later_marker"; }
   add_menu_output="$(prompt_add_node)"
   grep -Fxq blocked <<<"$add_menu_output"
@@ -1529,7 +1529,7 @@ grep -Fxq 'external executable' "$atomic_install_external"
     exit 1
   fi
 
-  LATEST_SINGBOX_VERSION=1.2.3
+  LATEST_KERNEL_VERSION=1.2.3
   LATEST_NFUSE_VERSION=4.5.6
   write_deployed_versions 4.7.2
   grep -Fxq 'SCRIPT_VERSION=4.7.2' "$SB_SYSTEM_ROOT/var/lib/sb-user-manager/versions"
@@ -1872,8 +1872,8 @@ exercise_install_repair_channel() (
   ENVIRONMENT_CLASS=managed_partial
   show_environment_diagnostics() { :; }
   install_prerequisites() { :; }
-  fetch_latest_releases() { LATEST_SINGBOX_VERSION=1.13.14; }
-  deploy_environment() { printf 'FLOW:singbox:%s\n' "$LATEST_SINGBOX_VERSION"; }
+  fetch_latest_releases() { LATEST_KERNEL_VERSION=1.13.14; }
+  deploy_environment() { printf 'FLOW:singbox:%s\n' "$LATEST_KERNEL_VERSION"; }
   install_environment <<<'1'
 )
 exercise_install_repair_channel "$install_flow_preview_bin" > "$work/install-repair-preview"
@@ -1937,7 +1937,7 @@ set +e
   LOCK_FILE="$work/update-failure.lock"
   flock() { return 0; }
   fetch_latest_releases() {
-    LATEST_SINGBOX_VERSION=1.2.3
+    LATEST_KERNEL_VERSION=1.2.3
     LATEST_NFUSE_VERSION=4.5.6
     LATEST_MANAGER_VERSION="$SCRIPT_VERSION"
   }
@@ -1973,7 +1973,7 @@ fi
   marker="$work/deploy-after-loopback-preflight"
   acquire_operation_lock() { return 0; }
   release_operation_lock() { :; }
-  ensure_safe_ssh_for_singbox_restart() { return 0; }
+  ensure_safe_ssh_for_kernel_restart() { return 0; }
   python3() { return 1; }
   validate_manager_shortcut_path() { : > "$marker"; return 0; }
   create_environment_backup() { : > "$marker"; return 0; }
@@ -1995,7 +1995,7 @@ for environment_entry in deploy takeover uninstall; do
       OPERATION_LOCK_ERROR='另一个管理操作正在进行，请等待完成后再试'
       return 1
     }
-    ensure_safe_ssh_for_singbox_restart() { : > "$side_effect_marker"; }
+    ensure_safe_ssh_for_kernel_restart() { : > "$side_effect_marker"; }
     ensure_safe_ssh_for_complete_uninstall() { : > "$side_effect_marker"; }
     create_environment_backup() { : > "$side_effect_marker"; }
     case "$environment_entry" in
@@ -2037,7 +2037,7 @@ grep -Fq '另一个管理操作正在进行，请等待完成后再试' "$work/u
   fresh_log="$fresh_root/deploy.log"
   mkdir -p "$fresh_root"
   flock() { return 0; }
-  ensure_safe_ssh_for_singbox_restart() { return 0; }
+  ensure_safe_ssh_for_kernel_restart() { return 0; }
   ensure_deploy_loopback_ready() { return 0; }
   validate_manager_shortcut_path() { return 0; }
   uname() { printf 'x86_64\n'; }
@@ -2077,7 +2077,7 @@ grep -Fq '另一个管理操作正在进行，请等待完成后再试' "$work/u
   LOCK_FILE="$failed_root/run/lock/sb-user-manager.lock"
   mkdir -p "$failed_root"
   flock() { return 0; }
-  ensure_safe_ssh_for_singbox_restart() { return 0; }
+  ensure_safe_ssh_for_kernel_restart() { return 0; }
   ensure_deploy_loopback_ready() { return 0; }
   validate_manager_shortcut_path() { return 0; }
   uname() { printf 'x86_64\n'; }
@@ -2104,7 +2104,7 @@ grep -Fq '另一个管理操作正在进行，请等待完成后再试' "$work/u
   interrupted_work=""
   mkdir -p "$interrupted_root"
   flock() { return 0; }
-  ensure_safe_ssh_for_singbox_restart() { return 0; }
+  ensure_safe_ssh_for_kernel_restart() { return 0; }
   ensure_deploy_loopback_ready() { return 0; }
   validate_manager_shortcut_path() { return 0; }
   uname() { printf 'x86_64\n'; }
@@ -2161,9 +2161,9 @@ grep -Fq '另一个管理操作正在进行，请等待完成后再试' "$work/u
   LOCK_FILE="$work/preview-update.lock"
   flock() { return 0; }
   fetch_latest_releases() {
-    LATEST_SINGBOX_VERSION=1.13.14
-    LATEST_SINGBOX_URL=https://example.com/stable.tar.gz
-    LATEST_SINGBOX_SHA256="$(printf 'a%.0s' {1..64})"
+    LATEST_KERNEL_VERSION=1.13.14
+    LATEST_KERNEL_URL=https://example.com/stable.tar.gz
+    LATEST_KERNEL_SHA256="$(printf 'a%.0s' {1..64})"
     LATEST_NFUSE_VERSION=0.1.11
     LATEST_MANAGER_VERSION="$SCRIPT_VERSION"
   }
@@ -3533,7 +3533,7 @@ MERGEORDER
   restart_calls=0
   validate_upstream_candidate() { :; }
   validate_remote_rule_set() { :; }
-  ensure_safe_ssh_for_singbox_restart() { :; }
+  ensure_safe_ssh_for_kernel_restart() { :; }
   start_managed_operation() { :; }
   rebuild_all_split_configs() { rebuild_calls=$((rebuild_calls + 1)); }
   check_singbox_and_restart() { restart_calls=$((restart_calls + 1)); }
@@ -5497,7 +5497,7 @@ state_remove_user anytls-custom
   check_new_user_conflicts() { printf -v "$4" '%s' '{"inbounds":[]}'; printf -v "$5" '%064d' 0; }
   generate_st_password() { printf 'blocked-st\n'; }
   generate_ss_password() { printf 'blocked-ss\n'; }
-  ensure_safe_ssh_for_singbox_restart() { return 1; }
+  ensure_safe_ssh_for_kernel_restart() { return 1; }
   start_managed_operation() { printf '%s\n' started > "$transaction_marker"; }
   nfuse() {
     if [[ "${1:-}" == list && "${2:-}" == --json ]]; then printf '[]\n'; return 0; fi
@@ -5534,7 +5534,7 @@ state_remove_user anytls-custom
   STATE_FILE="$work/multi-enable-state.json"
   printf '%s\n' '{"schema_version":6,"users":[{"name":"multi-enable","port":20025,"protocol":"anytls","status":"disabled","metered":false,"usage_offset_bytes":0,"anytls_password":"at","tls_sni":"at.example.com","endpoints":[{"protocol":"anytls","port":20025,"anytls_password":"at","tls_sni":"at.example.com"},{"protocol":"ss2022","transport":"direct","port":20026,"ss2022_password":"ss","method":"2022-blake3-aes-128-gcm"}]}],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
   tag_exists_in_config() { return 1; }
-  ensure_safe_ssh_for_singbox_restart() { return 0; }
+  ensure_safe_ssh_for_kernel_restart() { return 0; }
   nfuse() {
     [[ "${1:-}" == list && "${2:-}" == --json ]] || return 1
     printf '%s\n' '[{"name":"multi-enable","tier":"c","used_bytes":123,"ports":[{"id":1,"start":20025,"end":20025},{"id":2,"start":20026,"end":20026}]}]'
@@ -6737,13 +6737,15 @@ unset MIGRATION_BACKUP_DIR MIGRATION_REPORT_DIR ENVIRONMENT_BACKUP_BASE
 (
   download_work="$work/download-fingerprint"
   mkdir -p "$download_work"
-  LATEST_SINGBOX_VERSION=1.2.3
-  LATEST_SINGBOX_URL=https://example.com/sing-box.tar.gz
-  LATEST_SINGBOX_SHA256="$(printf '0%.0s' {1..64})"
+  LATEST_KERNEL_VERSION=1.2.3
+  LATEST_KERNEL_ASSET=sing-box-1.2.3-linux-amd64.tar.gz
+  LATEST_KERNEL_URL=https://example.com/sing-box.tar.gz
+  LATEST_KERNEL_SHA256="$(printf '0%.0s' {1..64})"
   LATEST_NFUSE_VERSION=1.2.3
   LATEST_NFUSE_URL=https://example.com/nfuse.tar.gz
   LATEST_NFUSE_SHA256="$(printf '0%.0s' {1..64})"
   installed_singbox_version() { printf '0.0.0'; }
+  installed_kernel_version() { printf '0.0.0'; }
   installed_nfuse_version() { printf '0.0.0'; }
   curl() {
     local output=""
@@ -6772,13 +6774,15 @@ unset MIGRATION_BACKUP_DIR MIGRATION_REPORT_DIR ENVIRONMENT_BACKUP_BASE
 (
   download_work="$work/download-tar-symlink"
   mkdir -p "$download_work"
-  LATEST_SINGBOX_VERSION=1.2.3
-  LATEST_SINGBOX_URL=https://example.com/sing-box.tar.gz
-  LATEST_SINGBOX_SHA256="$(printf 'a%.0s' {1..64})"
+  LATEST_KERNEL_VERSION=1.2.3
+  LATEST_KERNEL_ASSET=sing-box-1.2.3-linux-amd64.tar.gz
+  LATEST_KERNEL_URL=https://example.com/sing-box.tar.gz
+  LATEST_KERNEL_SHA256="$(printf 'a%.0s' {1..64})"
   LATEST_NFUSE_VERSION=1.2.3
   LATEST_NFUSE_URL=https://example.com/nfuse.tar.gz
   LATEST_NFUSE_SHA256="$(printf 'a%.0s' {1..64})"
   installed_singbox_version() { printf '0.0.0'; }
+  installed_kernel_version() { printf '0.0.0'; }
   installed_nfuse_version() { printf '0.0.0'; }
   curl() {
     local output=""
@@ -6860,9 +6864,10 @@ NFUSENEWFMT
 (
   download_work="$work/download-missing-nfuse"
   mkdir -p "$download_work"
-  LATEST_SINGBOX_VERSION=1.13.14
-  LATEST_SINGBOX_URL=https://example.com/sing-box.tar.gz
-  LATEST_SINGBOX_SHA256="$(printf 'a%.0s' {1..64})"
+  LATEST_KERNEL_VERSION=1.13.14
+  LATEST_KERNEL_ASSET=sing-box-1.13.14-linux-amd64.tar.gz
+  LATEST_KERNEL_URL=https://example.com/sing-box.tar.gz
+  LATEST_KERNEL_SHA256="$(printf 'a%.0s' {1..64})"
   LATEST_NFUSE_VERSION=0.1.13
   LATEST_NFUSE_URL=https://example.com/nfuse.tar.gz
   LATEST_NFUSE_SHA256="$(printf 'a%.0s' {1..64})"
@@ -6870,6 +6875,7 @@ NFUSENEWFMT
   printf '%s\n' 'SCRIPT_VERSION=4.12.0' 'SINGBOX_VERSION=1.13.14' 'NFUSE_VERSION=0.1.13' > "$DEPLOYED_VERSIONS_FILE"
   NFUSE_BIN="$download_work/nfuse-missing"
   installed_singbox_version() { printf '1.13.14'; }
+  installed_kernel_version() { printf '1.13.14'; }
   curl() {
     local output=""
     while (($#)); do
@@ -7099,7 +7105,7 @@ fi
     fi
   }
   log() { printf '%s\n' "$*"; }
-  ensure_safe_ssh_for_singbox_restart() { :; }
+  ensure_safe_ssh_for_kernel_restart() { :; }
   start_managed_operation() { printf '%s\n' "$1" >> "$expire_transaction_calls"; }
   run_managed_step() { "$@"; }
   nfuse_account_exists() { return 1; }
@@ -7140,7 +7146,7 @@ fi
       printf '%s\n' '[{"name":"unsafe-user","tier":"c","used_bytes":0,"ports":[{"start":22001,"end":22001}]}]'
     fi
   }
-  ensure_safe_ssh_for_singbox_restart() { return 1; }
+  ensure_safe_ssh_for_kernel_restart() { return 1; }
   start_managed_operation() { printf 'unexpected\n' > "$work/unsafe-enable-started"; }
   if cmd_enable unsafe-user >"$work/unsafe-enable-output" 2>&1; then
     echo 'unsafe SSH enable must fail instead of reporting success' >&2
@@ -8002,8 +8008,10 @@ fi
     exit 1
   fi
 )
-# 全新安装与接管既有安装必须引用同一份骨架来源，不能各写一套
-if ! grep -Fq 'SINGBOX_SKELETON_ENSURE_PROGRAM' <<<"$(declare -f write_base_config)"; then
+# 全新安装与接管既有安装必须引用同一份骨架来源，不能各写一套。
+# 全新安装经适配层的分派取骨架（它按内核选 SINGBOX_/MIHOMO_ 两份之一），
+# 接管既有安装按定义只针对 sing-box，因此直接引用 sing-box 那一份。
+if ! grep -Fq 'kernel_skeleton_ensure_program' <<<"$(declare -f write_base_config)"; then
   echo 'write_base_config must use the shared kernel skeleton program' >&2
   exit 1
 fi
@@ -8046,12 +8054,515 @@ STATE_FILE="'"$work"'/kernel-state.json"'
     echo '未知内核名必须被拒绝，不得静默降级为 singbox' >&2
     exit 1
   fi
+  # mihomo 是本片新接入的内核名，必须被接受。
+  printf '%s\nPROXY_KERNEL="mihomo"\n' "$base" > "$kernel_conf"
+  if [[ "$(read_kernel)" != mihomo ]]; then
+    echo 'PROXY_KERNEL=mihomo 应被接受' >&2
+    exit 1
+  fi
 )
-# sing-box 部署写出的管理配置不得包含 PROXY_KERNEL。写进去会让回退到旧脚本时
-# 因「未知配置项」而无法启动，而 sing-box 部署本来完全不需要这一项。
-if grep -Fq 'PROXY_KERNEL' <<<"$(declare -f write_manager_config)"; then
-  echo 'write_manager_config must not write PROXY_KERNEL for sing-box deployments' >&2
-  exit 1
-fi
+# 管理配置的内容按内核区分，直接检查写出来的文件而不是函数体：
+# 函数体检查会被「把写入挪进另一个函数」绕过，而这条盯的是最终产物。
+(
+  conf_check="$work/manager-config-kernel.conf"
+  # 单元测试以普通用户运行，chown root:root 在这里必然失败且与本条断言无关。
+  chown() { :; }
+  # sing-box 部署写出的管理配置不得包含 PROXY_KERNEL。写进去会让回退到旧脚本时
+  # 因「未知配置项」而无法启动，而 sing-box 部署本来完全不需要这一项。
+  ( CONF_FILE="$conf_check"; PROXY_KERNEL=singbox; write_manager_config ) || {
+    echo 'sing-box 管理配置写入失败' >&2
+    exit 1
+  }
+  if grep -Fq 'PROXY_KERNEL' "$conf_check"; then
+    echo 'sing-box 部署写出的管理配置不得包含 PROXY_KERNEL' >&2
+    exit 1
+  fi
+  if grep -Fq 'MIHOMO_' "$conf_check"; then
+    echo 'sing-box 部署写出的管理配置不得包含 mihomo 的路径' >&2
+    exit 1
+  fi
+  # 对照：只验「sing-box 那份不含这些键」不够——一个什么都不写的实现同样能通过。
+  # 这条确认 mihomo 那份确实写出了内核声明与自己的路径。
+  ( CONF_FILE="$conf_check"; PROXY_KERNEL=mihomo; write_manager_config ) || {
+    echo 'mihomo 管理配置写入失败' >&2
+    exit 1
+  }
+  if ! grep -Fxq 'PROXY_KERNEL="mihomo"' "$conf_check"; then
+    echo 'mihomo 部署写出的管理配置必须声明 PROXY_KERNEL' >&2
+    exit 1
+  fi
+  for mihomo_key in MIHOMO_BIN MIHOMO_CONFIG MIHOMO_SERVICE MIHOMO_WORK_DIR; do
+    if ! grep -Fq "${mihomo_key}=" "$conf_check"; then
+      echo "mihomo 部署写出的管理配置缺少 ${mihomo_key}" >&2
+      exit 1
+    fi
+  done
+  # 写出来的内容必须能被自己的解析器读回去，否则这台机器下次启动就起不来。
+  ( CONF_FILE="$conf_check"
+    STATE_FILE="$work/kernel-state.json"
+    unset PROXY_KERNEL
+    load_runtime_config >/dev/null 2>&1 || exit 1
+    [[ "$PROXY_KERNEL" == mihomo ]] || exit 1 ) || {
+    echo 'mihomo 管理配置无法被 load_runtime_config 读回' >&2
+    exit 1
+  }
+  rm -f -- "$conf_check"
+)
+
+# ============================================================
+# 第二内核 mihomo：安装、服务与版本（公开 Issue #165）
+# ============================================================
+
+# 内核身份三项按 PROXY_KERNEL 分派。
+(
+  # 用可区分的哨兵取值，确认取到的确实是当前内核那一套，而不是碰巧相同的默认值。
+  SINGBOX_BIN=/sentinel/singbox-bin
+  SINGBOX_CONFIG=/sentinel/singbox-config.json
+  SINGBOX_SERVICE=sentinel-singbox
+  MIHOMO_BIN=/sentinel/mihomo-bin
+  MIHOMO_CONFIG=/sentinel/mihomo-config.json
+  MIHOMO_SERVICE=sentinel-mihomo
+  MIHOMO_WORK_DIR=/sentinel/mihomo-work
+  ( PROXY_KERNEL=singbox
+    [[ "$(kernel_binary_path)" == /sentinel/singbox-bin ]] &&
+    [[ "$(kernel_config_path)" == /sentinel/singbox-config.json ]] &&
+    [[ "$(kernel_service_name)" == sentinel-singbox ]] &&
+    [[ "$(kernel_work_dir)" == /var/lib/sing-box ]] &&
+    [[ "$(kernel_display_name)" == sing-box ]] &&
+    [[ "$(kernel_process_name)" == sing-box ]] ) || {
+    echo 'sing-box 部署的内核身份取值不正确' >&2
+    exit 1
+  }
+  ( PROXY_KERNEL=mihomo
+    [[ "$(kernel_binary_path)" == /sentinel/mihomo-bin ]] &&
+    [[ "$(kernel_config_path)" == /sentinel/mihomo-config.json ]] &&
+    [[ "$(kernel_service_name)" == sentinel-mihomo ]] &&
+    [[ "$(kernel_work_dir)" == /sentinel/mihomo-work ]] &&
+    [[ "$(kernel_display_name)" == mihomo ]] &&
+    [[ "$(kernel_process_name)" == mihomo ]] ) || {
+    echo 'mihomo 部署的内核身份取值不正确' >&2
+    exit 1
+  }
+  # 内核名无法识别时必须报错，不得静默返回某一套取值。
+  if ( PROXY_KERNEL=nosuchkernel; kernel_binary_path >/dev/null 2>&1 ); then
+    echo '未知内核名下的身份查询必须失败' >&2
+    exit 1
+  fi
+)
+
+# mihomo 尚未实现的适配层操作必须明确报错，且不得回落到 sing-box 的实现。
+# 回落产生的是按 sing-box 结构改写的坏数据，比报错难查得多。
+(
+  kernel_fallback="$work/kernel-fallback"
+  mkdir -p "$kernel_fallback"
+  marker="$kernel_fallback/singbox-was-called"
+  fake_singbox="$kernel_fallback/sing-box"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'printf called > %q\n' "$marker"
+  } > "$fake_singbox"
+  chmod 755 "$fake_singbox"
+  PROXY_KERNEL=mihomo
+  SINGBOX_BIN="$fake_singbox"
+  SINGBOX_CONFIG="$kernel_fallback/config.json"
+  printf '{}\n' > "$SINGBOX_CONFIG"
+  for unsupported in \
+    'kernel_normalized_config' \
+    'kernel_normalized_default_install' \
+    "kernel_rule_set_compile $fake_singbox in out" \
+    "kernel_rule_set_decompile $fake_singbox in out"; do
+    if $unsupported >/dev/null 2>&1; then
+      printf 'mihomo 部署下 %s 必须报错而不是成功返回\n' "$unsupported" >&2
+      exit 1
+    fi
+  done
+  # 对照：报错还不够，必须确认它根本没去调用 sing-box。
+  if [[ -e "$marker" ]]; then
+    echo 'mihomo 部署下的未实现操作不得回落到 sing-box 实现' >&2
+    exit 1
+  fi
+  # 再一条对照：同样这几个操作在 sing-box 部署下必须真的调用到内核，
+  # 否则「没调用 sing-box」也可能只是因为整段代码根本没跑起来。
+  PROXY_KERNEL=singbox
+  kernel_normalized_config >/dev/null 2>&1 || true
+  if [[ ! -e "$marker" ]]; then
+    echo 'sing-box 部署下读取运行配置必须调用内核' >&2
+    exit 1
+  fi
+)
+
+# 版本号解析：两个内核的子命令与输出格式都不同。
+(
+  version_work="$work/kernel-version"
+  mkdir -p "$version_work"
+  fake_mihomo="$version_work/mihomo"
+  cat > "$fake_mihomo" <<'FAKE'
+#!/usr/bin/env bash
+[[ "$1" == -v ]] || exit 64
+printf 'Mihomo Meta v1.19.30 linux amd64 with go1.26.6 Sun Aug 16 10:01:10 UTC 2026\n'
+printf 'Use tags: with_gvisor\n'
+FAKE
+  chmod 755 "$fake_mihomo"
+  fake_singbox="$version_work/sing-box"
+  cat > "$fake_singbox" <<'FAKE'
+#!/usr/bin/env bash
+[[ "$1" == version ]] || exit 64
+printf 'sing-box version 1.13.19\n'
+FAKE
+  chmod 755 "$fake_singbox"
+  # mihomo 的版本号带 v 前缀，必须去掉才能与 Release 标签去 v 后的写法比较。
+  if [[ "$(PROXY_KERNEL=mihomo; kernel_binary_version "$fake_mihomo")" != 1.19.30 ]]; then
+    echo 'mihomo 版本号解析不正确（应去掉 v 前缀）' >&2
+    exit 1
+  fi
+  if [[ "$(PROXY_KERNEL=singbox; kernel_binary_version "$fake_singbox")" != 1.13.19 ]]; then
+    echo 'sing-box 版本号解析被改坏了' >&2
+    exit 1
+  fi
+  # 微架构不匹配的 mihomo 二进制会拒绝运行；版本读出来必须是空字符串，
+  # 安装流程正是靠这一点当场发现资产选错（公开 Issue #165）。
+  # 拒绝信息走标准错误、退出码 1、标准输出为空——这是真实二进制的行为，
+  # 已在测试机上实测确认，不是照着想象写的。
+  wrong_arch="$version_work/mihomo-wrong-arch"
+  cat > "$wrong_arch" <<'FAKE'
+#!/usr/bin/env bash
+printf 'This program can only be run on AMD64 processors with v3 microarchitecture support.\n' >&2
+exit 1
+FAKE
+  chmod 755 "$wrong_arch"
+  if [[ -n "$(PROXY_KERNEL=mihomo; kernel_binary_version "$wrong_arch")" ]]; then
+    echo '拒绝运行的 mihomo 二进制不应报出版本号' >&2
+    exit 1
+  fi
+)
+
+# 资产名：mihomo 选 compatible 变体，不选不带后缀的那个（那个是 v3 构建）。
+(
+  # 变量名刻意避开 fetch_latest_kernel_release 里的 local release_json：
+  # bash 是动态作用域，同名会让桩函数读到函数内那个尚未赋值的局部变量。
+  mihomo_release_fixture='{"tag_name":"v1.19.30","assets":[
+    {"name":"mihomo-linux-amd64-v1.19.30.gz","browser_download_url":"https://example.com/v3.gz","digest":"sha256:'"$(printf 'a%.0s' {1..64})"'"},
+    {"name":"mihomo-linux-amd64-compatible-v1.19.30.gz","browser_download_url":"https://example.com/compatible.gz","digest":"sha256:'"$(printf 'b%.0s' {1..64})"'"}]}'
+  github_api_get() { printf '%s' "$mihomo_release_fixture"; }
+  PROXY_KERNEL=mihomo
+  fetch_latest_kernel_release || { echo 'mihomo Release 解析失败' >&2; exit 1; }
+  if [[ "$LATEST_KERNEL_ASSET" != mihomo-linux-amd64-compatible-v1.19.30.gz ]]; then
+    printf 'mihomo 资产变体必须是 compatible，实际取到 %s\n' "$LATEST_KERNEL_ASSET" >&2
+    exit 1
+  fi
+  if [[ "$LATEST_KERNEL_URL" != https://example.com/compatible.gz ]]; then
+    echo 'mihomo 资产地址取错了变体' >&2
+    exit 1
+  fi
+  if [[ "$LATEST_KERNEL_VERSION" != 1.19.30 ]]; then
+    echo 'mihomo 版本号应去掉标签的 v 前缀' >&2
+    exit 1
+  fi
+)
+
+# 下载：版本号对不上时必须在安装前停止。这条同时是选错微架构的兜底。
+(
+  dl="$work/kernel-download-mihomo"
+  mkdir -p "$dl"
+  PROXY_KERNEL=mihomo
+  LATEST_KERNEL_VERSION=1.19.30
+  LATEST_KERNEL_ASSET=mihomo-linux-amd64-compatible-v1.19.30.gz
+  LATEST_KERNEL_URL=https://example.com/compatible.gz
+  LATEST_KERNEL_SHA256="$(printf 'b%.0s' {1..64})"
+  github_download_to() { printf 'compressed' > "$1"; }
+  sha256sum() { cat >/dev/null; return 0; }
+  atomic_install_file() { printf 'installed\n' > "$dl/installed"; }
+  # 解压出来的二进制报告的版本与预期不符。
+  gzip() {
+    printf '#!/usr/bin/env bash\nprintf "Mihomo Meta v9.9.9 linux amd64\\n"\n'
+  }
+  if download_mihomo_binary "$dl" >/dev/null 2>&1; then
+    echo '解压出的 mihomo 版本与预期不符时必须失败' >&2
+    exit 1
+  fi
+  if [[ -e "$dl/installed" ]]; then
+    echo '版本不符时不得安装二进制' >&2
+    exit 1
+  fi
+  # 对照：版本相符时同一条路径必须走通并安装，否则上面的失败可能只是别处出错。
+  gzip() {
+    printf '#!/usr/bin/env bash\nprintf "Mihomo Meta v1.19.30 linux amd64\\n"\n'
+  }
+  if ! download_mihomo_binary "$dl" >/dev/null 2>&1; then
+    echo '版本相符时 mihomo 下载安装应当成功' >&2
+    exit 1
+  fi
+  if [[ ! -e "$dl/installed" ]]; then
+    echo '版本相符时应当安装二进制' >&2
+    exit 1
+  fi
+)
+
+# systemd 单元内容。sing-box 一侧必须与升级前一字不变，mihomo 一侧必须带上
+# SAFE_PATHS——公开 Issue #154 实测确认 mihomo 拒绝加载工作目录之外的证书，
+# 而这个限制在 `mihomo -t` 阶段完全不暴露，只有真正启动监听器时才报错。
+(
+  unit_root="$work/kernel-units"
+  mkdir -p "$unit_root/etc/systemd/system"
+  SB_SYSTEM_ROOT="$unit_root"
+  expected_singbox='[Unit]
+Description=sing-box service
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=root
+StateDirectory=sing-box
+ExecStart=/usr/local/bin/sing-box -D /var/lib/sing-box -c /etc/sing-box/config.json run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
+[Install]
+WantedBy=multi-user.target'
+  expected_expiry_service='[Unit]
+Description=Expire sing-box managed users
+After=sing-box.service nfuse.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sb-user-manager --internal-expire'
+  ( PROXY_KERNEL=singbox; write_kernel_unit && write_expiry_units ) || {
+    echo 'sing-box 单元写入失败' >&2
+    exit 1
+  }
+  if [[ "$(<"$unit_root/etc/systemd/system/sing-box.service")" != "$expected_singbox" ]]; then
+    echo 'sing-box 服务单元内容发生了变化；既有部署升级后单元必须一字不变' >&2
+    diff -u <(printf '%s\n' "$expected_singbox") "$unit_root/etc/systemd/system/sing-box.service" >&2 || true
+    exit 1
+  fi
+  if [[ "$(<"$unit_root/etc/systemd/system/sb-user-expiry.service")" != "$expected_expiry_service" ]]; then
+    echo '到期检查单元在 sing-box 部署上的内容发生了变化' >&2
+    diff -u <(printf '%s\n' "$expected_expiry_service") "$unit_root/etc/systemd/system/sb-user-expiry.service" >&2 || true
+    exit 1
+  fi
+  expected_mihomo='[Unit]
+Description=mihomo service
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=root
+StateDirectory=mihomo
+Environment=SAFE_PATHS=/etc/sing-box/cert
+ExecStart=/usr/local/bin/mihomo -d /var/lib/mihomo -f /etc/mihomo/config.json
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
+[Install]
+WantedBy=multi-user.target'
+  ( PROXY_KERNEL=mihomo; write_kernel_unit && write_expiry_units ) || {
+    echo 'mihomo 单元写入失败' >&2
+    exit 1
+  }
+  if [[ "$(<"$unit_root/etc/systemd/system/mihomo.service")" != "$expected_mihomo" ]]; then
+    echo 'mihomo 服务单元内容不符合预期' >&2
+    diff -u <(printf '%s\n' "$expected_mihomo") "$unit_root/etc/systemd/system/mihomo.service" >&2 || true
+    exit 1
+  fi
+  if [[ ! -e "$unit_root/etc/systemd/system/sing-box.service" ]]; then
+    echo '写 mihomo 单元不应删除既有的 sing-box 单元' >&2
+    exit 1
+  fi
+  # 到期检查单元必须跟着内核走，否则 mihomo 机器上它会等一个永远不出现的服务。
+  if ! grep -Fxq 'After=mihomo.service nfuse.service' "$unit_root/etc/systemd/system/sb-user-expiry.service"; then
+    echo 'mihomo 部署的到期检查单元必须依赖 mihomo.service' >&2
+    exit 1
+  fi
+)
+
+# 版本记录里的内核字段按内核命名；sing-box 一侧保持 SINGBOX_VERSION 不变。
+(
+  versions_root="$work/kernel-versions"
+  mkdir -p "$versions_root"
+  SB_SYSTEM_ROOT="$versions_root"
+  LATEST_KERNEL_VERSION=1.19.30
+  LATEST_NFUSE_VERSION=0.1.13
+  ( PROXY_KERNEL=mihomo; write_deployed_versions 4.25.16 ) || {
+    echo 'mihomo 版本记录写入失败' >&2
+    exit 1
+  }
+  if ! grep -Fxq 'MIHOMO_VERSION=1.19.30' "$versions_root/var/lib/sb-user-manager/versions"; then
+    echo 'mihomo 部署的版本记录应写 MIHOMO_VERSION' >&2
+    exit 1
+  fi
+  if grep -Fq 'SINGBOX_VERSION=' "$versions_root/var/lib/sb-user-manager/versions"; then
+    echo 'mihomo 部署的版本记录不应写 SINGBOX_VERSION' >&2
+    exit 1
+  fi
+  LATEST_KERNEL_VERSION=1.13.19
+  ( PROXY_KERNEL=singbox; write_deployed_versions 4.25.16 ) || {
+    echo 'sing-box 版本记录写入失败' >&2
+    exit 1
+  }
+  if ! grep -Fxq 'SINGBOX_VERSION=1.13.19' "$versions_root/var/lib/sb-user-manager/versions"; then
+    echo 'sing-box 部署的版本记录必须继续写 SINGBOX_VERSION' >&2
+    exit 1
+  fi
+)
+
+# 「SSH 连接是否走本机节点」这条护栏按当前内核的进程名匹配。
+# 写死 sing-box 会让它在 mihomo 机器上永远判为「不是本机节点」——
+# 一条恒假的安全检查比没有更糟，因为它看起来还在。
+(
+  SSH_CONNECTION='203.0.113.9 51234 198.51.100.7 22'
+  list_kernel_owned_ssh_sockets() {
+    printf '198.51.100.7:22 203.0.113.9:51234 users:(("mihomo",pid=4242,fd=9))\n'
+  }
+  if ( PROXY_KERNEL=singbox; ssh_connection_uses_local_kernel ); then
+    echo 'sing-box 部署不应把 mihomo 持有的连接判成本机节点' >&2
+    exit 1
+  fi
+  if ! ( PROXY_KERNEL=mihomo; ssh_connection_uses_local_kernel ); then
+    echo 'mihomo 部署必须识别出 mihomo 持有的 SSH 连接' >&2
+    exit 1
+  fi
+  list_kernel_owned_ssh_sockets() {
+    printf '198.51.100.7:22 203.0.113.9:51234 users:(("sing-box",pid=4242,fd=9))\n'
+  }
+  if ! ( PROXY_KERNEL=singbox; ssh_connection_uses_local_kernel ); then
+    echo 'sing-box 部署必须继续识别出 sing-box 持有的 SSH 连接' >&2
+    exit 1
+  fi
+)
+
+# 环境完整性只看当前内核的核心文件：mihomo 机器上没有 sing-box 是正常状态。
+(
+  env_root="$work/kernel-environment"
+  mkdir -p "$env_root/etc/mihomo" "$env_root/usr/local/bin" "$env_root/etc/systemd/system" \
+    "$env_root/etc/sing-box" "$env_root/usr/local/sbin"
+  SB_SYSTEM_ROOT="$env_root"
+  : > "$env_root/etc/mihomo/config.json"
+  : > "$env_root/usr/local/bin/mihomo"
+  : > "$env_root/etc/systemd/system/mihomo.service"
+  : > "$env_root/etc/sb-user-manager.conf"
+  : > "$env_root/etc/sing-box/managed-users.json"
+  : > "$env_root/usr/local/sbin/sb-user-manager"
+  : > "$env_root/usr/local/bin/nfuse"
+  : > "$env_root/etc/systemd/system/nfuse.service"
+  : > "$env_root/etc/systemd/system/sb-user-expiry.service"
+  : > "$env_root/etc/systemd/system/sb-user-expiry.timer"
+  if ! ( PROXY_KERNEL=mihomo; standalone_environment_is_complete ); then
+    echo '只装了 mihomo 的机器应被判为部署完整' >&2
+    exit 1
+  fi
+  # 对照：同一套文件在 sing-box 部署下必须被判为不完整，
+  # 否则「完整」可能只是因为这条检查什么都没查。
+  if ( PROXY_KERNEL=singbox; standalone_environment_is_complete ); then
+    echo '缺少 sing-box 的机器在 sing-box 部署下不应被判为完整' >&2
+    exit 1
+  fi
+)
+
+# mihomo 的配置骨架。对空对象应用得到全新安装的初始配置；
+# 对既有配置应用只补缺项，不覆盖已有值。
+(
+  mihomo_skeleton="$(jq -n "{} | $MIHOMO_SKELETON_ENSURE_PROGRAM")" || {
+    echo 'mihomo 骨架程序无法执行' >&2
+    exit 1
+  }
+  if ! jq -e '
+    .["log-level"] == "info" and .mode == "rule" and
+    (.listeners | type == "array" and length == 0) and
+    (.proxies | type == "array" and length == 0) and
+    (.["proxy-groups"] | type == "array" and length == 0) and
+    (.rules | type == "array" and length == 0)
+  ' <<<"$mihomo_skeleton" >/dev/null; then
+    echo 'mihomo 初始配置骨架不符合预期' >&2
+    printf '%s\n' "$mihomo_skeleton" >&2
+    exit 1
+  fi
+  # 骨架里不写用于重申默认值的键：mihomo 对未知键完全静默，写一个拼错的
+  # external-controller 只会带来虚假的安全感。真正的保护是部署后
+  # 「mihomo 名下监听套接字数为 0」这条可观测断言。
+  if jq -e 'has("external-controller") or has("port") or has("socks-port") or has("mixed-port")' \
+      <<<"$mihomo_skeleton" >/dev/null; then
+    echo 'mihomo 骨架不应写入用于重申默认值的入口配置项' >&2
+    exit 1
+  fi
+  # 对照：补齐必须保留已有内容，而不是丢弃输入重新造一份。
+  existing='{"log-level":"warning","listeners":[{"name":"keep-me","type":"shadowsocks"}]}'
+  filled="$(jq "$MIHOMO_SKELETON_ENSURE_PROGRAM" <<<"$existing")" || {
+    echo 'mihomo 骨架补齐失败' >&2
+    exit 1
+  }
+  if ! jq -e '.["log-level"] == "warning" and (.listeners | length) == 1 and .listeners[0].name == "keep-me" and (.rules | type) == "array"' \
+      <<<"$filled" >/dev/null; then
+    echo 'mihomo 骨架补齐覆盖了已有内容' >&2
+    printf '%s\n' "$filled" >&2
+    exit 1
+  fi
+)
+
+# 已部署的机器执行「安装或修复环境」时，内核必须取自管理配置的声明。
+# 这条是真机上撞出来的：不显式确定内核时，一台 mihomo 机器执行「自动修复缺失内容」
+# 会按文件级默认值走 sing-box——下载 sing-box、写 sing-box 单元、
+# 再用 sing-box 去校验一份不存在的配置。
+(
+  resolve_conf="$work/resolve-kernel.conf"
+  resolve_state="$work/resolve-kernel-state.json"
+  printf '%s\n' '{"schema_version":7,"users":[],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$resolve_state"
+  base_conf='HANDSHAKE_PORT=443
+SHADOWTLS_STRICT_MODE=true
+SS2022_SHADOWTLS_SNI="a.example.com"
+ANYTLS_SNI="b.example.com"
+STATE_FILE="'"$resolve_state"'"'
+  resolved_kernel() {
+    ( CONF_FILE="$resolve_conf"
+      PROXY_KERNEL=singbox
+      resolve_deployment_kernel >/dev/null 2>&1 || exit 1
+      printf '%s' "$PROXY_KERNEL" )
+  }
+
+  printf '%s\nPROXY_KERNEL="mihomo"\n' "$base_conf" > "$resolve_conf"
+  chmod 600 "$resolve_conf"
+  if [[ "$(resolved_kernel)" != mihomo ]]; then
+    echo '已部署的 mihomo 机器再次部署时必须仍按 mihomo 进行' >&2
+    exit 1
+  fi
+  # 对照：同一条路径在 sing-box 机器上必须仍然得到 singbox，
+  # 否则「取到 mihomo」也可能只是因为这个函数把什么都当成 mihomo。
+  printf '%s\n' "$base_conf" > "$resolve_conf"
+  chmod 600 "$resolve_conf"
+  if [[ "$(resolved_kernel)" != singbox ]]; then
+    echo '已部署的 sing-box 机器必须仍按 sing-box 进行' >&2
+    exit 1
+  fi
+  # 尚未部署的机器才轮到测试用的选择方式。
+  rm -f -- "$resolve_conf"
+  if [[ "$( CONF_FILE="$resolve_conf"; PROXY_KERNEL=singbox; SB_DEPLOY_PROXY_KERNEL=mihomo
+            resolve_deployment_kernel >/dev/null 2>&1; printf '%s' "$PROXY_KERNEL" )" != mihomo ]]; then
+    echo '未部署的机器应接受测试用的内核选择' >&2
+    exit 1
+  fi
+)
+
+# 仅供测试的内核选择：只对尚未部署的机器生效，未知取值必须拒绝。
+(
+  select_conf="$work/kernel-select.conf"
+  rm -f -- "$select_conf"
+  if [[ "$( CONF_FILE="$select_conf"; SB_DEPLOY_PROXY_KERNEL=mihomo
+            apply_test_only_kernel_selection >/dev/null; printf '%s' "$PROXY_KERNEL" )" != mihomo ]]; then
+    echo '未部署的机器应接受测试用的内核选择' >&2
+    exit 1
+  fi
+  printf 'HANDSHAKE_PORT=443\n' > "$select_conf"
+  if [[ "$( CONF_FILE="$select_conf"; PROXY_KERNEL=singbox; SB_DEPLOY_PROXY_KERNEL=mihomo
+            apply_test_only_kernel_selection >/dev/null; printf '%s' "$PROXY_KERNEL" )" != singbox ]]; then
+    echo '已部署的机器不得被环境变量改掉内核' >&2
+    exit 1
+  fi
+  rm -f -- "$select_conf"
+  if ( CONF_FILE="$select_conf"; SB_DEPLOY_PROXY_KERNEL=nosuchkernel
+       apply_test_only_kernel_selection >/dev/null 2>&1 ); then
+    echo '未知的测试内核选择必须被拒绝' >&2
+    exit 1
+  fi
+)
+
 
 echo 'unit checks passed'

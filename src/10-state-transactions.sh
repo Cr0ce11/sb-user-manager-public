@@ -120,8 +120,12 @@ check_config_vars() {
   if ! PUBLIC_SERVER="$(detect_public_server)"; then
     die "无法识别公网 IPv4，已停止导出以避免生成内网地址。请检查服务器能否访问 HTTPS；特殊网络可在 ${CONF_FILE} 设置 PUBLIC_SERVER_OVERRIDE=\"公网IPv4\""
   fi
-  [[ -f "$SINGBOX_CONFIG" ]] || die "sing-box 配置不存在：$SINGBOX_CONFIG"
-  [[ -x "$SINGBOX_BIN" ]] || die "sing-box 不可执行：$SINGBOX_BIN"
+  local kernel_config kernel_bin kernel_label
+  kernel_config="$(kernel_config_path)" || die "无法确认代理内核的配置位置"
+  kernel_bin="$(kernel_binary_path)" || die "无法确认代理内核的可执行文件位置"
+  kernel_label="$(kernel_display_name)" || die "无法确认代理内核名称"
+  [[ -f "$kernel_config" ]] || die "${kernel_label} 配置不存在：$kernel_config"
+  [[ -x "$kernel_bin" ]] || die "${kernel_label} 不可执行：$kernel_bin"
   [[ -x "$NFUSE_BIN" ]] || die "nfuse 不可执行：$NFUSE_BIN"
   [[ -S "$NFUSE_SOCKET" ]] || die "流量统计服务尚未就绪（Nfuse 通信文件不存在：${NFUSE_SOCKET}）。请先查看服务状态"
   validate_runtime_config_file
@@ -1009,6 +1013,10 @@ recover_pending_transaction() {
 is_environment_recovery_path() {
   case "$1" in
     /etc/sb-user-manager.conf|/etc/sing-box|/etc/sing-box/*|/etc/systemd/system/sing-box.service|/etc/systemd/system/nfuse.service|/etc/systemd/system/sb-user-expiry.service|/etc/systemd/system/sb-user-expiry.timer|/etc/systemd/system/multi-user.target.wants/sing-box.service|/etc/systemd/system/multi-user.target.wants/nfuse.service|/etc/systemd/system/timers.target.wants/sb-user-expiry.timer|/var/lib/nfuse|/var/lib/nfuse/*|/var/lib/sing-box|/var/lib/sing-box/*|/var/lib/sb-user-manager|/var/lib/sb-user-manager/*|/usr/local/sbin/sb-user-manager|/usr/local/bin/sbm|/usr/local/bin/sing-box|/usr/local/bin/nfuse|/run/nfuse.sock) return 0;;
+    # mihomo 部署的路径。两个内核的路径同时列在白名单里而不是按内核分派：
+    # 白名单只决定「这条路径允不允许出现在事务里」，多列几条不会让不存在的文件
+    # 被创建，而按内核分派会让一台机器换内核后旧路径突然不被允许清理。
+    /etc/mihomo|/etc/mihomo/*|/etc/systemd/system/mihomo.service|/etc/systemd/system/multi-user.target.wants/mihomo.service|/var/lib/mihomo|/var/lib/mihomo/*|/usr/local/bin/mihomo) return 0;;
     *) return 1;;
   esac
 }
@@ -1181,33 +1189,36 @@ write_command_output() {
   "$@" > "$output"
 }
 
-list_singbox_owned_ssh_sockets() {
+list_kernel_owned_ssh_sockets() {
   local client_port="$1" server_port="$2"
   command -v ss >/dev/null 2>&1 || return 1
   ss -Htnp state established \
     "( sport = :${client_port} and dport = :${server_port} )" 2>/dev/null
 }
 
-ssh_connection_uses_local_singbox() {
-  local client_ip client_port server_ip server_port extra socket_rows
+ssh_connection_uses_local_kernel() {
+  local client_ip client_port server_ip server_port extra socket_rows process
   [[ -n "${SSH_CONNECTION:-}" ]] || return 1
   read -r client_ip client_port server_ip server_port extra <<<"$SSH_CONNECTION"
   [[ -n "$client_ip" && -n "$server_ip" && -z "${extra:-}" ]] || return 1
   [[ "$client_port" =~ ^[1-9][0-9]{0,4}$ && "$server_port" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
   ((client_port <= 65535 && server_port <= 65535)) || return 1
-  socket_rows="$(list_singbox_owned_ssh_sockets "$client_port" "$server_port")" || return 1
-  grep -Fq '"sing-box"' <<<"$socket_rows"
+  socket_rows="$(list_kernel_owned_ssh_sockets "$client_port" "$server_port")" || return 1
+  # 按当前内核的进程名匹配。写死 sing-box 会让这条护栏在 mihomo 机器上
+  # 永远判为「不是本机节点」——一条恒假的安全检查比没有更糟，
+  # 因为它看起来还在。
+  process="$(kernel_process_name)" || return 1
+  grep -Fq "\"${process}\"" <<<"$socket_rows"
 }
 
-ensure_safe_ssh_for_singbox_restart() {
-  local phase="${1:-preflight}"
-  ssh_connection_uses_local_singbox || return 0
-  cat <<'EOF'
-检测到当前 SSH 连接正通过这台服务器自己的 sing-box 节点。
-接下来的操作需要重启 sing-box；继续会中断当前连接，并使本次操作等待下次运行脚本时自动恢复。
-EOF
+ensure_safe_ssh_for_kernel_restart() {
+  local phase="${1:-preflight}" label
+  ssh_connection_uses_local_kernel || return 0
+  label="$(kernel_display_name)" || return 1
+  printf '检测到当前 SSH 连接正通过这台服务器自己的 %s 节点。\n' "$label"
+  printf '接下来的操作需要重启 %s；继续会中断当前连接，并使本次操作等待下次运行脚本时自动恢复。\n' "$label"
   if [[ "$phase" == rollback ]]; then
-    echo '为避免连接中断，sing-box 尚未重启；脚本正在撤销本次尚未完成的修改。'
+    printf '为避免连接中断，%s 尚未重启；脚本正在撤销本次尚未完成的修改。\n' "$label"
   else
     echo '为避免连接中断，本次操作已经停止，服务器数据尚未修改。'
   fi

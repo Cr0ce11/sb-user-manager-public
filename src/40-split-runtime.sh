@@ -689,6 +689,10 @@ migrate_empty_split_preset_fields() {
   command -v jq >/dev/null || return 0
   command -v flock >/dev/null || return 0
   load_runtime_config || return 1
+  # 这是一次性整理历史 sing-box 数据的流程，其它内核的部署里没有对应的历史包袱。
+  # 显式判断而不是依赖「sing-box 文件恰好不存在」——那种依赖在一台两个内核
+  # 的二进制都还留着的机器上会失效。
+  [[ "$PROXY_KERNEL" == singbox ]] || return 0
   [[ -f "$STATE_FILE" && -f "$SINGBOX_CONFIG" && -x "$SINGBOX_BIN" && -x "$NFUSE_BIN" && -S "$NFUSE_SOCKET" ]] || return 0
   split_preset_fields_are_current && return 0
   exec 9>"$LOCK_FILE" || return 1
@@ -711,6 +715,10 @@ migrate_shared_preset_runtime_configs() {
   command -v jq >/dev/null || return 0
   command -v flock >/dev/null || return 0
   load_runtime_config || return 1
+  # 这是一次性整理历史 sing-box 数据的流程，其它内核的部署里没有对应的历史包袱。
+  # 显式判断而不是依赖「sing-box 文件恰好不存在」——那种依赖在一台两个内核
+  # 的二进制都还留着的机器上会失效。
+  [[ "$PROXY_KERNEL" == singbox ]] || return 0
   [[ -f "$STATE_FILE" && -f "$SINGBOX_CONFIG" && -x "$SINGBOX_BIN" && -x "$NFUSE_BIN" && -S "$NFUSE_SOCKET" ]] || return 0
   shared_preset_runtime_marker_matches && return 0
   if shared_preset_runtime_is_current; then
@@ -725,7 +733,7 @@ migrate_shared_preset_runtime_configs() {
     release_operation_lock
     return 0
   fi
-  if ! ensure_safe_ssh_for_singbox_restart; then release_operation_lock; return 0; fi
+  if ! ensure_safe_ssh_for_kernel_restart; then release_operation_lock; return 0; fi
   if ! start_managed_operation migrate-shared-presets; then release_operation_lock; return 1; fi
   if ! rebuild_and_finish_split_operation; then
     release_operation_lock
@@ -942,7 +950,7 @@ cmd_outbound_preset_edit() {
   if ((active == 0)); then
     state_replace_outbound_preset "$name" "$upstream" || return 1
   else
-    ensure_safe_ssh_for_singbox_restart || return 0
+    ensure_safe_ssh_for_kernel_restart || return 0
     start_managed_operation "edit-outbound-preset:$name" || return 1
     run_managed_step state_replace_outbound_preset "$name" "$upstream" || return 1
     rebuild_and_finish_split_operation || return 1
@@ -980,7 +988,7 @@ cmd_rule_preset_edit() {
   if ((active == 0)); then
     state_replace_rule_preset "$name" "$url" || return 1
   else
-    ensure_safe_ssh_for_singbox_restart || return 0
+    ensure_safe_ssh_for_kernel_restart || return 0
     start_managed_operation "edit-rule-preset:$name" || return 1
     run_managed_step state_replace_rule_preset "$name" "$url" || return 1
     rebuild_and_finish_split_operation || return 1
@@ -1070,7 +1078,7 @@ cmd_split_add() {
   fi
   validate_split_relationships "$name" "$runtime_rule_tag" "$runtime_outbound_tag" "$scope" "$user" false || return 1
   validate_remote_rule_set "$url"
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "add-split:$name" || return 1
   run_managed_step state_add_split "$name" "$url" "$scope" "$user" "$upstream" "$out_tag" "$rule_tag" "$rule_preset" "$outbound_preset" \
     "$runtime_rule_tag" "$runtime_outbound_tag" "$runtime_transport_tag" || return 1
@@ -1082,7 +1090,7 @@ cmd_split_disable() {
   local name="$1" split
   split_exists "$name" || die "分流不存在：$name"; split="$(jq -c --arg name "$name" '.splits[] | select(.name == $name)' "$STATE_FILE")"
   [[ "$(jq -r '.status' <<<"$split")" == active ]] || die "分流已经停用"
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "disable-split:$name" || return 1
   run_managed_step state_set_split_status "$name" disabled || return 1
   rebuild_and_finish_split_operation || return 1
@@ -1104,7 +1112,7 @@ cmd_split_enable() {
   validate_outbound_tag "$out_tag"
   jq -e --arg out "$out_tag" --arg transport "$(split_transport_tag "$name")" '.outbounds[]? | select(.tag == $out or .tag == $transport)' "$SINGBOX_CONFIG" >/dev/null && die "sing-box 已存在同名分流出站标签"
   jq -e --arg tag "$rule_tag" '.route.rule_set[]? | select(.tag == $tag)' "$SINGBOX_CONFIG" >/dev/null && die "sing-box 已存在同名规则集标签"
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "enable-split:$name" || return 1
   run_managed_step state_set_split_status "$name" active || return 1
   rebuild_and_finish_split_operation || return 1
@@ -1114,7 +1122,7 @@ cmd_split_enable() {
 cmd_split_remove() {
   local name="$1"
   split_exists "$name" || die "分流不存在：$name"
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "remove-split:$name" || return 1
   run_managed_step remove_split_config "$name" || return 1
   run_managed_step state_remove_split "$name" || return 1
@@ -1152,7 +1160,7 @@ cmd_split_edit() {
   fi
   validate_split_relationships "$name" "$runtime_rule_tag" "$runtime_outbound_tag" "$scope" "$user" false || return 1
   validate_remote_rule_set "$url"
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "edit-split:$name" || return 1
   run_managed_step remove_split_config "$name" || return 1
   run_managed_step state_replace_split "$name" "$url" "$scope" "$user" "$upstream" "$out_tag" "$rule_preset" "$outbound_preset" \
@@ -1172,7 +1180,7 @@ cmd_split_move() {
   group="$(split_merge_group_names "$name")" || return 1
   group_size="$(jq 'length' <<<"$group")" || return 1
   if [[ "$current" == "$position" && "$group_size" == 1 ]]; then echo "优先级未变化。"; return 0; fi
-  ensure_safe_ssh_for_singbox_restart || return 0
+  ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "move-split:$name" || return 1
   run_managed_step state_move_split "$group" "$position" || return 1
   rebuild_and_finish_split_operation || return 1

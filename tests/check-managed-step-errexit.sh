@@ -110,9 +110,16 @@ fi
 # Direct targets plus mutation-sensitive helpers reached from those targets.
 cp "$work/expected-direct-functions" "$work/checked-functions"
 cat >> "$work/checked-functions" <<'EOF'
+download_kernel_binary
 download_manager
+download_mihomo_binary
+download_singbox_binary
 write_expiry_units
+write_kernel_unit
+write_mihomo_manager_config
+write_mihomo_unit
 write_nfuse_unit
+write_singbox_manager_config
 write_singbox_unit
 EOF
 LC_ALL=C sort -u -o "$work/checked-functions" "$work/checked-functions"
@@ -124,7 +131,7 @@ awk '
   }
 
   function inspect(statement, line_number, next_statement) {
-    if (statement !~ /(^|[[:space:];|&!])(cat|chmod|chown|clear_environment_transaction|cp|curl|download_manager|github_api_get|github_download_to|install|ln|mv|register_temp_path|rm|sha256sum|sync_transaction_path|systemctl|tar|write_expiry_units|write_nfuse_unit|write_singbox_unit)([[:space:]]|$)/ &&
+    if (statement !~ /(^|[[:space:];|&!])(cat|chmod|chown|clear_environment_transaction|cp|curl|download_kernel_binary|download_manager|download_mihomo_binary|download_singbox_binary|github_api_get|github_download_to|gzip|install|ln|mv|register_temp_path|rm|sha256sum|sync_transaction_path|systemctl|tar|write_expiry_units|write_kernel_unit|write_mihomo_manager_config|write_mihomo_unit|write_nfuse_unit|write_singbox_manager_config|write_singbox_unit)([[:space:]]|$)/ &&
         statement !~ /openssl[[:space:]]+enc([[:space:]]|$)/) {
       return
     }
