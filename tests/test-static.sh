@@ -707,7 +707,7 @@ for shared_helper in default_network_interface ensure_anytls_certificate install
   fi
 done
 [[ "$(grep -Fc 'openssl req -x509 -newkey rsa:2048' sb-user-manager.sh)" == 1 ]]
-[[ "$(grep -Fc 'systemctl enable nfuse sing-box sb-user-expiry.timer' sb-user-manager.sh)" == 1 ]]
+[[ "$(grep -Fc 'systemctl enable nfuse "$kernel_service" sb-user-expiry.timer' sb-user-manager.sh)" == 1 ]]
 grep -Fq 'begin_operation_transaction()' sb-user-manager.sh
 grep -Fq 'recover_pending_transaction()' sb-user-manager.sh
 grep -Fq 'restore_nfuse_snapshot()' sb-user-manager.sh
