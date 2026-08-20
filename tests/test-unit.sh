@@ -14,7 +14,14 @@ trap 'rm -rf "$work"' EXIT
 apply_skeleton_to_test_config() {
   local tmp
   tmp="$(mktemp "$work/skeleton.XXXXXX")" || return 1
-  jq -c "$SINGBOX_SKELETON_ENSURE_PROGRAM" "$SINGBOX_CONFIG" > "$tmp" || return 1
+  # 补齐骨架后再删掉空容器，模拟 sing-box format 的真实输出——它会把空数组整个
+  # 省略。夹具因此与真实部署一致；不这样做就重现不了 Issue #135 那类误报：
+  # 内核桩的 format 分支只做美化输出，会原样保留空数组。
+  jq -c "$SINGBOX_SKELETON_ENSURE_PROGRAM
+    | (if (.inbounds | length) == 0 then del(.inbounds) else . end)
+    | (if (.route.rules | length) == 0 then del(.route.rules) else . end)
+    | (if (.route.rule_set | length) == 0 then del(.route.rule_set) else . end)" \
+    "$SINGBOX_CONFIG" > "$tmp" || return 1
   mv "$tmp" "$SINGBOX_CONFIG" || return 1
 }
 
@@ -7456,7 +7463,11 @@ EOF
   }
   printf '%s\n' '{"schema_version":7,"users":[],"splits":[]}' > "$STATE_FILE"
   # 骨架完整：对照组，必须一个问题都不报。缺了这一组就分不清检查是有效还是恒真。
-  command jq -cn "{} | $SINGBOX_SKELETON_ENSURE_PROGRAM" > "$SINGBOX_CONFIG"
+  # 这里刻意删掉空容器，因为比对基准是 sing-box format 的输出，而它会把空数组
+  # 整个省略。这同时是 Issue #135 的回归用例：修复前，一台没有配分流的服务器
+  # 会被误报缺少 route.rules 与 route.rule_set。
+  command jq -cn "{} | $SINGBOX_SKELETON_ENSURE_PROGRAM
+    | del(.inbounds) | del(.route.rules) | del(.route.rule_set)" > "$SINGBOX_CONFIG"
   audit_consistency > "$work/audit-skeleton-complete-output"
   if [[ "$AUDIT_ISSUES" != 0 ]]; then
     printf '骨架完整时不得报出问题，实际报了 %s 个\n' "$AUDIT_ISSUES" >&2
@@ -7478,7 +7489,8 @@ EOF
     fi
   done
   # 只缺一个子项时应精确到该子项，而不是笼统报出整段
-  command jq -cn "{} | $SINGBOX_SKELETON_ENSURE_PROGRAM" \
+  command jq -cn "{} | $SINGBOX_SKELETON_ENSURE_PROGRAM
+    | del(.inbounds) | del(.route.rules) | del(.route.rule_set)" \
     | command jq -c 'del(.route.final)' > "$SINGBOX_CONFIG"
   audit_consistency > "$work/audit-skeleton-partial-output"
   if [[ "$AUDIT_ISSUES" != 1 ]]; then
