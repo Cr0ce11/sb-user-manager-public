@@ -3614,13 +3614,24 @@ nfuse_port_exists() {
     '.[] | .ports[]? | select(.start <= $port and .end >= $port)' >/dev/null
 }
 
+# 生成 base64 编码的随机密钥，参数是随机字节数。
+# 这里刻意不使用代理内核的随机数命令：密钥生成与内核无关，绑在内核上会让
+# 每个内核都要各实现一遍。openssl 已是本项目的既有依赖（迁移备份加密与
+# AnyTLS 自签证书都在用），语义也与原先一致——参数同为随机字节数，输出同为
+# 带填充的标准 base64。
+# 去掉换行是因为 openssl 在超过 48 字节时会折行；当前只用到 16 与 32 字节，
+# 不触及该边界，但不去掉的话将来改用更长密钥会静默出错。
+generate_random_base64() {
+  openssl rand -base64 "$1" | tr -d '\n' || return 1
+}
+
 generate_ss_password() {
   case "$1" in
     2022-blake3-aes-128-gcm)
-      "$SINGBOX_BIN" generate rand --base64 16
+      generate_random_base64 16
       ;;
     2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305)
-      "$SINGBOX_BIN" generate rand --base64 32
+      generate_random_base64 32
       ;;
     *)
       die "脚本只支持 Shadowsocks 2022 方法，当前：$1"
@@ -3629,7 +3640,7 @@ generate_ss_password() {
 }
 
 generate_st_password() {
-  "$SINGBOX_BIN" generate rand --base64 32
+  generate_random_base64 32
 }
 
 make_user_inbounds() {

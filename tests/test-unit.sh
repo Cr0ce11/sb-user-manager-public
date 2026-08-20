@@ -2943,11 +2943,13 @@ jq -e '
     case "${1:-}" in
       format) jq . "$3";;
       check) jq -e 'type == "object"' "$3" >/dev/null;;
-      generate) printf 'ss-new-secret\n';;
       *) return 64;;
     esac
   }
   SINGBOX_BIN=edit_singbox
+  # 密钥生成已不经内核，因此桩在这里而不是内核桩的 generate 分支上。
+  # 内核桩保留 *) return 64，若将来又有人让内核去生成密钥，这个用例会立刻失败。
+  generate_random_base64() { printf 'ss-new-secret\n'; }
   SINGBOX_SERVICE=sing-box
   port_is_listening() { return 1; }
   systemctl() { printf 'systemctl:%s\n' "$*" >> "$edit_events"; }
@@ -7838,5 +7840,36 @@ if ! grep -Fq 'SINGBOX_CONFIG_NORMALISE_PROGRAM' <<<"$(declare -f singbox_config
   echo 'singbox_config_for_comparison must use the shared normalisation filter' >&2
   exit 1
 fi
+
+# 密钥生成已脱离代理内核改用 openssl。这里锁定输出规格：参数是随机字节数，
+# 输出是带填充的标准 base64 且不含换行。规格弄错会让新建用户的密钥强度与
+# 存量不等价，而这在界面上完全看不出来。
+(
+  assert_key_shape() {
+    local label="$1" value="$2" want_chars="$3" want_bytes="$4" decoded
+    if [[ "${#value}" != "$want_chars" ]]; then
+      printf '%s 应为 %s 字符，实际 %s\n' "$label" "$want_chars" "${#value}" >&2
+      exit 1
+    fi
+    decoded="$(printf '%s' "$value" | base64 -d | wc -c | tr -d ' ')"
+    if [[ "$decoded" != "$want_bytes" ]]; then
+      printf '%s 解码后应为 %s 字节，实际 %s\n' "$label" "$want_bytes" "$decoded" >&2
+      exit 1
+    fi
+    if [[ "$value" == *$'\n'* ]]; then
+      printf '%s 不得包含换行\n' "$label" >&2
+      exit 1
+    fi
+  }
+  assert_key_shape 'SS2022 128 位密钥' "$(generate_ss_password 2022-blake3-aes-128-gcm)" 24 16
+  assert_key_shape 'SS2022 256 位密钥' "$(generate_ss_password 2022-blake3-aes-256-gcm)" 44 32
+  assert_key_shape 'SS2022 chacha20 密钥' "$(generate_ss_password 2022-blake3-chacha20-poly1305)" 44 32
+  assert_key_shape 'ShadowTLS/AnyTLS 密码' "$(generate_st_password)" 44 32
+  # 对照：长度对了也可能是常量。连续两次必须不同，否则随机源已经失效。
+  if [[ "$(generate_st_password)" == "$(generate_st_password)" ]]; then
+    echo '连续两次生成的密钥相同，随机源可能已失效' >&2
+    exit 1
+  fi
+)
 
 echo 'unit checks passed'
