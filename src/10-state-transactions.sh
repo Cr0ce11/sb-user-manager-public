@@ -691,12 +691,12 @@ restore_backup() {
     log "严重错误：备份已恢复，但备份配置校验失败"
     return 1
   fi
-  systemctl reset-failed "$SINGBOX_SERVICE" 2>/dev/null || true
-  if ! systemctl restart "$SINGBOX_SERVICE"; then
+  kernel_service_reset_failed
+  if ! kernel_service_restart; then
     log "严重错误：备份已恢复，但 sing-box 重启失败"
     return 1
   fi
-  if ! systemctl is-active --quiet "$SINGBOX_SERVICE"; then
+  if ! kernel_service_is_active; then
     log "严重错误：备份已恢复，但 sing-box 未处于 active 状态"
     return 1
   fi

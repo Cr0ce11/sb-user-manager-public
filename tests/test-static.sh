@@ -58,16 +58,21 @@ trap 'rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fix
 # 读取内核配置必须经 src/05-kernel.sh 的适配层，其它模块不得直接调用内核。
 # 上游在小版本之间修改配置规范时，只应改适配层一处，而不是逐个模块跟进。
 # 说明：tests/ 下的直接调用是有意的，那里测的就是内核自身的行为。
+# 覆盖四类内核命令：配置读取、配置校验、密钥生成（应完全脱离内核）、
+# 以及服务控制、版本解析与规则集编译。
+# 注意不要误伤 Nfuse：它的版本查询与代理内核无关，刻意不纳入适配层。
 kernel_adapter_violations() {
-  grep -REn --include='*.sh' '"\$SINGBOX_BIN" format|check -c|generate rand' "$1" | grep -v '/05-kernel\.sh:' || true
+  grep -REn --include='*.sh' \
+    '"\$SINGBOX_BIN" format|check -c|generate rand|rule-set (compile|decompile)|systemctl [a-z-]+ "\$SINGBOX_SERVICE"|version 2>/dev/null \| awk .NR==1' \
+    "$1" | grep -v '/05-kernel\.sh:' || true
 }
 if [[ -n "$(kernel_adapter_violations src)" ]]; then
   kernel_adapter_violations src >&2
-  echo 'kernel invocations must go through src/05-kernel.sh; key generation must use generate_random_base64' >&2
+  echo 'kernel invocations (config/check/service/version/rule-set) must go through src/05-kernel.sh; key generation must use generate_random_base64' >&2
   exit 1
 fi
 # 反面样本：确认该门禁在有人绕过适配层时确实会失败，而不是恒真断言。
-for kernel_adapter_bypass in '"$SINGBOX_BIN" format -c "$SINGBOX_CONFIG"' '"$SINGBOX_BIN" check -c "$SINGBOX_CONFIG"' '/usr/local/bin/sing-box check -c /etc/sing-box/config.json' '"$SINGBOX_BIN" generate rand --base64 32'; do
+for kernel_adapter_bypass in '"$SINGBOX_BIN" format -c "$SINGBOX_CONFIG"' '"$SINGBOX_BIN" check -c "$SINGBOX_CONFIG"' '/usr/local/bin/sing-box check -c /etc/sing-box/config.json' '"$SINGBOX_BIN" generate rand --base64 32' '"$1" rule-set compile --output "$2" "$3"' 'systemctl restart "$SINGBOX_SERVICE"' '"$1" version 2>/dev/null | awk '"'"'NR==1 {print $3}'"'"''; do
   printf 'x() {\n  %s\n}\n' "$kernel_adapter_bypass" > "$kernel_adapter_fixture/90-bypass.sh"
   if [[ -z "$(kernel_adapter_violations "$kernel_adapter_fixture")" ]]; then
     printf 'kernel adapter check must reject a direct kernel invocation outside the adapter: %s\n' "$kernel_adapter_bypass" >&2

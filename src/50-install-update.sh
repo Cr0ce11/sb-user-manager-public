@@ -307,11 +307,6 @@ current_singbox_channel() {
   singbox_channel_name "${current:-0.0.0}"
 }
 
-singbox_binary_version() {
-  [[ -x "$1" ]] || return 0
-  "$1" version 2>/dev/null | awk 'NR==1 {print $3}' || true
-}
-
 write_singbox_channel_state() {
   local channel="$1" version="$2" previous_channel="$3" previous_version="$4"
   local dir tmp stable_version preview_version
@@ -319,8 +314,8 @@ write_singbox_channel_state() {
   install -d -m 700 "$dir" || return 1
   tmp="$(mktemp "$dir/.singbox-channel.XXXXXX")" || return 1
   register_temp_path "$tmp" || return 1
-  stable_version="$(singbox_binary_version "$SINGBOX_VERSION_STORE/stable/sing-box")"
-  preview_version="$(singbox_binary_version "$SINGBOX_VERSION_STORE/preview/sing-box")"
+  stable_version="$(kernel_binary_version "$SINGBOX_VERSION_STORE/stable/sing-box")"
+  preview_version="$(kernel_binary_version "$SINGBOX_VERSION_STORE/preview/sing-box")"
   if ! jq -n --arg channel "$channel" --arg version "$version" \
       --arg stable "$stable_version" --arg preview "$preview_version" \
       --arg previous_channel "$previous_channel" --arg previous_version "$previous_version" \
@@ -361,8 +356,8 @@ show_singbox_channel_versions() {
   current="$(installed_singbox_version)"
   [[ -z "$current" ]] || current_label="$(singbox_channel_label "$current")"
   current_channel="$(current_singbox_channel)"
-  cached_stable="$(singbox_binary_version "$SINGBOX_VERSION_STORE/stable/sing-box")"; cached_stable="${cached_stable:-未保存}"
-  cached_preview="$(singbox_binary_version "$SINGBOX_VERSION_STORE/preview/sing-box")"; cached_preview="${cached_preview:-未保存}"
+  cached_stable="$(kernel_binary_version "$SINGBOX_VERSION_STORE/stable/sing-box")"; cached_stable="${cached_stable:-未保存}"
+  cached_preview="$(kernel_binary_version "$SINGBOX_VERSION_STORE/preview/sing-box")"; cached_preview="${cached_preview:-未保存}"
   printf '\n%-16s %-26s\n' '项目' '版本'
   printf '%-16s %-26s\n' '----------------' '--------------------------'
   printf '%-16s %-26s\n' '当前版本' "${current:-未知}（${current_label}）"
@@ -393,9 +388,9 @@ check_rule_set_with_binary() {
   fi
   if [[ "$format" == source ]]; then
     jq -e 'type == "object" and (.version | type == "number") and (.rules | type == "array")' "$downloaded" >/dev/null &&
-      "$binary" rule-set compile --output "$decoded" "$downloaded" >/dev/null
+      kernel_rule_set_compile "$binary" "$downloaded" "$decoded"
   else
-    "$binary" rule-set decompile --output "$decoded" "$downloaded" >/dev/null &&
+    kernel_rule_set_decompile "$binary" "$downloaded" "$decoded" &&
       jq -e 'type == "object" and (.version | type == "number") and (.rules | type == "array")' "$decoded" >/dev/null
   fi
   local rc=$?
@@ -425,7 +420,7 @@ prepare_singbox_release_binary() {
      [[ ! -f "$binary" || -L "$binary" || ! -x "$binary" ]]; then
     return 1
   fi
-  detected="$($binary version 2>/dev/null | awk 'NR==1 {print $3}')"
+  detected="$(kernel_binary_version "$binary")"
   [[ "$detected" == "$version" ]] || return 1
   PREPARED_SINGBOX_BINARY="$binary"
 }
@@ -1116,7 +1111,7 @@ take_over_installed_manager() {
 }
 # <<< manager_channel_handoff
 
-installed_singbox_version() { "${SINGBOX_BIN:-/usr/local/bin/sing-box}" version 2>/dev/null | awk 'NR==1 {print $3}' || true; }
+installed_singbox_version() { kernel_binary_version "${SINGBOX_BIN:-/usr/local/bin/sing-box}"; }
 installed_nfuse_version() {
   local bin="${NFUSE_BIN:-/usr/local/bin/nfuse}" reported rc=0
   # 二进制缺失、丢执行位或根本跑不起来时版本记录都不可信；返回空串让部署流程重新下载。

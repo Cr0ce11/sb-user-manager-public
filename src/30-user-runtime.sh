@@ -2,9 +2,9 @@
 check_singbox_and_restart() {
   ensure_safe_ssh_for_singbox_restart rollback || return 1
   kernel_check_config "$SINGBOX_CONFIG" || return 1
-  systemctl reset-failed "$SINGBOX_SERVICE" 2>/dev/null || true
-  systemctl restart "$SINGBOX_SERVICE" || return 1
-  if ! systemctl is-active --quiet "$SINGBOX_SERVICE"; then
+  kernel_service_reset_failed
+  kernel_service_restart || return 1
+  if ! kernel_service_is_active; then
     log "错误：sing-box 重启后未处于 active 状态"
     return 1
   fi
