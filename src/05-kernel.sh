@@ -440,19 +440,147 @@ kernel_shadowtls_entry_prefixes() {
 # 分流名至少一个字符，managed-split-<名字> 永远带那个连字符。
 MIHOMO_MANAGED_SUB_RULE="managed-splits"
 
-# 判断托管 sub-rule 里的一行是不是某条规则集生成的。
-# 行的形状只有两种，都由 kernel_render_split_plan 生成：
+# 一个用户端点的托管条目除了「在不在」之外还要对哪些字段。
+#
+# 「在不在」两个内核完全一样，由审计里共用的那段程序负责；这里只写形状特有的
+# 那一部分，两个内核各一份，与用户入口的生成放在同一个模块里——生成改了形状，
+# 审计的断言就得跟着改，隔着模块放迟早只改一处。
+#
+# 两段都只用到审计程序里先定义好的 issue()，以及 $config 和 $strict_mode 这两个变量。
+SINGBOX_USER_ENTRY_SHAPE_DEF='
+  def sbm_entry_shape_issues($name; $protocol; $transport; $port; $status; $has_legacy; $expected):
+    (if $protocol == "ss2022" and $transport == "shadowtls" and $status == "active" and
+        any($config.inbounds[]?; .tag == ("ss-udp-" + $name)) and
+        (any($config.inbounds[]?;
+          .tag == ("ss-udp-" + $name) and .type == "shadowsocks" and .network == "udp" and .listen_port == $port) | not)
+     then issue(true; "[可自动修复] 用户 \($name) 的 UDP 连接配置不正确") else empty end),
+    (if $protocol == "ss2022" and $transport == "direct" and $status == "active" and
+        (any($config.inbounds[]?;
+          .tag == $expected and .type == "shadowsocks" and .listen_port == $port and ((.network // "") == "")) | not)
+     then issue(true; "[可自动修复] 用户 \($name) 的原生 SS2022 连接配置不正确") else empty end),
+    (if $protocol == "ss2022" and $transport == "direct" and ($has_legacy | not) and
+        any($config.inbounds[]?; .tag == ("st-" + $name) or .tag == ("ss-udp-" + $name))
+     then issue(true; "[可自动修复] 用户 \($name) 的原生 SS2022 仍有旧版 ShadowTLS 连接残留") else empty end);'
+
+# mihomo 侧的对应物。差别来自 2c 定下的形状：
+# 一个监听器同时承载 TCP 与 UDP（因此没有单独的 UDP 条目，改看 udp 字段），
+# ShadowTLS 是挂在 shadowsocks 监听器上的子结构而不是独立入站。
+#
+# strict-mode 这一条 sing-box 侧今天没有对应检查（它的 strict_mode 同样没查）。
+# mihomo 侧加它的理由是这个键**恰恰是 mihomo 会静默丢弃的那一类**——键名写错
+# 不报错、严格模式悄悄关掉（公开 Issue #154 的更正评论）。运行配置里它是不是
+# 管理配置里那个值，是审计能便宜地回答的问题。
+MIHOMO_USER_ENTRY_SHAPE_DEF='
+  def sbm_entry_shape_issues($name; $protocol; $transport; $port; $status; $has_legacy; $expected):
+    (first($config.listeners[]? | select(.name == ("st-" + $name))) // null) as $shadowtls |
+    (if $protocol == "ss2022" and $transport == "shadowtls" and $status == "active" and
+        ($shadowtls != null) and
+        (($shadowtls | .type == "shadowsocks" and .port == $port and .udp == true and
+          ((.["shadow-tls"].enable // false) == true) and
+          ((.["shadow-tls"].version // 0) == 3)) | not)
+     then issue(true; "[可自动修复] 用户 \($name) 的 SS2022 + ShadowTLS 连接配置不正确") else empty end),
+    (if $protocol == "ss2022" and $transport == "shadowtls" and $status == "active" and
+        ($shadowtls != null) and
+        (($shadowtls | .["shadow-tls"]["strict-mode"]) != $strict_mode)
+     then issue(true; "[可自动修复] 用户 \($name) 的 ShadowTLS 严格模式与管理配置不一致") else empty end),
+    (if $protocol == "ss2022" and $transport == "direct" and $status == "active" and
+        (any($config.listeners[]?;
+          .name == $expected and .type == "shadowsocks" and .port == $port and .udp == true and
+          (has("shadow-tls") | not)) | not)
+     then issue(true; "[可自动修复] 用户 \($name) 的原生 SS2022 连接配置不正确") else empty end),
+    (if $protocol == "ss2022" and $transport == "direct" and ($has_legacy | not) and
+        ($shadowtls != null)
+     then issue(true; "[可自动修复] 用户 \($name) 的原生 SS2022 仍有旧版 ShadowTLS 连接残留") else empty end);'
+
+kernel_user_entry_shape_def() {
+  case "$PROXY_KERNEL" in
+    singbox) printf '%s' "$SINGBOX_USER_ENTRY_SHAPE_DEF" ;;
+    mihomo) printf '%s' "$MIHOMO_USER_ENTRY_SHAPE_DEF" ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 拿运行配置与「我们写进去的样子」做比对之前，要先做的规范化。
+#
+# sing-box 的 Listable 字段只有一个元素时，会被 `format` 规范化成裸标量：
+#   写入的 "inbound":["anytls-share"]  →  读回的 "inbound":"anytls-share"
+# 直接拿它和期望的标签数组做集合运算，jq 会因类型不符而报错
+# （array and string cannot be subtracted）。而这些比对的调用点写成
+# `if ! jq ...` 或 `jq ... || return 1`，jq 崩溃会被当成「配置不符」，
+# 于是既误报「分流尚未覆盖用户的全部连接」，又会触发一次不必要的配置重建与
+# sing-box 重启。字符串上的 `.inbound[]?` 还会安静地什么都不返回，让
+# 「已停用用户的规则仍在生效」这类检查静默失效（v4.25.11 修的正是这个）。
+#
+# **mihomo 侧不存在这件事**：这一支的规范化本身就是 `jq .`，写进去什么形状
+# 读回来就是什么形状，这条管线里没有会改写形状的环节。因此它只做类型校验。
+# 照搬 sing-box 那一段过去没有意义——mihomo 的配置里根本没有 route.rules。
+#
+# 整段放在单引号常量里，调用处只做一次普通变量展开：内联拼接会产生转义双引号，
+# 而 tests/check-shell-call-targets.py 的分词器遇到那种写法会静默停止检查
+# 文件剩余部分（见公开 Issue #102）。
+SINGBOX_CONFIG_NORMALISE_PROGRAM='
+  if type != "object" then error("运行配置不是 JSON 对象") else . end
+  | if (.route.rules? | type) == "array" then
+      .route.rules |= map(
+        if has("inbound") and ((.inbound | type) != "array") then .inbound = [.inbound] else . end)
+    else . end'
+
+MIHOMO_CONFIG_NORMALISE_PROGRAM='
+  if type != "object" then error("运行配置不是 JSON 对象") else . end'
+
+kernel_config_normalise_program() {
+  case "$PROXY_KERNEL" in
+    singbox) printf '%s' "$SINGBOX_CONFIG_NORMALISE_PROGRAM" ;;
+    mihomo) printf '%s' "$MIHOMO_CONFIG_NORMALISE_PROGRAM" ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 骨架反推出的缺项里，期望值为空容器的那些要不要报。
+#
+# sing-box 的 `format` **会把空数组整个省略**，读回来分不清「没有这个键」和
+# 「这个键是空数组」，而对内核而言两者语义相同——不排除就会在没有分流的
+# 服务器上把 route.rules 与 route.rule_set 误报成缺项（v4.25.13 修的正是这个）。
+#
+# **mihomo 侧必须报。** 它的规范化是 `jq .`，空数组原样在，读回来分得清；
+# 照搬那条排除的后果是：一台丢了 listeners、proxies 或 rules 的 mihomo 机器，
+# 「服务与配置检查」会说一切正常。这一条有实测与对照（公开 Issue #189）。
+kernel_skeleton_skips_empty_containers() {
+  case "$PROXY_KERNEL" in
+    singbox) return 0 ;;
+    mihomo) return 1 ;;
+    *) kernel_unknown ;;
+  esac
+}
+
+# 判断托管 sub-rule 里的一行是什么。行的形状只有两种，都由
+# kernel_render_split_plan 生成：
 #   RULE-SET,<规则集>,<出口>
 #   AND,((RULE-SET,<规则集>),(IN-NAME,...)),<出口>
-# 生成与识别必须一起改，因此这段判断与渲染函数放在同一个模块里，
-# 由分流模块以变量展开的方式注入自己的 jq 程序。
-# tests/test-static.sh 据此禁止分流模块与界面模块自己拼这套规则语法。
-MIHOMO_SPLIT_RULE_OWNED_DEF='
+# 生成与识别必须一起改，因此这几段判断与渲染函数放在同一个模块里，
+# 由分流模块与审计以变量展开的方式注入自己的 jq 程序。
+# tests/test-static.sh 据此禁止其它模块自己拼这套规则语法。
+#
+# 四个判断各自回答一个问题：这一行属不属于某条规则集（删除时用）、
+# 是不是「某规则集 → 某出口」（审计「配置完不完整」用）、是不是不限入口的
+# 那一种（审计已停用的全局分流用）、有没有覆盖到某几个入口名（审计
+# 「有没有覆盖用户的全部连接」与「已停用用户是否仍在生效」用）。
+MIHOMO_SPLIT_RULE_DEFS='
   def sbm_line_owned_by($line; $tags):
     ($line | type) == "string" and
     any($tags[]; . as $tag |
       ($line | startswith("RULE-SET," + $tag + ",")) or
-      ($line | contains("(RULE-SET," + $tag + ")")));'
+      ($line | contains("(RULE-SET," + $tag + ")")));
+  def sbm_line_routes($line; $rule; $out):
+    sbm_line_owned_by($line; [$rule]) and ($line | endswith("," + $out));
+  def sbm_line_scope_all($line; $rule; $out):
+    ($line | type) == "string" and $line == ("RULE-SET," + $rule + "," + $out);
+  def sbm_line_covers($line; $names):
+    ($line | type) == "string" and
+    all($names[]; . as $entry | $line | contains("(IN-NAME," + $entry + ")"));
+  def sbm_line_touches($line; $rule; $names):
+    sbm_line_owned_by($line; [$rule]) and
+    any($names[]; . as $entry | $line | contains("(IN-NAME," + $entry + ")"));'
 
 # 派发条目。条件写成覆盖整个端口空间的 DST-PORT，语义是「所有连接」：
 # MATCH 不能当逻辑规则的条件（mihomo 明确拒绝 SUB-RULE,(MATCH),名字），

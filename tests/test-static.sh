@@ -160,6 +160,21 @@ if [[ -n "$(mihomo_rules_dir_literals "$manager_data_fixture")" ]]; then
 fi
 rm -f -- "$manager_data_fixture/93-config.sh"
 
+# 诊断模块不得直接读 sing-box 专有的配置形状。审计要问运行配置的问题都已经
+# 抽成按内核分派的取值函数与判断函数；在这里直接写 .inbounds / .outbounds /
+# .route. 就意味着又长出一条只对一个内核成立的路径，而它在另一个内核上不会
+# 报错，只会静静地什么都查不到——2e 之前那条「尚未支持」的守卫正是为了挡住
+# 这种情况才存在的，守卫撤掉之后需要这条门禁接上。
+singbox_shape_in_diagnostics() {
+  grep -n '\.route\.\|\.inbounds\|\.outbounds' src/60-operations-diagnostics.sh |
+    grep -v '^[0-9]*:[[:space:]]*#' || true
+}
+if [[ -n "$(singbox_shape_in_diagnostics)" ]]; then
+  singbox_shape_in_diagnostics >&2
+  echo 'diagnostics must reach the running config through the kernel-dispatched helpers' >&2
+  exit 1
+fi
+
 # SAFE_PATHS 只能由 mihomo_safe_paths 给出。单元里写一份、配置校验里再写一份，
 # 两边一旦不一致就会出现「管理器说配置不可用、服务其实跑得起来」这种自相矛盾的
 # 失败——2d 实测撞到过一次，当时校验那一侧根本没设这个环境变量。
