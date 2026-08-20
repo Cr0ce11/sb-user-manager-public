@@ -442,6 +442,10 @@ update_deployed_singbox_version() {
 
 show_singbox_channel_versions() {
   local current current_channel current_label='未知' cached_stable='未保存' cached_preview='未保存'
+  # environment_is_deployed 按当前内核判断核心文件是否齐全，因此必须先确定内核。
+  # 此前靠「调用它之前一定有人载入过配置」，而这条约束没写在任何地方、也没有
+  # 检查看守（公开 Issue #171）。重复调用是幂等的。
+  resolve_deployment_kernel || return 1
   environment_is_deployed || { echo "检测结果：尚未安装，请先选择「安装或修复环境」。"; return 0; }
   load_runtime_config
   need_cmd curl; need_cmd jq
@@ -523,6 +527,7 @@ check_singbox_release_compatibility() {
   local channel="$1" version asset url sha256 work binary stable_binary normalized output rule_url rule_count=0
   SINGBOX_COMPATIBLE=false
   SINGBOX_COMPATIBLE_VERSION=""
+  resolve_deployment_kernel || return 1
   environment_is_deployed || { echo "检测结果：尚未安装，请先选择「安装或修复环境」。"; return 0; }
   load_runtime_config
   need_cmd curl; need_cmd jq; need_cmd tar; need_cmd sha256sum
@@ -667,6 +672,7 @@ perform_singbox_channel_switch() {
 
 switch_singbox_channel() {
   local channel="$1" mode="${2:-switch}" current current_channel answer token
+  resolve_deployment_kernel || return 1
   environment_is_deployed || { echo "检测结果：尚未安装，请先选择「安装或修复环境」。"; return 0; }
   current="$(installed_singbox_version)"
   current_channel="$(current_singbox_channel)"
@@ -705,6 +711,8 @@ update_current_singbox_channel() {
 
 singbox_channel_menu() {
   local choice
+  # 守卫判断的是调用时刻的 PROXY_KERNEL，因此先确定内核再判断（公开 Issue #171）。
+  resolve_deployment_kernel || return 1
   # 正式版／测试版通道是 sing-box 特有的发布形态。其它内核没有对应物，
   # 这里明确说明并返回，而不是让下面的流程按 sing-box 的资产名去查一个不存在的东西。
   if [[ "$PROXY_KERNEL" != singbox ]]; then
@@ -2720,6 +2728,7 @@ EOF
 # >>> check_updates
 check_updates() {
   local current_kernel current_nfuse current_manager current_channel kernel_latest_label answer needs_update=false update_manager=false manager_latest_label kernel_label
+  resolve_deployment_kernel || return 1
   environment_is_deployed || { echo "检测结果：尚未安装，请先选择「安装或修复环境」。"; return 0; }
   load_runtime_config
   need_cmd curl; need_cmd jq

@@ -504,13 +504,19 @@ ensure_global_sni_config() {
   log "已写入全局 SNI 配置；原配置备份：$BACKUP_DIR"
 }
 
+# 操作事务的回滚材料。备份的必须是**当前内核自己的**运行配置——
+# 此前这里写死 SINGBOX_CONFIG，在 mihomo 机器上会去备份一份不存在的
+# sing-box 配置，整个操作在第一步就失败（公开 Issue #180）。
+# 备份文件名保持 config.json.<戳> 不变：它只是 BACKUP_DIR 里的一个名字，
+# 改名会让既有部署里已有的回滚组认不出来。
 backup_files() {
-  local stamp config_backup state_backup manager_backup
+  local stamp config_backup state_backup manager_backup runtime_config
+  runtime_config="$(kernel_runtime_config_path)" || return 1
   stamp="$(date '+%Y%m%d-%H%M%S-%N').$$"
   config_backup="$BACKUP_DIR/config.json.$stamp"
   state_backup="$BACKUP_DIR/managed-users.json.$stamp"
   manager_backup="$BACKUP_DIR/sb-user-manager.conf.$stamp"
-  if ! cp -a -- "$SINGBOX_CONFIG" "$config_backup"; then
+  if ! cp -a -- "$runtime_config" "$config_backup"; then
     rm -f -- "$config_backup" "$state_backup" "$manager_backup"
     return 1
   fi
@@ -620,7 +626,7 @@ prune_operation_transaction_backups() {
 }
 
 restore_backup() {
-  local stamp="$1" config_source state_source manager_source config_tmp state_tmp previous_state manager_tmp=""
+  local stamp="$1" config_source state_source manager_source config_tmp state_tmp previous_state manager_tmp="" runtime_config
   config_source="$BACKUP_DIR/config.json.$stamp"
   state_source="$BACKUP_DIR/managed-users.json.$stamp"
   manager_source="$BACKUP_DIR/sb-user-manager.conf.$stamp"
@@ -628,7 +634,8 @@ restore_backup() {
     log "严重错误：事务备份不完整，无法恢复：$stamp"
     return 1
   fi
-  config_tmp="$(mktemp "$(dirname "$SINGBOX_CONFIG")/.restore-config.XXXXXX")" || return 1
+  runtime_config="$(kernel_runtime_config_path)" || return 1
+  config_tmp="$(mktemp "$(dirname "$runtime_config")/.restore-config.XXXXXX")" || return 1
   register_temp_path "$config_tmp"
   state_tmp="$(mktemp "$(dirname "$STATE_FILE")/.restore-state.XXXXXX")" || {
     rm -f -- "$config_tmp"
@@ -661,7 +668,7 @@ restore_backup() {
   fi
   if ! kernel_check_config "$config_tmp"; then
     rm -f -- "$config_tmp" "$state_tmp" "$previous_state" "$manager_tmp"
-    log "严重错误：备份中的 sing-box 配置校验失败"
+    log "严重错误：备份中的运行配置校验失败"
     return 1
   fi
   if ! jq -e 'type == "object"' "$state_tmp" >/dev/null; then
@@ -674,12 +681,12 @@ restore_backup() {
     log "严重错误：无法从备份恢复用户状态"
     return 1
   fi
-  if ! mv -- "$config_tmp" "$SINGBOX_CONFIG"; then
+  if ! mv -- "$config_tmp" "$runtime_config"; then
     if ! mv -- "$previous_state" "$STATE_FILE"; then
-      log "严重错误：sing-box 配置恢复失败，且无法还原原用户状态"
+      log "严重错误：运行配置恢复失败，且无法还原原用户状态"
     fi
     rm -f -- "$config_tmp" "$state_tmp" "$previous_state" "$manager_tmp"
-    log "严重错误：无法从备份恢复 sing-box 配置"
+    log "严重错误：无法从备份恢复运行配置"
     return 1
   fi
   rm -f -- "$previous_state"
@@ -691,17 +698,17 @@ restore_backup() {
       return 1
     fi
   fi
-  if ! kernel_check_config "$SINGBOX_CONFIG"; then
+  if ! kernel_check_config "$runtime_config"; then
     log "严重错误：备份已恢复，但备份配置校验失败"
     return 1
   fi
   kernel_service_reset_failed
   if ! kernel_service_restart; then
-    log "严重错误：备份已恢复，但 sing-box 重启失败"
+    log "严重错误：备份已恢复，但 $(kernel_display_name) 重启失败"
     return 1
   fi
   if ! kernel_service_is_active; then
-    log "严重错误：备份已恢复，但 sing-box 未处于 active 状态"
+    log "严重错误：备份已恢复，但 $(kernel_display_name) 未处于 active 状态"
     return 1
   fi
 }
@@ -977,7 +984,7 @@ commit_operation_transaction() {
     return 0
   fi
   nfuse persist >/dev/null || return 1
-  sync_transaction_path "$SINGBOX_CONFIG" || return 1
+  sync_transaction_path "$(kernel_runtime_config_path)" || return 1
   sync_transaction_path "$STATE_FILE" || return 1
   if [[ -f "$CONF_FILE" ]]; then sync_transaction_path "$CONF_FILE" || return 1; fi
   if [[ -f "$nfuse_db" ]]; then sync_transaction_path "$nfuse_db" || return 1; fi

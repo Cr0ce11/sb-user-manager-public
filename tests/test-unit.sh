@@ -527,14 +527,16 @@ grep -Fq '内部错误：不支持的新增用户协议：unknown' <<<"$unknown_
   grep -Fq '配置在新增用户预检后发生变化' "$work/new-user-change-during-write.out"
   cmp -s "$work/new-user-change-during-write.expected" "$SINGBOX_CONFIG"
 
-  # format 失败必须在事务前失败关闭，并保留原有配置错误文案。
+  # format 失败必须在事务前失败关闭，并报出出错的配置文件。
+  # 文案自 2c 起不再写死 sing-box：同一条路径在 mihomo 部署上指向的是
+  # mihomo 的配置，说成 sing-box 会把人引到错误的文件上去。
   counting_new_user_singbox() { return 77; }
   config_snapshot="" config_source=""
   if format_failure_output="$(check_new_user_conflicts ss2022 broken 23008 config_snapshot config_source 2>&1)"; then
     echo 'new user preflight should fail closed when sing-box format fails' >&2
     exit 1
   fi
-  grep -Fq "无法解析或格式化 sing-box 配置：$SINGBOX_CONFIG" <<<"$format_failure_output"
+  grep -Fq "无法解析或格式化运行配置：$SINGBOX_CONFIG" <<<"$format_failure_output"
 )
 
 # 用户状态变化只有在存在专属分流时才重建配置；失败继续返回给既有事务回滚路径。
@@ -8144,6 +8146,142 @@ STATE_FILE="'"$work"'/kernel-state.json"'
       exit 1
     fi
   done
+)
+
+# ============================================================
+# 用户入口的 mihomo 生成（公开 Issue #180，第二步 2c）
+# ============================================================
+# 三种入口在两个内核下的形状。**条目数量本来就不同**：sing-box 的
+# SS2022 + ShadowTLS 是三个入站，mihomo 是一个同时承载 TCP 与 UDP 的监听器。
+(
+  entry_hs_port=443
+  entry_strict=true
+  gen() { # gen <内核> <函数> <参数...>
+    ( PROXY_KERNEL="$1"; HANDSHAKE_PORT="$entry_hs_port"; SHADOWTLS_STRICT_MODE="$entry_strict"
+      ANYTLS_CERT_FILE=/etc/sing-box/cert/anytls.crt
+      ANYTLS_KEY_FILE=/etc/sing-box/cert/anytls.key
+      shift; "$@" )
+  }
+  expect() { # expect <说明> <期望> <实际>
+    [[ "$2" == "$3" ]] && return 0
+    printf '%s：期望 %s，实际 %s\n' "$1" "$2" "$3" >&2
+    exit 1
+  }
+
+  # 一、SS2022 + ShadowTLS
+  sb="$(gen singbox make_user_inbounds demo 20001 stpw sspw 2022-blake3-aes-128-gcm a.example.com)" || exit 1
+  mh="$(gen mihomo make_user_inbounds demo 20001 stpw sspw 2022-blake3-aes-128-gcm a.example.com)" || exit 1
+  expect 'sing-box 的 SS2022+ShadowTLS 条目数' 3 "$(jq 'length' <<<"$sb")"
+  expect 'mihomo 的 SS2022+ShadowTLS 条目数' 1 "$(jq 'length' <<<"$mh")"
+  expect 'sing-box 仍有单独承载 UDP 的入站' true \
+    "$(jq '[.[] | select(.tag == "ss-udp-demo" and .network == "udp")] | length == 1' <<<"$sb")"
+  expect 'mihomo 监听器名沿用 st- 前缀' '"st-demo"' "$(jq '.[0].name' <<<"$mh")"
+  expect 'mihomo 监听器一条就带 UDP' true "$(jq '.[0].udp' <<<"$mh")"
+  # 严格模式的键名是 strict-mode。写成 strictmode 会被 mihomo 静默丢弃，
+  # 严格模式悄悄关闭，而配置测试与启动日志都不会有任何提示（公开 Issue #154 的更正）。
+  expect 'mihomo 的严格模式键名' true "$(jq '.[0]["shadow-tls"] | has("strict-mode")' <<<"$mh")"
+  expect 'mihomo 不得出现 strictmode 这个写法' false \
+    "$(jq '.[0]["shadow-tls"] | has("strictmode")' <<<"$mh")"
+  expect 'mihomo 的严格模式取值跟随配置' true "$(jq '.[0]["shadow-tls"]["strict-mode"]' <<<"$mh")"
+  # 对照：配置里关掉时，生成的也必须是关的——否则上一条只证明了「这里恒为真」。
+  entry_strict=false
+  mh_off="$(gen mihomo make_user_inbounds demo 20001 stpw sspw 2022-blake3-aes-128-gcm a.example.com)" || exit 1
+  expect '严格模式关闭时生成的取值' false "$(jq '.[0]["shadow-tls"]["strict-mode"]' <<<"$mh_off")"
+  entry_strict=true
+  # 握手目标：sing-box 是 server + server_port 两个字段，mihomo 是单个 dest 字符串。
+  expect 'sing-box 的握手目标' '"a.example.com"' "$(jq '.[0].handshake.server' <<<"$sb")"
+  expect 'mihomo 的握手目标' '"a.example.com:443"' "$(jq '.[0]["shadow-tls"].handshake.dest' <<<"$mh")"
+
+  # 二、原生 SS2022
+  sb="$(gen singbox make_ss2022_inbound demo 20002 sspw 2022-blake3-aes-128-gcm)" || exit 1
+  mh="$(gen mihomo make_ss2022_inbound demo 20002 sspw 2022-blake3-aes-128-gcm)" || exit 1
+  expect 'sing-box 原生 SS2022 的方法字段' '"2022-blake3-aes-128-gcm"' "$(jq '.[0].method' <<<"$sb")"
+  expect 'mihomo 原生 SS2022 的方法字段叫 cipher' '"2022-blake3-aes-128-gcm"' "$(jq '.[0].cipher' <<<"$mh")"
+  expect 'mihomo 原生 SS2022 带 UDP' true "$(jq '.[0].udp' <<<"$mh")"
+  mh="$(gen mihomo make_ss2022_inbound demo 20002 sspw 2022-blake3-aes-128-gcm ss-direct-demo)" || exit 1
+  expect 'mihomo 沿用指定的条目名' '"ss-direct-demo"' "$(jq '.[0].name' <<<"$mh")"
+
+  # 三、AnyTLS：users 在 sing-box 是数组，在 mihomo 是映射；证书字段名也不同。
+  sb="$(gen singbox make_anytls_inbound demo 20003 atpw)" || exit 1
+  mh="$(gen mihomo make_anytls_inbound demo 20003 atpw)" || exit 1
+  expect 'sing-box 的 AnyTLS users 是数组' '"array"' "$(jq '.[0].users | type' <<<"$sb")"
+  expect 'mihomo 的 AnyTLS users 是映射' '"object"' "$(jq '.[0].users | type' <<<"$mh")"
+  expect 'mihomo 的 AnyTLS 密码按用户名索引' '"atpw"' "$(jq '.[0].users.demo' <<<"$mh")"
+  expect 'mihomo 的证书字段名' '"/etc/sing-box/cert/anytls.crt"' "$(jq '.[0].certificate' <<<"$mh")"
+  expect 'mihomo 的私钥字段名' '"/etc/sing-box/cert/anytls.key"' "$(jq '.[0]["private-key"]' <<<"$mh")"
+  # 证书路径跟着 MANAGER_DATA_DIR 走，不是写死的（公开 Issue #173）。
+  mh="$( PROXY_KERNEL=mihomo
+         MANAGER_DATA_DIR=/etc/sb-user-manager; resolve_manager_data_paths
+         make_anytls_inbound demo 20003 atpw )" || exit 1
+  expect 'mihomo 的证书路径跟随管理器数据目录' '"/etc/sb-user-manager/cert/anytls.crt"' \
+    "$(jq '.[0].certificate' <<<"$mh")"
+
+  # 四、未知内核必须报错，不得回落到任意一个内核的形状。
+  if ( PROXY_KERNEL=nosuchkernel; make_anytls_inbound demo 20003 atpw >/dev/null 2>&1 ); then
+    echo '未知内核时生成入口必须报错' >&2
+    exit 1
+  fi
+
+  # 五、托管条目的容器与标识按内核取值。
+  expect 'sing-box 的容器' inbounds "$(PROXY_KERNEL=singbox kernel_managed_container)"
+  expect 'mihomo 的容器' listeners "$(PROXY_KERNEL=mihomo kernel_managed_container)"
+  expect 'sing-box 的标识字段' tag "$(PROXY_KERNEL=singbox kernel_managed_key)"
+  expect 'mihomo 的标识字段' name "$(PROXY_KERNEL=mihomo kernel_managed_key)"
+)
+# 操作事务的回滚材料必须取自当前内核自己的运行配置。此前这里写死 SINGBOX_CONFIG，
+# 在 mihomo 机器上第一步就会去复制一份不存在的 sing-box 配置，整个操作失败。
+# 2c 之前 mihomo 机器不可能有用户，走不到这条路；本片让它可达。
+(
+  txn_root="$work/txn-kernel"
+  mkdir -p "$txn_root/backups"
+  printf '%s' '{"inbounds":[]}' > "$txn_root/singbox.json"
+  printf '%s' '{"listeners":[]}' > "$txn_root/mihomo.json"
+  printf '%s' '{"schema_version":7,"users":[]}' > "$txn_root/state.json"
+  for txn_kernel in singbox mihomo; do
+    stamp="$( PROXY_KERNEL="$txn_kernel"
+              SINGBOX_CONFIG="$txn_root/singbox.json"
+              MIHOMO_CONFIG="$txn_root/mihomo.json"
+              STATE_FILE="$txn_root/state.json"
+              BACKUP_DIR="$txn_root/backups"
+              CONF_FILE="$txn_root/absent.conf"
+              backup_files )" || {
+      printf '%s 部署的事务备份失败\n' "$txn_kernel" >&2
+      exit 1
+    }
+    # 备份文件名保持 config.json.<戳>，内容取自当前内核的运行配置。
+    expected="$txn_root/$txn_kernel.json"
+    if ! cmp -s "$txn_root/backups/config.json.$stamp" "$expected"; then
+      printf '%s 部署的事务备份内容不是该内核的运行配置\n' "$txn_kernel" >&2
+      exit 1
+    fi
+  done
+  # 对照：备份出来的两份内容必须不同，否则上面的比对可能只是「两个文件恰好一样」。
+  if cmp -s "$txn_root/singbox.json" "$txn_root/mihomo.json"; then
+    echo '对照失败：两个内核的样例配置内容相同，比对不成立' >&2
+    exit 1
+  fi
+  rm -rf -- "$txn_root"
+)
+
+# 分流的运行配置改写在 mihomo 上必须明确失败，不得写到 sing-box 的配置里去。
+# 2c 让 mihomo 机器第一次能有用户，分流菜单随之可达，而分流的 mihomo 侧要到 2d。
+(
+  split_probe_config="$work/split-guard-config.json"
+  printf '%s' '{"inbounds":[],"outbounds":[]}' > "$split_probe_config"
+  if ( PROXY_KERNEL=mihomo; SINGBOX_CONFIG="$split_probe_config"
+       rewrite_singbox_config '.' >/dev/null 2>&1 ); then
+    echo 'mihomo 部署上改写分流运行配置必须失败' >&2
+    exit 1
+  fi
+  # 对照：sing-box 上照常工作，否则上一条也可能只是「这个函数整个坏了」。
+  if ! ( PROXY_KERNEL=singbox; SINGBOX_CONFIG="$split_probe_config"
+         MIHOMO_CONFIG="$split_probe_config"
+         kernel_normalized_config() { cat "$SINGBOX_CONFIG"; }
+         rewrite_singbox_config '.' >/dev/null 2>&1 ); then
+    echo 'sing-box 部署上改写分流运行配置必须照常工作' >&2
+    exit 1
+  fi
+  rm -f -- "$split_probe_config"
 )
 
 # ============================================================

@@ -548,7 +548,42 @@ grep -Fq 'if ! migrate_legacy_ss2022_udp_inbounds; then' sb-user-manager.sh
 grep -Fq 'run_managed_step rebuild_all_split_configs' sb-user-manager.sh
 grep -Fq 'make_ss2022_inbound()' sb-user-manager.sh
 grep -Fq 'transport:"direct"' sb-user-manager.sh
-grep -Fq '"tag": ("ss-udp-" + $name)' sb-user-manager.sh
+# sing-box 的 SS2022 + ShadowTLS 需要一个单独承载 UDP 的入站；mihomo 一个监听器
+# 同时承载 TCP 与 UDP，靠 "udp":true（实测确认，公开 Issue #180）。两条各盯一个内核，
+# 漏掉任一侧的 UDP 都会变红。生成的形状本身由单元测试逐字段断言。
+grep -Fq '"tag":("ss-udp-" + $name)' sb-user-manager.sh
+grep -Fq '"cipher":$method,"password":$ENV.SB_JQ_SS_PASSWORD,"udp":true' sb-user-manager.sh
+# ShadowTLS 严格模式在 mihomo 侧的键名是 strict-mode，不是 strictmode：监听器配置
+# 走 inbound 结构体标签而不是 yaml 标签（公开 Issue #154 的更正）。写错会被静默丢弃，
+# 严格模式悄悄关闭，而配置测试与启动日志都不会有任何提示。
+grep -Fq '"strict-mode":$strict' sb-user-manager.sh
+# 只盯键的写法（带引号或 jq 的裸键），不然解释这件事的注释自己会把门禁弄红。
+strictmode_key_typos() {
+  grep -En '"strictmode"|[^a-z-]strictmode:' "$1" || true
+}
+if [[ -n "$(strictmode_key_typos sb-user-manager.sh)" ]]; then
+  strictmode_key_typos sb-user-manager.sh >&2
+  echo 'mihomo ShadowTLS strict mode key is strict-mode; strictmode is silently dropped' >&2
+  exit 1
+fi
+# 反面样本：两种写错的形态都必须被抓到，同时确认正确写法与解释它的注释不会误伤。
+printf 'x() {\n  jq -n %s{"shadow-tls":{"strictmode":$s}}%s\n}\n' "'" "'" > "$manager_data_fixture/92-strictmode.sh"
+if [[ -z "$(strictmode_key_typos "$manager_data_fixture/92-strictmode.sh")" ]]; then
+  echo 'strict mode key check must reject a quoted strictmode key' >&2
+  exit 1
+fi
+printf 'x() {\n  jq -n %s{shadow-tls:{strictmode:$s}}%s\n}\n' "'" "'" > "$manager_data_fixture/92-strictmode.sh"
+if [[ -z "$(strictmode_key_typos "$manager_data_fixture/92-strictmode.sh")" ]]; then
+  echo 'strict mode key check must reject a bare strictmode key' >&2
+  exit 1
+fi
+printf '# 键名是 strict-mode 不是 strictmode，写错会被静默丢弃\nx() {\n  jq -n %s{"strict-mode":$s}%s\n}\n' "'" "'" \
+  > "$manager_data_fixture/92-strictmode.sh"
+if [[ -n "$(strictmode_key_typos "$manager_data_fixture/92-strictmode.sh")" ]]; then
+  echo 'strict mode key check must not flag the correct key or the comment explaining it' >&2
+  exit 1
+fi
+rm -f -- "$manager_data_fixture/92-strictmode.sh"
 grep -Fq 'shadow-tls-version=3, udp-relay=true' sb-user-manager.sh
 grep -Fq 'shadowrocket_anytls_url()' sb-user-manager.sh
 grep -Fq 'shadowrocket_ss2022_url()' sb-user-manager.sh
