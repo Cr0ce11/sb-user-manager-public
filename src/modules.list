@@ -1,4 +1,5 @@
 00-bootstrap.sh
+05-kernel.sh
 10-state-transactions.sh
 20-migration-backup.sh
 30-user-runtime.sh

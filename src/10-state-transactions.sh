@@ -289,7 +289,7 @@ migrate_state() {
   if ((schema == 1)); then
     normalized="$(mktemp "$(dirname "$STATE_FILE")/.migration-config.XXXXXX")"
     register_temp_path "$normalized"
-    if ! "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" > "$normalized"; then
+    if ! kernel_normalized_config > "$normalized"; then
       rm -f "$normalized"; restore_state_backup_atomically "$backup" || die "旧用户资料升级失败，且无法自动恢复原数据；备份：$backup"
       die "无法读取连接配置，旧用户资料未能升级；原数据已自动恢复"
     fi

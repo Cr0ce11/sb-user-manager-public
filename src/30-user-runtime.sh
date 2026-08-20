@@ -20,7 +20,7 @@ port_in_state() {
 
 tag_exists_in_config() {
   local tag="$1"
-  "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" |
+  kernel_normalized_config |
     jq -e --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' >/dev/null
 }
 
@@ -41,7 +41,7 @@ load_new_user_config_snapshot() {
   local json_output_name="$1" source_output_name="$2"
   local source_before snapshot_json
   read_singbox_config_source source_before || return 1
-  snapshot_json="$("$SINGBOX_BIN" format -c "$SINGBOX_CONFIG")" || return 1
+  snapshot_json="$(kernel_normalized_config)" || return 1
   printf -v "$json_output_name" '%s' "$snapshot_json"
   printf -v "$source_output_name" '%s' "$source_before"
 }
@@ -294,7 +294,7 @@ rewrite_singbox_config() {
     return 1
   }
   register_temp_path "$normalized"
-  if ! "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG" > "$normalized"; then
+  if ! kernel_normalized_config > "$normalized"; then
     rm -f -- "$tmp" "$normalized"
     printf '错误：无法解析或格式化 sing-box 配置：%s\n' "$SINGBOX_CONFIG" >&2
     return 1

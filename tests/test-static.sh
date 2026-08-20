@@ -6,11 +6,12 @@ cd "$(dirname "$0")/.."
 [[ -x tools/build-manager.sh ]]
 [[ -f src/modules.list && ! -L src/modules.list ]]
 source_module_count="$(find src -maxdepth 1 -type f -name '[0-9][0-9]-*.sh' | wc -l | tr -d ' ')"
-if [[ "$source_module_count" != 10 ]]; then
-  printf 'expected 10 source modules, found %s\n' "$source_module_count" >&2
+if [[ "$source_module_count" != 11 ]]; then
+  printf 'expected 11 source modules, found %s\n' "$source_module_count" >&2
   exit 1
 fi
 expected_modules='00-bootstrap.sh
+05-kernel.sh
 10-state-transactions.sh
 20-migration-backup.sh
 30-user-runtime.sh
@@ -52,7 +53,26 @@ convention_fixture="$(mktemp "${TMPDIR:-/tmp}/sb-convention-fixture.XXXXXX")"
 convention_output="$(mktemp "${TMPDIR:-/tmp}/sb-convention-output.XXXXXX")"
 negation_fixture="$(mktemp "${TMPDIR:-/tmp}/sb-negation-fixture.XXXXXX")"
 negation_output="$(mktemp "${TMPDIR:-/tmp}/sb-negation-output.XXXXXX")"
-trap 'rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fixture" "$shell_target_output" "$convention_fixture" "$convention_output" "$negation_fixture" "$negation_output"' EXIT
+kernel_adapter_fixture="$(mktemp -d "${TMPDIR:-/tmp}/sb-kernel-adapter.XXXXXX")"
+trap 'rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fixture" "$shell_target_output" "$convention_fixture" "$convention_output" "$negation_fixture" "$negation_output"; rm -rf -- "$kernel_adapter_fixture"' EXIT
+# 读取内核配置必须经 src/05-kernel.sh 的适配层，其它模块不得直接调用内核。
+# 上游在小版本之间修改配置规范时，只应改适配层一处，而不是逐个模块跟进。
+# 说明：tests/ 下的直接调用是有意的，那里测的就是内核自身的行为。
+kernel_adapter_violations() {
+  grep -REn --include='*.sh' '"\$SINGBOX_BIN" format' "$1" | grep -v '/05-kernel\.sh:' || true
+}
+if [[ -n "$(kernel_adapter_violations src)" ]]; then
+  kernel_adapter_violations src >&2
+  echo 'kernel config reads must go through kernel_normalized_config in src/05-kernel.sh' >&2
+  exit 1
+fi
+# 反面样本：确认该门禁在有人绕过适配层时确实会失败，而不是恒真断言。
+printf 'x() {\n  "$SINGBOX_BIN" format -c "$SINGBOX_CONFIG"\n}\n' > "$kernel_adapter_fixture/90-bypass.sh"
+if [[ -z "$(kernel_adapter_violations "$kernel_adapter_fixture")" ]]; then
+  echo 'kernel adapter check must reject a direct kernel invocation outside the adapter' >&2
+  exit 1
+fi
+
 sed '/^download_binaries() {/,/^}$/ {
   /LATEST_SINGBOX_URL/ s/ || return 1//
 }' sb-user-manager.sh > "$managed_step_fixture"
