@@ -15,7 +15,7 @@
 3. 只修改 `src/` 中的源码模块，不直接编辑生成物 `sb-user-manager.sh`；模块顺序只通过 `src/modules.list` 管理。
 4. 运行 `bash tools/build-manager.sh` 重新生成单脚本，同时更新相应测试和文档。
 5. 在本地运行发布门禁。
-6. 对服务器相关变化执行 Debian 12 x86_64 专用测试机验收。
+6. 对服务器相关变化在 Debian 12 x86_64 测试机执行适用的验收模式；当前使用开发机上的本地 OrbStack 测试机，其已验证能力与未覆盖项见 [公开 Issue #139](https://github.com/Cr0ce11/sb-user-manager-public/issues/139)。
 7. 创建草稿 Pull Request，记录风险、测试和恢复方式。
 8. 项目所有者确认用户体验后才进入发布流程；正式环境或高风险操作还需单独明确授权。
 
@@ -81,10 +81,10 @@ GitHub 分支保护要求 `validate`、`jq16-compat` 和 `debian-standalone-e2e`
 - 数据格式变化具备兼容及回滚方案。
 - README、CHANGELOG 或设计文档已按影响更新。
 - 本地测试和 GitHub CI 通过。
-- 涉及真实服务的变更已上传专用测试服务器验证。
+- 涉及真实服务的变更已在 Debian 12 x86_64 测试机验证。
 - Pull Request 说明用户影响、技术风险和恢复办法。
 
-纯文档和 GitHub 模板变更可以免除测试服务器部署，但仍需通过本地测试和 CI。
+纯文档和 GitHub 模板变更可以免除测试机部署，但仍需通过本地测试和 CI。
 
 ## AI 协作交接
 
