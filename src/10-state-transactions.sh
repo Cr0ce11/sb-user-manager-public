@@ -1012,6 +1012,10 @@ recover_pending_transaction() {
 
 is_environment_recovery_path() {
   case "$1" in
+    # 管理器自身数据的目录。今天它等于 /etc/sing-box，下面那条字面量已经覆盖；
+    # 单列一条是为了 MANAGER_DATA_DIR 改值之后，白名单不会把管理器的用户资料
+    # 与内部备份挡在事务之外（公开 Issue #172）。
+    "$MANAGER_DATA_DIR"|"$MANAGER_DATA_DIR"/*) return 0;;
     /etc/sb-user-manager.conf|/etc/sing-box|/etc/sing-box/*|/etc/systemd/system/sing-box.service|/etc/systemd/system/nfuse.service|/etc/systemd/system/sb-user-expiry.service|/etc/systemd/system/sb-user-expiry.timer|/etc/systemd/system/multi-user.target.wants/sing-box.service|/etc/systemd/system/multi-user.target.wants/nfuse.service|/etc/systemd/system/timers.target.wants/sb-user-expiry.timer|/var/lib/nfuse|/var/lib/nfuse/*|/var/lib/sing-box|/var/lib/sing-box/*|/var/lib/sb-user-manager|/var/lib/sb-user-manager/*|/usr/local/sbin/sb-user-manager|/usr/local/bin/sbm|/usr/local/bin/sing-box|/usr/local/bin/nfuse|/run/nfuse.sock) return 0;;
     # mihomo 部署的路径。两个内核的路径同时列在白名单里而不是按内核分派：
     # 白名单只决定「这条路径允不允许出现在事务里」，多列几条不会让不存在的文件

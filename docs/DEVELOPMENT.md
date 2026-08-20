@@ -67,6 +67,12 @@ GitHub 分支保护要求 `validate`、`jq16-compat` 和 `debian-standalone-e2e`
   `set -e` 不会因它失败而退出，这类断言命中缺陷也不会让测试变红。改用
   `if cmd; then echo '说明为什么这是错的' >&2; exit 1; fi`。条件上下文中的 `!`
   （`if ! cmd`、`while ! cmd`、`[[ ! -f x ]]` 等）是合法的，门禁会放行。
+- 管理器自身的数据（用户资料、内部备份、AnyTLS 证书）只能经 `MANAGER_DATA_DIR`
+  派生的变量取得，不得在 `src/` 里写死 `/etc/sing-box` 下的路径。写死一处，
+  将来把这些数据搬出 sing-box 目录时就会漏掉一处，而漏掉的那处指向用户数据。
+  sing-box 自己的 `config.json` 不受这条约束——那是内核的文件，不是管理器的。
+- 适配层（`src/05-kernel.sh`）里提到某个内核的函数必须同时提到另一个内核；
+  尚未实现的操作也要写出该内核的分支并在其中明确报错，不得回落到另一个内核。
 - 可选文本字段（`outbound_preset`、`rule_preset` 以及三个 `runtime_*_tag`）
   在本项目里「空字符串」和「字段不存在」是同一个意思，判空一律写
   `(.field // "") == ""`。`(.field // null)` 对空字符串求值仍是空字符串，

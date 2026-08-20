@@ -54,7 +54,8 @@ convention_output="$(mktemp "${TMPDIR:-/tmp}/sb-convention-output.XXXXXX")"
 negation_fixture="$(mktemp "${TMPDIR:-/tmp}/sb-negation-fixture.XXXXXX")"
 negation_output="$(mktemp "${TMPDIR:-/tmp}/sb-negation-output.XXXXXX")"
 kernel_adapter_fixture="$(mktemp -d "${TMPDIR:-/tmp}/sb-kernel-adapter.XXXXXX")"
-trap 'rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fixture" "$shell_target_output" "$convention_fixture" "$convention_output" "$negation_fixture" "$negation_output"; rm -rf -- "$kernel_adapter_fixture"' EXIT
+manager_data_fixture="$(mktemp -d "${TMPDIR:-/tmp}/sb-manager-data.XXXXXX")"
+trap 'rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fixture" "$shell_target_output" "$convention_fixture" "$convention_output" "$negation_fixture" "$negation_output"; rm -rf -- "$kernel_adapter_fixture" "$manager_data_fixture"' EXIT
 # 读取内核配置必须经 src/05-kernel.sh 的适配层，其它模块不得直接调用内核。
 # 上游在小版本之间修改配置规范时，只应改适配层一处，而不是逐个模块跟进。
 # 说明：tests/ 下的直接调用是有意的，那里测的就是内核自身的行为。
@@ -98,6 +99,40 @@ if python3 tests/check-kernel-dispatch.py "$kernel_adapter_fixture/05-kernel-pro
   exit 1
 fi
 rm -f -- "$kernel_adapter_fixture/05-kernel-probe.sh"
+
+# 管理器自身的数据（用户资料、内部备份、AnyTLS 证书）只能经 MANAGER_DATA_DIR
+# 派生的变量取得，不得在 src/ 里写死 /etc/sing-box 下的路径。
+# 写死一处，将来把这些数据搬出 sing-box 目录时就会漏掉一处，而漏掉的那处
+# 指向的正是用户数据（公开 Issue #172）。这条规则刻意不管 config.json——
+# 那是 sing-box 自己的文件，不是管理器的。
+manager_data_path_literals() {
+  grep -rn '/etc/sing-box/\(managed-users\.json\|backups\|cert\)' "$1" |
+    grep -v '^[^:]*:[0-9]*:[[:space:]]*#' || true
+}
+if [[ -n "$(manager_data_path_literals src)" ]]; then
+  manager_data_path_literals src >&2
+  echo 'manager data paths must derive from MANAGER_DATA_DIR, not hardcode /etc/sing-box' >&2
+  exit 1
+fi
+# 反面样本：三类路径各写回一处都必须被拒绝，否则这条门禁只是看起来在。
+for manager_data_literal in \
+  'state="/etc/sing-box/managed-users.json"' \
+  'backups="/etc/sing-box/backups"' \
+  'cert="/etc/sing-box/cert/anytls.crt"'; do
+  printf 'x() {\n  %s\n}\n' "$manager_data_literal" > "$manager_data_fixture/90-literal.sh"
+  if [[ -z "$(manager_data_path_literals "$manager_data_fixture")" ]]; then
+    printf 'manager data path check must reject a hardcoded literal: %s\n' "$manager_data_literal" >&2
+    exit 1
+  fi
+done
+rm -f -- "$manager_data_fixture/90-literal.sh"
+# 对照：sing-box 自己的配置路径不受这条规则约束，写死它不应变红。
+printf 'x() {\n  config="/etc/sing-box/config.json"\n}\n' > "$manager_data_fixture/91-config.sh"
+if [[ -n "$(manager_data_path_literals "$manager_data_fixture")" ]]; then
+  echo 'manager data path check must not flag the sing-box kernel config path' >&2
+  exit 1
+fi
+rm -f -- "$manager_data_fixture/91-config.sh"
 
 # GitHub 的 API 查询与资产下载必须经 github_api_get / github_download_to，
 # 不得在调用点各写一份 curl。散落时一旦要调整重试或超时策略就得逐处跟进，

@@ -1099,7 +1099,7 @@ load_diagnostic_runtime_config() {
   SINGBOX_SERVICE=sing-box
   NFUSE_BIN=/usr/local/bin/nfuse
   NFUSE_SOCKET=/run/nfuse.sock
-  STATE_FILE=/etc/sing-box/managed-users.json
+  STATE_FILE="$MANAGER_DATA_DIR/managed-users.json"
   LOCK_FILE=/run/lock/sb-user-manager.lock
   TRANSACTION_DIR=/var/lib/sb-user-manager/transactions
   TRANSACTION_JOURNAL="$TRANSACTION_DIR/active.json"

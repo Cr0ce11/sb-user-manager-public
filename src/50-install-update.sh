@@ -13,8 +13,8 @@ SINGBOX_CONFIG="/etc/sing-box/config.json"
 SINGBOX_SERVICE="sing-box"
 NFUSE_BIN="/usr/local/bin/nfuse"
 NFUSE_SOCKET="/run/nfuse.sock"
-STATE_FILE="/etc/sing-box/managed-users.json"
-BACKUP_DIR="/etc/sing-box/backups"
+STATE_FILE="$MANAGER_DATA_DIR/managed-users.json"
+BACKUP_DIR="$MANAGER_DATA_DIR/backups"
 LOCK_FILE="/run/lock/sb-user-manager.lock"
 CLIENT_SERVER_PORT_OVERRIDE=""
 PUBLIC_SERVER_OVERRIDE=""
@@ -23,12 +23,10 @@ EOF
 
 # mihomo 部署的管理配置。这类机器本来就退不回不支持 mihomo 的脚本，
 # 因此写 PROXY_KERNEL 不构成新的回退障碍。
-# 管理器自身的数据（用户资料、内部备份、AnyTLS 证书）仍然放在 /etc/sing-box 下：
-# 那些路径是管理器的，不是 sing-box 的，改动它们会牵动迁移与备份子系统——
-# 本片不动那里。代价是 mihomo 机器上会出现一个名字容易误解的 /etc/sing-box 目录。
-# 退路：若在 2f 开放菜单选择之前认为这个名字不可接受，把管理器数据整体迁到
-# /etc/sb-user-manager 是一片独立的工作；此刻还没有任何 mihomo 正式部署，
-# 迁移成本为零，越往后越贵。
+# 管理器自身的数据（用户资料、内部备份、AnyTLS 证书）目前仍在 /etc/sing-box 下，
+# 由 MANAGER_DATA_DIR 的默认值给出。两份配置都刻意不写 MANAGER_DATA_DIR：
+# 写进去等于把当前默认值固化在每台机器的配置文件里，将来改默认值反而要逐台改。
+# 新装机器改用中立路径是公开 Issue #172 三步走的第二步，在 2f 开放安装选择时做。
 write_mihomo_manager_config() {
   cat > "$CONF_FILE" <<EOF || return 1
 HANDSHAKE_PORT=443
@@ -42,8 +40,8 @@ MIHOMO_SERVICE="mihomo"
 MIHOMO_WORK_DIR="/var/lib/mihomo"
 NFUSE_BIN="/usr/local/bin/nfuse"
 NFUSE_SOCKET="/run/nfuse.sock"
-STATE_FILE="/etc/sing-box/managed-users.json"
-BACKUP_DIR="/etc/sing-box/backups"
+STATE_FILE="$MANAGER_DATA_DIR/managed-users.json"
+BACKUP_DIR="$MANAGER_DATA_DIR/backups"
 LOCK_FILE="/run/lock/sb-user-manager.lock"
 CLIENT_SERVER_PORT_OVERRIDE=""
 PUBLIC_SERVER_OVERRIDE=""
@@ -129,8 +127,10 @@ EOF
 #    且该限制在 `mihomo -t` 阶段完全不暴露，只有真正启动监听器时才报错）。
 # 3. 不写 ExecReload：本项目从不执行 systemctl reload，写一条未经验证的重载
 #    命令等于给出一个没验过的承诺。
+# heredoc 刻意不加引号：SAFE_PATHS 要跟着证书目录走，来源与别处同一个。
+# 因此往这段单元里加内容时不能出现 $ —— sing-box 单元里的 $MAINPID 就是反例。
 write_mihomo_unit() {
-  cat > "$(system_path /etc/systemd/system/mihomo.service)" <<'EOF' || return 1
+  cat > "$(system_path /etc/systemd/system/mihomo.service)" <<EOF || return 1
 [Unit]
 Description=mihomo service
 After=network-online.target nss-lookup.target
@@ -139,7 +139,7 @@ Wants=network-online.target
 Type=simple
 User=root
 StateDirectory=mihomo
-Environment=SAFE_PATHS=/etc/sing-box/cert
+Environment=SAFE_PATHS=$CERT_DIR
 ExecStart=/usr/local/bin/mihomo -d /var/lib/mihomo -f /etc/mihomo/config.json
 Restart=on-failure
 RestartSec=10s
@@ -234,7 +234,7 @@ system_path() {
 classify_environment() {
   local managed=0 core=0 complete=true runtime_ok=true path kernel_paths
   kernel_paths="$(kernel_core_paths)" || return 1
-  for path in /etc/sb-user-manager.conf /etc/sing-box/managed-users.json /usr/local/sbin/sb-user-manager /etc/systemd/system/sb-user-expiry.timer; do
+  for path in /etc/sb-user-manager.conf "$MANAGER_DATA_DIR/managed-users.json" /usr/local/sbin/sb-user-manager /etc/systemd/system/sb-user-expiry.timer; do
     [[ -e "$(system_path "$path")" ]] && ((managed+=1))
   done
   for path in /usr/local/bin/nfuse /etc/systemd/system/nfuse.service /var/lib/nfuse/nfuse.db; do
@@ -243,7 +243,7 @@ classify_environment() {
   while IFS= read -r path; do
     [[ -e "$(system_path "$path")" ]] && ((core+=1))
   done <<<"$kernel_paths"
-  for path in /etc/sb-user-manager.conf /etc/sing-box/managed-users.json /usr/local/sbin/sb-user-manager /usr/local/bin/nfuse /etc/systemd/system/nfuse.service /etc/systemd/system/sb-user-expiry.service /etc/systemd/system/sb-user-expiry.timer; do
+  for path in /etc/sb-user-manager.conf "$MANAGER_DATA_DIR/managed-users.json" /usr/local/sbin/sb-user-manager /usr/local/bin/nfuse /etc/systemd/system/nfuse.service /etc/systemd/system/sb-user-expiry.service /etc/systemd/system/sb-user-expiry.timer; do
     [[ -e "$(system_path "$path")" ]] || complete=false
   done
   while IFS= read -r path; do
@@ -286,8 +286,8 @@ show_environment_diagnostics() {
     printf '%-34s %s\n' "$path" "$status"
   done < <(
     kernel_core_paths
-    cat <<'EOF'
-/etc/sing-box/managed-users.json
+    cat <<EOF
+$MANAGER_DATA_DIR/managed-users.json
 /etc/sb-user-manager.conf
 /usr/local/bin/nfuse
 /usr/local/sbin/sb-user-manager
@@ -1435,15 +1435,17 @@ default_network_interface() {
 }
 
 ensure_anytls_certificate() {
-  local cert_dir
-  cert_dir="$(system_path /etc/sing-box/cert)" || return 1
+  local cert_dir cert_file key_file
+  cert_dir="$(system_path "$CERT_DIR")" || return 1
+  cert_file="$(system_path "$ANYTLS_CERT_FILE")" || return 1
+  key_file="$(system_path "$ANYTLS_KEY_FILE")" || return 1
   install -d -m 700 "$cert_dir" || return 1
-  if [[ ! -s "$cert_dir/anytls.crt" || ! -s "$cert_dir/anytls.key" ]]; then
+  if [[ ! -s "$cert_file" || ! -s "$key_file" ]]; then
     openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 3650 -subj '/CN=localhost' \
       -addext "subjectAltName=IP:$(hostname -I | awk '{print $1}')" \
-      -keyout "$cert_dir/anytls.key" -out "$cert_dir/anytls.crt" >/dev/null 2>&1 || return 1
-    chmod 600 "$cert_dir/anytls.key" || return 1
-    chmod 644 "$cert_dir/anytls.crt" || return 1
+      -keyout "$key_file" -out "$cert_file" >/dev/null 2>&1 || return 1
+    chmod 600 "$key_file" || return 1
+    chmod 644 "$cert_file" || return 1
   fi
 }
 
@@ -1542,7 +1544,12 @@ complete_environment_change() {
 }
 
 environment_backup_paths() {
-  cat <<'EOF'
+  {
+    # 管理器数据目录单列一条。今天它就是下面那个 /etc/sing-box，去重后输出不变；
+    # 分开写是因为这两者是两回事——一个是内核的部署目录，一个是管理器的用户
+    # 资料与内部备份。MANAGER_DATA_DIR 改值之后漏掉它，等于环境快照里没有用户数据。
+    printf '%s\n' "$MANAGER_DATA_DIR"
+    cat <<'EOF'
 /etc/sing-box
 /var/lib/nfuse
 /var/lib/sing-box
@@ -1560,6 +1567,7 @@ environment_backup_paths() {
 /usr/local/bin/sing-box
 /usr/local/bin/nfuse
 EOF
+  } | awk 'NF && !seen[$0]++'
 }
 
 write_environment_snapshot_manifest() {
@@ -1927,7 +1935,10 @@ create_environment_backup() {
     fi
   done < <(environment_backup_paths)
   # 内部事务备份另有独立保留策略；不把历史回滚组反复复制进每份完整环境快照。
-  rm -rf -- "$backup/root/etc/sing-box/backups"
+  # 这里刻意用默认位置而不是 ${BACKUP_DIR}：本函数在接管流程里早于 load_runtime_config
+  # 运行，那时 BACKUP_DIR 还没有取值。与改动前的写死行为一致——管理配置把
+  # BACKUP_DIR 指到别处的机器，这一步同样跳不掉，这一点收敛前后都成立。
+  rm -rf -- "$backup/root${MANAGER_DATA_DIR}/backups"
   if ! snapshot_nfuse_sqlite_database \
       "$(system_path /var/lib/nfuse/nfuse.db)" "$backup/root/var/lib/nfuse/nfuse.db"; then
     rm -rf -- "$backup"
@@ -2050,11 +2061,11 @@ deploy_tracked_paths() {
   {
     printf '%s\n' "$CONF_FILE"
     all_kernel_deployment_paths
+    # 管理器数据目录及其下的三项。父目录在前，与本函数的顺序约定一致；
+    # 今天目录本身与 all_kernel_deployment_paths 里的 /etc/sing-box 重合，去重后不变。
+    printf '%s\n' "$MANAGER_DATA_DIR" "$MANAGER_DATA_DIR/backups" \
+      "$CERT_DIR" "$ANYTLS_CERT_FILE" "$ANYTLS_KEY_FILE"
     cat <<'EOF'
-/etc/sing-box/backups
-/etc/sing-box/cert
-/etc/sing-box/cert/anytls.crt
-/etc/sing-box/cert/anytls.key
 /etc/systemd/system/nfuse.service
 /etc/systemd/system/sb-user-expiry.service
 /etc/systemd/system/sb-user-expiry.timer
@@ -2076,9 +2087,12 @@ EOF
 # 用于「本次是从零开始装的，失败就不该留下任何东西」。
 purge_fresh_deploy_paths() {
   local path
+  # 管理器数据目录一并清。今天它等于 all_kernel_deployment_paths 里的 /etc/sing-box，
+  # 这一行是重复删除、无副作用；MANAGER_DATA_DIR 改值之后它就是唯一清得掉
+  # 这份半成品用户数据的地方。
   while IFS= read -r path; do
     rm -rf -- "$path"
-  done < <(all_kernel_deployment_paths)
+  done < <(all_kernel_deployment_paths; printf '%s\n' "$MANAGER_DATA_DIR")
   rm -f /etc/sb-user-manager.conf /etc/systemd/system/nfuse.service \
     /etc/systemd/system/sb-user-expiry.service /etc/systemd/system/sb-user-expiry.timer \
     /usr/local/sbin/sb-user-manager /usr/local/bin/sbm /usr/local/bin/nfuse
@@ -2138,7 +2152,13 @@ deploy_environment() {
   set_signal_rollback rollback_deploy
   run_step_or_rollback rollback_deploy download_binaries "$work" || return 1
   run_step_or_rollback rollback_deploy install -d -m 700 \
-    /etc/sing-box /etc/sing-box/backups /etc/sing-box/cert /var/lib/nfuse /usr/local/sbin || return 1
+    "$MANAGER_DATA_DIR" "$MANAGER_DATA_DIR/backups" "$CERT_DIR" /var/lib/nfuse /usr/local/sbin || return 1
+  if [[ "$PROXY_KERNEL" == singbox ]]; then
+    # sing-box 自己的配置目录。今天与管理器数据目录是同一个，上面那行已经建好，
+    # 这里是重复调用、无副作用；分开写是因为两者属于不同的东西——管理器数据
+    # 搬走之后，内核仍然需要自己的目录（公开 Issue #172）。
+    run_step_or_rollback rollback_deploy install -d -m 700 "$(dirname "$SINGBOX_CONFIG")" || return 1
+  fi
   if [[ "$PROXY_KERNEL" == mihomo ]]; then
     # mihomo 的配置目录与工作目录。工作目录也由 systemd 的 StateDirectory 负责，
     # 但配置校验发生在服务启动之前，那时它还不存在——不预先建好的话，
@@ -2223,7 +2243,7 @@ takeover_existing_environment() {
   create_environment_backup || { release_operation_lock; return 1; }
   for path in \
     /etc/sb-user-manager.conf \
-    /etc/sing-box/managed-users.json \
+    "$MANAGER_DATA_DIR/managed-users.json" \
     /usr/local/sbin/sb-user-manager \
     /usr/local/bin/sbm \
     /etc/systemd/system/sing-box.service \
@@ -2231,8 +2251,8 @@ takeover_existing_environment() {
     /etc/systemd/system/sb-user-expiry.service \
     /etc/systemd/system/sb-user-expiry.timer \
     /var/lib/sb-user-manager/versions \
-    /etc/sing-box/cert/anytls.crt \
-    /etc/sing-box/cert/anytls.key; do
+    "$ANYTLS_CERT_FILE" \
+    "$ANYTLS_KEY_FILE"; do
     [[ -e "$path" || -L "$path" ]] || takeover_created+=("$path")
   done
   work="$(mktemp -d /tmp/sb-user-manager.takeover.XXXXXX)" || { release_operation_lock; return 1; }
@@ -2286,7 +2306,7 @@ takeover_existing_environment() {
   run_step_or_rollback rollback_takeover install_manager_binary "$work" false || return 1
   run_step_or_rollback rollback_takeover install_manager_shortcut || return 1
   run_step_or_rollback rollback_takeover install -d -m 700 \
-    /var/lib/nfuse /var/lib/sb-user-manager /etc/sing-box/backups /etc/sing-box/cert || return 1
+    /var/lib/nfuse /var/lib/sb-user-manager "$MANAGER_DATA_DIR/backups" "$CERT_DIR" || return 1
   run_step_or_rollback rollback_takeover ensure_anytls_certificate || return 1
   if [[ ! -f /etc/systemd/system/sing-box.service ]]; then
     run_step_or_rollback rollback_takeover write_singbox_unit || return 1
@@ -2364,7 +2384,7 @@ EOF
       case "$choice" in
         1)
           config_path="$(system_path /etc/sing-box/config.json)"
-          state_path="$(system_path /etc/sing-box/managed-users.json)"
+          state_path="$(system_path "$MANAGER_DATA_DIR/managed-users.json")"
           [[ -f "$config_path" ]] || die "sing-box 配置缺失，无法安全自动修复；请从备份恢复或选择全新部署"
           if [[ ! -f "$state_path" ]] && jq -e '
             any(.inbounds[]?; (.tag // "") | test("^(st-|ss-|anytls-)"))
@@ -2423,6 +2443,9 @@ EOF
 managed_uninstall_paths() {
   {
     all_kernel_deployment_paths
+    # 管理器数据目录。今天与 /etc/sing-box 重合，去重后清单不变；
+    # 漏掉它就是卸载之后用户资料还留在盘上。
+    printf '%s\n' "$MANAGER_DATA_DIR"
     cat <<'EOF'
 /etc/sb-user-manager.conf
 /etc/systemd/system/nfuse.service

@@ -8110,6 +8110,111 @@ STATE_FILE="'"$work"'/kernel-state.json"'
 )
 
 # ============================================================
+# 管理器数据路径的单一来源（公开 Issue #172、#173）
+# ============================================================
+# 管理器自身的数据——用户资料、内部备份、AnyTLS 证书——全部由 MANAGER_DATA_DIR
+# 派生。这一节先锁默认值（既有机器一字不变），再验「改这一个值整组跟着走」。
+# 只验前者不够：默认值写死在派生公式里也能让前者通过，那样等于没有单一来源。
+(
+  data_conf="$work/manager-data.conf"
+  base='HANDSHAKE_PORT=443
+SHADOWTLS_STRICT_MODE=true
+SS2022_SHADOWTLS_SNI="a.example.com"
+ANYTLS_SNI="b.example.com"'
+
+  # 一、不写 MANAGER_DATA_DIR 时，三类路径必须与历史版本逐字相同。
+  printf '%s\n' "$base" > "$data_conf"
+  ( CONF_FILE="$data_conf"
+    # 这几项在上文的夹具里已被设过；不清掉，:= 兜底就不会生效，
+    # 这条断言测到的将是夹具的值而不是默认值。与上文 unset PROXY_KERNEL 同理。
+    unset MANAGER_DATA_DIR STATE_FILE BACKUP_DIR CERT_DIR ANYTLS_CERT_FILE ANYTLS_KEY_FILE
+    load_runtime_config >/dev/null 2>&1 || exit 1
+    [[ "$MANAGER_DATA_DIR" == /etc/sing-box ]] || exit 1
+    [[ "$STATE_FILE" == /etc/sing-box/managed-users.json ]] || exit 1
+    [[ "$BACKUP_DIR" == /etc/sing-box/backups ]] || exit 1
+    [[ "$CERT_DIR" == /etc/sing-box/cert ]] || exit 1
+    [[ "$ANYTLS_CERT_FILE" == /etc/sing-box/cert/anytls.crt ]] || exit 1
+    [[ "$ANYTLS_KEY_FILE" == /etc/sing-box/cert/anytls.key ]] || exit 1 ) || {
+    echo '不写 MANAGER_DATA_DIR 时，管理器数据路径必须与历史版本逐字相同' >&2
+    exit 1
+  }
+
+  # 二、写了就以配置为准，且整组跟着走——包括生成的运行配置与 systemd 单元。
+  moved_root="$work/manager-data-root"
+  mkdir -p "$moved_root/etc/systemd/system"
+  printf '%s\nMANAGER_DATA_DIR="/etc/sb-user-manager"\n' "$base" > "$data_conf"
+  ( CONF_FILE="$data_conf"
+    SB_SYSTEM_ROOT="$moved_root"
+    unset MANAGER_DATA_DIR STATE_FILE BACKUP_DIR CERT_DIR ANYTLS_CERT_FILE ANYTLS_KEY_FILE
+    load_runtime_config >/dev/null 2>&1 || exit 1
+    [[ "$STATE_FILE" == /etc/sb-user-manager/managed-users.json ]] || exit 1
+    [[ "$BACKUP_DIR" == /etc/sb-user-manager/backups ]] || exit 1
+    [[ "$ANYTLS_CERT_FILE" == /etc/sb-user-manager/cert/anytls.crt ]] || exit 1
+    # 生成的 AnyTLS 入站里的证书路径同样要跟着走：这两处此前是 jq 过滤器里的
+    # 字面量，是本次收敛里最容易漏掉的一处。
+    inbound="$(make_anytls_inbound demo 20001 pw)" || exit 1
+    [[ "$(jq -r '.[0].tls.certificate_path' <<<"$inbound")" == /etc/sb-user-manager/cert/anytls.crt ]] || exit 1
+    [[ "$(jq -r '.[0].tls.key_path' <<<"$inbound")" == /etc/sb-user-manager/cert/anytls.key ]] || exit 1
+    # mihomo 单元里的 SAFE_PATHS 指的就是证书目录；它跟不上就等于监听器起不来
+    # （公开 Issue #154 实测：mihomo 拒绝加载 SAFE_PATHS 之外的证书，
+    # 而 mihomo -t 完全测不出这个问题）。
+    write_mihomo_unit || exit 1
+    grep -Fxq 'Environment=SAFE_PATHS=/etc/sb-user-manager/cert' \
+      "$moved_root/etc/systemd/system/mihomo.service" || exit 1
+    # 四组路径集合：漏掉任何一组，改值之后就会出现「备份里没有用户数据」
+    # 或「卸载后用户资料还留在盘上」这类静默后果。
+    CONF_FILE=/etc/sb-user-manager.conf
+    deploy_tracked_paths | grep -Fxq /etc/sb-user-manager/cert || exit 1
+    environment_backup_paths | grep -Fxq /etc/sb-user-manager || exit 1
+    managed_uninstall_paths | grep -Fxq /etc/sb-user-manager || exit 1
+    is_environment_recovery_path /etc/sb-user-manager/managed-users.json || exit 1 ) || {
+    echo 'MANAGER_DATA_DIR 改值后，管理器数据路径必须整组跟着走' >&2
+    exit 1
+  }
+
+  # 三、相对路径必须报错退出。用户资料、内部备份与证书落到脚本当时的工作目录里，
+  # 丢了就是丢了，不能将就。
+  printf '%s\nMANAGER_DATA_DIR="relative/path"\n' "$base" > "$data_conf"
+  if ( CONF_FILE="$data_conf"; unset MANAGER_DATA_DIR; load_runtime_config >/dev/null 2>&1 ); then
+    echo 'MANAGER_DATA_DIR 为相对路径时必须报错退出' >&2
+    exit 1
+  fi
+  # 对照：绝对路径仍然被接受，证明上一条挡住的是相对路径本身，
+  # 而不是这个配置项整个不能用。
+  printf '%s\nMANAGER_DATA_DIR="/etc/sb-user-manager"\n' "$base" > "$data_conf"
+  ( CONF_FILE="$data_conf"; unset MANAGER_DATA_DIR; load_runtime_config >/dev/null 2>&1 ) || {
+    echo 'MANAGER_DATA_DIR 为绝对路径时必须被接受' >&2
+    exit 1
+  }
+  rm -f -- "$data_conf"
+)
+# 两份管理配置都不写 MANAGER_DATA_DIR：写进去等于把当前默认值固化在每台机器上，
+# 将来改默认值反而要逐台改配置。同时确认展开后的取值与历史版本逐字相同。
+(
+  conf_check="$work/manager-config-data-dir.conf"
+  chown() { :; }
+  for data_dir_kernel in singbox mihomo; do
+    ( CONF_FILE="$conf_check"; PROXY_KERNEL="$data_dir_kernel"; write_manager_config ) || {
+      echo "${data_dir_kernel} 管理配置写入失败" >&2
+      exit 1
+    }
+    if grep -Fq 'MANAGER_DATA_DIR' "$conf_check"; then
+      echo "${data_dir_kernel} 部署写出的管理配置不得包含 MANAGER_DATA_DIR" >&2
+      exit 1
+    fi
+    if ! grep -Fxq 'STATE_FILE="/etc/sing-box/managed-users.json"' "$conf_check"; then
+      echo "${data_dir_kernel} 管理配置里的 STATE_FILE 取值与历史版本不一致" >&2
+      exit 1
+    fi
+    if ! grep -Fxq 'BACKUP_DIR="/etc/sing-box/backups"' "$conf_check"; then
+      echo "${data_dir_kernel} 管理配置里的 BACKUP_DIR 取值与历史版本不一致" >&2
+      exit 1
+    fi
+  done
+  rm -f -- "$conf_check"
+)
+
+# ============================================================
 # 第二内核 mihomo：安装、服务与版本（公开 Issue #165）
 # ============================================================
 
