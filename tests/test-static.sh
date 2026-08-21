@@ -613,6 +613,15 @@ trap - EXIT
 
 version="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)"/\1/p' sb-user-manager.sh | head -n1)"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+# PROJECT.md 的「最新正式版」必须与脚本版本一致。这一行曾经从 v4.25.19 一路停到
+# v4.25.24 才被发现——五次发布准备都改了同文件正文里那句「现有最新完整正式版为 …」，
+# 唯独漏了表格这一行，因为它靠人记得。发布准备会把 SCRIPT_VERSION 与本行一起改，
+# 因此在 main 上这两者任何时候都应当相等。
+project_latest_release="$(sed -n 's/^| 最新正式版 | v\([0-9][0-9.]*\) |$/\1/p' PROJECT.md)"
+if [[ "$project_latest_release" != "$version" ]]; then
+  echo "PROJECT.md 最新正式版 is '$project_latest_release' but SCRIPT_VERSION is '$version'" >&2
+  exit 1
+fi
 grep -Fq "## $version " CHANGELOG.md
 grep -Fxq 'SCRIPT_EDITION_LABEL="公开版"' sb-user-manager.sh
 grep -Fq 'PORT_MIN=20001' sb-user-manager.sh
