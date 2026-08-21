@@ -25,17 +25,14 @@ download_binaries
 enable_user_without_transaction
 ensure_anytls_certificate
 fetch_latest_releases
-init_state
 initialize_deployed_state
 install_manager_binary
 install_manager_shortcut
 kernel_check_config
 kernel_check_default_install
-load_runtime_config
 nfuse
 rebuild_all_split_configs
 rebuild_protocol_inbounds
-register_temp_path
 remove_managed_uninstall_paths
 remove_split_config
 remove_user_inbounds
@@ -67,14 +64,10 @@ verify_kernel_switch
 verify_managed_uninstall_paths_removed
 verify_singbox_cleanup
 write_base_config
-write_command_output
 write_deployed_versions
-write_expiry_units
 write_global_sni_config
 write_manager_config
-write_nfuse_unit
 write_singbox_channel_state
-write_singbox_unit
 write_systemd_units
 EOF
 

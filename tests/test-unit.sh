@@ -1803,7 +1803,6 @@ exercise_install_flow() (
   install_prerequisites() { printf 'FLOW:prerequisites\n'; }
   fetch_latest_releases() { printf 'FLOW:fetch:%s\n' "$1"; }
   deploy_environment() { printf 'FLOW:deploy:%s:%s\n' "$1" "${2:-}"; }
-  takeover_existing_environment() { printf 'FLOW:takeover\n'; }
   install_environment <<<"$input"
 )
 
@@ -1883,16 +1882,16 @@ grep -Fxq 'FLOW:singbox:1.14.0-alpha.44' "$work/install-repair-preview"
 exercise_install_repair_channel "$install_flow_stable_bin" > "$work/install-repair-stable"
 grep -Fxq 'FLOW:singbox:1.13.14' "$work/install-repair-stable"
 
-exercise_install_flow external $'1\ny' > "$work/install-takeover"
-grep -Fxq 'FLOW:prerequisites' "$work/install-takeover"
-grep -Fxq 'FLOW:takeover' "$work/install-takeover"
-if grep -Fq 'FLOW:deploy' "$work/install-takeover"; then
-  echo 'unexpected FLOW:deploy in $work/install-takeover' >&2
+# 别人手工装的 sing-box：接管已经撤除（2f），覆盖重装也一并撤掉——那等于在一套
+# 还活着的 sing-box 旁边再装一个内核。因此这条路必须**什么都不做**地走到头：
+# 既不装依赖、不取版本，也不部署，并且要说清楚下一步该干什么。
+exercise_install_flow external $'1\ny' > "$work/install-external"
+if grep -Eq 'FLOW:(prerequisites|fetch|deploy)' "$work/install-external"; then
+  echo '外部 sing-box 机器上不得触发任何安装动作' >&2
+  cat "$work/install-external" >&2
   exit 1
 fi
-exercise_install_flow external $'2\ny' > "$work/install-external-overwrite"
-grep -Fxq 'FLOW:fetch:false' "$work/install-external-overwrite"
-grep -Fxq 'FLOW:deploy:true:' "$work/install-external-overwrite"
+grep -Fq '请先自行停用并清理那套 sing-box' "$work/install-external"
 (
   apt_get_called="$work/apt-get-install-called"
   apt-get() {
@@ -1995,8 +1994,9 @@ fi
   grep -Fq '本次操作已在修改前取消' "$work/deploy-loopback-rejected"
 )
 
-# 三个会直接修改环境的入口必须先取 fd 9；锁冲突时连预检和备份都不能开始。
-for environment_entry in deploy takeover uninstall; do
+# 会直接修改环境的入口必须先取 fd 9；锁冲突时连预检和备份都不能开始。
+# 接管既有安装曾经也在这一组里，2f 之后它已经整段删掉。
+for environment_entry in deploy uninstall; do
   (
     side_effect_marker="$work/${environment_entry}-after-operation-lock"
     acquire_operation_lock() {
@@ -2008,7 +2008,6 @@ for environment_entry in deploy takeover uninstall; do
     create_environment_backup() { : > "$side_effect_marker"; }
     case "$environment_entry" in
       deploy) deploy_environment false false ;;
-      takeover) takeover_existing_environment ;;
       uninstall) uninstall_managed_environment ;;
     esac
   ) > "$work/${environment_entry}-operation-lock.out" 2>&1 && {
@@ -8053,15 +8052,15 @@ fi
     exit 1
   fi
 )
-# 全新安装与接管既有安装必须引用同一份骨架来源，不能各写一套。
-# 全新安装经适配层的分派取骨架（它按内核选 SINGBOX_/MIHOMO_ 两份之一），
-# 接管既有安装按定义只针对 sing-box，因此直接引用 sing-box 那一份。
+# 全新安装必须经适配层的分派取骨架（它按内核选 SINGBOX_/MIHOMO_ 两份之一），
+# 不能自己另写一套。接管既有安装曾经是这里的第二个调用点，2f 之后已整段删掉。
 if ! grep -Fq 'kernel_skeleton_ensure_program' <<<"$(declare -f write_base_config)"; then
   echo 'write_base_config must use the shared kernel skeleton program' >&2
   exit 1
 fi
-if ! grep -Fq 'SINGBOX_SKELETON_ENSURE_PROGRAM' <<<"$(declare -f takeover_existing_environment)"; then
-  echo 'takeover_existing_environment must use the shared kernel skeleton program' >&2
+# 顺带确认这个入口真的没了：留着一段谁都调不到的部署代码，迟早有人以为它还能用。
+if declare -f takeover_existing_environment >/dev/null 2>&1; then
+  echo '接管既有 sing-box 安装应当已经整段删除' >&2
   exit 1
 fi
 
