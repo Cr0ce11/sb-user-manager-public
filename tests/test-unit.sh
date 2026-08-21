@@ -9980,4 +9980,389 @@ https://example.com/b.json'
   }
 )
 
+
+# ============================================================
+# 远程规则集：来源、生成、校验与更新（公开 Issue #218）
+# ============================================================
+# 这一组要守住的是**保存那一刻的那道关**。mihomo 取不到远程规则集且本地没有
+# 缓存时只留一行警告、服务照常起来，那条分流静静地完全不生效；内核不报，
+# 就只能管理器在保存之前自己下载一次、校验一遍。
+(
+  work_218="$work/remote-ruleset"
+  mkdir -p "$work_218/rules"
+  PROXY_KERNEL=mihomo
+  MIHOMO_RULES_DIR="$work_218/rules"
+  STATE_FILE="$work_218/state.json"
+  expect() {
+    [[ "$2" == "$3" ]] && return 0
+    printf '%s：期望 %s，实际 %s\n' "$1" "$2" "$3" >&2
+    exit 1
+  }
+  refuse() { # refuse <说明> <函数> <参数...>
+    local label="$1"; shift
+    if ( "$@" ) >/dev/null 2>&1; then
+      printf '应当拒绝但通过了：%s\n' "$label" >&2
+      exit 1
+    fi
+  }
+
+  # 一、文件名原样取自地址。项目所有者的要求是「保持原有命名以方便识别」，
+  # 因此这里宁可拒绝也不悄悄改名。
+  expect '普通地址的文件名' 'geosite-openai.yaml' \
+    "$(remote_rule_set_file_name 'https://example.com/rules/geosite-openai.yaml')"
+  expect '带查询串的文件名' 'a.yaml' "$(remote_rule_set_file_name 'https://example.com/a.yaml?v=2')"
+  expect '带片段的文件名' 'a.yaml' "$(remote_rule_set_file_name 'https://example.com/a.yaml#top')"
+  expect '以斜杠结尾时没有文件名' '' "$(remote_rule_set_file_name 'https://example.com/rules/')"
+
+  # 二、地址写法。**对照在最后一条**：合法地址必须通过，否则这几条拒绝可能是恒真。
+  refuse 'HTTP 地址' validate_remote_rule_set_url 'http://example.com/a.yaml'
+  refuse '不是 yaml' validate_remote_rule_set_url 'https://example.com/a.list'
+  refuse 'mrs 格式' validate_remote_rule_set_url 'https://example.com/a.mrs'
+  refuse '看不出文件名' validate_remote_rule_set_url 'https://example.com/rules/'
+  refuse '文件名以点开头' validate_remote_rule_set_url 'https://example.com/.hidden.yaml'
+  validate_remote_rule_set_url 'https://example.com/rules/geosite-openai.yaml' ||
+    { echo '合法的远程规则集地址必须通过（对照）' >&2; exit 1; }
+
+  # 三、生成的形状：远程来源写 type:http 加一天的更新间隔，本机来源保持原样。
+  remote_entry="$(kernel_split_rule_set_entry tag1 'a.yaml' classical 'https://example.com/a.yaml')"
+  local_entry="$(kernel_split_rule_set_entry tag1 'a.yaml' classical '')"
+  expect '远程来源的类型' '"http"' "$(jq '.entry.type' <<<"$remote_entry")"
+  expect '远程来源的地址' '"https://example.com/a.yaml"' "$(jq '.entry.url' <<<"$remote_entry")"
+  expect '远程来源的更新间隔' 86400 "$(jq '.entry.interval' <<<"$remote_entry")"
+  expect '远程来源的落地路径' "\"$work_218/rules/a.yaml\"" "$(jq '.entry.path' <<<"$remote_entry")"
+  expect '本机来源的类型' '"file"' "$(jq '.entry.type' <<<"$local_entry")"
+  expect '本机来源不写地址' 'false' "$(jq '.entry | has("url")' <<<"$local_entry")"
+  expect '本机来源不写更新间隔' 'false' "$(jq '.entry | has("interval")' <<<"$local_entry")"
+
+  # 四、命名冲突。同一个地址被多条分流共用不算冲突，两个不同地址算出同一个
+  # 文件名才算——后者会让两条分流互相覆盖对方的缓存。
+  printf '%s\n' '{"schema_version":7,"users":[],"outbound_presets":[],
+    "splits":[{"name":"s1","rule_file":"a.yaml","rule_url":"https://one.example.com/a.yaml",
+               "rule_behavior":"classical","status":"active"}],
+    "rule_presets":[{"name":"p1","rule_file":"a.yaml","rule_url":"https://one.example.com/a.yaml",
+                     "rule_behavior":"classical"}]}' > "$STATE_FILE"
+  expect '同一个地址不算冲突' '' "$(remote_rule_set_name_conflict 'a.yaml' 'https://one.example.com/a.yaml')"
+  expect '另一个地址算冲突并指出是谁' 's1' \
+    "$(remote_rule_set_name_conflict 'a.yaml' 'https://two.example.com/a.yaml')"
+  expect '没被占用的文件名' '' "$(remote_rule_set_name_conflict 'b.yaml' 'https://two.example.com/b.yaml')"
+
+  # 五、「立即更新」要更新哪些。分流与预置共用同一个文件，因此同一个地址只该
+  # 出现一次；这条防的是同一个文件被下载两遍、后一遍覆盖前一遍。
+  expect '去重后的远程规则集条数' 1 "$(remote_rule_set_rows | wc -l | tr -d ' ')"
+  expect '去重后的那一条' 'https://one.example.com/a.yaml	a.yaml	classical' "$(remote_rule_set_rows)"
+  printf '%s\n' '{"schema_version":7,"users":[],"outbound_presets":[],"rule_presets":[],
+    "splits":[{"name":"s1","rule_file":"a.yaml","rule_behavior":"classical","status":"active"}]}' > "$STATE_FILE"
+  expect '没有远程来源时清单为空' '' "$(remote_rule_set_rows)"
+  update_out="$(cmd_remote_rule_sets_update)" || { echo '没有远程规则集时不该失败' >&2; exit 1; }
+  case "$update_out" in
+    *没有使用网址来源的规则集*) ;;
+    *) printf '没有远程规则集时的说明不对：%s\n' "$update_out" >&2; exit 1;;
+  esac
+
+  # 六、下载失败时**不写出文件**，旧缓存原样留着。取不到的地址用本机的闭端口，
+  # 不用公网域名——测试机外面那层代理会替所有端口应答 TCP，拿公网地址试
+  # 会得到「连上了但不是规则集」而不是「连不上」。
+  printf 'payload:\n  - DOMAIN-SUFFIX,old.example.com\n' > "$work_218/rules/keep.yaml"
+  if download_remote_rule_set 'https://127.0.0.1:9/keep.yaml' "$work_218/rules/keep.yaml" classical 2>/dev/null; then
+    echo '取不到的地址必须失败' >&2
+    exit 1
+  fi
+  expect '失败之后旧缓存原样留着' 'payload:
+  - DOMAIN-SUFFIX,old.example.com' "$(cat "$work_218/rules/keep.yaml")"
+)
+
+# ============================================================
+# GeoSite／GeoIP 类别分流（公开 Issue #219）
+# ============================================================
+# 第三种规则来源。与前两种最要紧的差别是**它不会静默失效**：类别名写错、
+# 数据库缺了，mihomo 当场拒绝加载配置。因此这一组的重点不在「拦住坏输入」，
+# 而在**生成的形状**与**认行的办法**——geo 分流没有规则集标签，删除与审计
+# 只能按匹配条件认，认错了就会删掉别人的行或者把自己的行当成不存在。
+(
+  work_219="$work/geo-split"
+  mkdir -p "$work_219/rules"
+  PROXY_KERNEL=mihomo
+  MIHOMO_RULES_DIR="$work_219/rules"
+  STATE_FILE="$work_219/state.json"
+  expect() {
+    [[ "$2" == "$3" ]] && return 0
+    printf '%s：期望 %s，实际 %s\n' "$1" "$2" "$3" >&2
+    exit 1
+  }
+  refuse() {
+    local label="$1"; shift
+    if ( "$@" ) >/dev/null 2>&1; then
+      printf '应当拒绝但通过了：%s\n' "$label" >&2
+      exit 1
+    fi
+  }
+
+  # 一、类别写法。这里只挡「会把一条规则拼成另一条」的写法；类别名认不认得
+  # 由保存时那次 mihomo -t 说。最后两条是**对照**：合法写法必须通过。
+  refuse '没有前缀' validate_geo_category 'openai'
+  refuse '前缀不认识' validate_geo_category 'GEOX,openai'
+  refuse '类别名里有逗号' validate_geo_category 'GEOSITE,a,b'
+  refuse '类别名里有括号' validate_geo_category 'GEOSITE,(a)'
+  refuse '类别名里有空格' validate_geo_category 'GEOSITE,open ai'
+  refuse '类别名为空' validate_geo_category 'GEOSITE,'
+  validate_geo_category 'GEOSITE,openai' || { echo 'GEOSITE 合法写法必须通过（对照）' >&2; exit 1; }
+  validate_geo_category 'GEOIP,us' || { echo 'GEOIP 合法写法必须通过（对照）' >&2; exit 1; }
+
+  refuse '空清单' validate_geo_categories_json '[]'
+  refuse '重复的类别' validate_geo_categories_json '["GEOSITE,a","GEOSITE,a"]'
+  validate_geo_categories_json '["GEOSITE,a","GEOIP,us"]' ||
+    { echo '合法的类别清单必须通过（对照）' >&2; exit 1; }
+
+  # 二、匹配条件。生成、删除与审计三处必须算出同一个字符串，因此都走这一个函数。
+  expect '规则集来源的匹配条件' 'RULE-SET,tag1' "$(mihomo_split_match_condition tag1 '[]')"
+  expect '单个 geo 类别的匹配条件' 'GEOSITE,openai' \
+    "$(mihomo_split_match_condition tag1 '["GEOSITE,openai"]')"
+  expect '多个 geo 类别的匹配条件' 'OR,((GEOSITE,a),(GEOIP,us))' \
+    "$(mihomo_split_match_condition tag1 '["GEOSITE,a","GEOIP,us"]')"
+
+  # 三、渲染出来的四种形状。这四条与真机上用 mihomo -t 验过的写法逐字一致
+  # （公开 Issue #219 的实测表：单类别、多类别、限定用户、限定用户＋多类别，
+  # 四种都被 mihomo 接受，写错类别名的两条被当场拒绝）。
+  geo_plan='{"outbound_groups":[{"tag":"out1","objects":[{"name":"out1"}]}],"rule_sets":[],
+    "routes":[
+      {"match":"geo:1","rule_set":"r1","geo":["GEOSITE,openai"],"outbound":"out1","scope_all":true,"users":[],"inbound":[]},
+      {"match":"geo:2","rule_set":"r2","geo":["GEOSITE,a","GEOIP,us"],"outbound":"out1","scope_all":true,"users":[],"inbound":[]},
+      {"match":"geo:3","rule_set":"r3","geo":["GEOSITE,openai"],"outbound":"out1","scope_all":false,"users":["u"],"inbound":["st-u"]},
+      {"match":"geo:4","rule_set":"r4","geo":["GEOSITE,a","GEOIP,us"],"outbound":"out1","scope_all":false,"users":["u"],"inbound":["st-u"]},
+      {"match":"rule:r5","rule_set":"r5","geo":[],"outbound":"out1","scope_all":true,"users":[],"inbound":[]}]}'
+  rendered="$(kernel_render_split_plan "$geo_plan")"
+  expect '单类别、全部用户' '"GEOSITE,openai,out1"' "$(jq '.sub_rules[0]' <<<"$rendered")"
+  expect '多类别、全部用户' '"OR,((GEOSITE,a),(GEOIP,us)),out1"' "$(jq '.sub_rules[1]' <<<"$rendered")"
+  expect '单类别、限定用户' '"AND,((GEOSITE,openai),(IN-NAME,st-u)),out1"' "$(jq '.sub_rules[2]' <<<"$rendered")"
+  expect '多类别、限定用户' '"AND,((OR,((GEOSITE,a),(GEOIP,us))),(IN-NAME,st-u)),out1"' \
+    "$(jq '.sub_rules[3]' <<<"$rendered")"
+  expect '规则集来源不受影响（对照）' '"RULE-SET,r5,out1"' "$(jq '.sub_rules[4]' <<<"$rendered")"
+  expect 'geo 来源不写 rule-providers' 0 \
+    "$(jq '[.rule_providers | keys[]] | length' <<<"$rendered")"
+
+  # 四、sing-box 必须当场拒绝，而不是把 geo 当成空条件渲染出去——少一个条件的
+  # 路由会把**全部流量**送进上游出口。保存那一刻已经挡过一次，这是第二道。
+  if ( PROXY_KERNEL=singbox; kernel_render_split_plan "$geo_plan" ) >/dev/null 2>&1; then
+    echo 'sing-box 必须拒绝 geo 类别分流' >&2
+    exit 1
+  fi
+  ( PROXY_KERNEL=singbox
+    kernel_render_split_plan '{"outbound_groups":[],"rule_sets":[],
+      "routes":[{"match":"rule:r5","rule_set":"r5","geo":[],"outbound":"out1","scope_all":true,"users":[],"inbound":[]}]}'
+  ) >/dev/null || { echo 'sing-box 的规则集来源必须照常渲染（对照）' >&2; exit 1; }
+
+  # 五、认行。geo 行没有规则集标签可认，只能按条件认；认错的后果是删掉别人的行，
+  # 或者把自己的行当成不存在而反复「自动修复」。
+  geo_lines='["GEOSITE,openai,out1","AND,((OR,((GEOSITE,a),(GEOIP,us))),(IN-NAME,st-u)),out2","RULE-SET,r5,out3"]'
+  owned() {
+    jq -e --arg cond "$1" --argjson lines "$geo_lines" --argjson idx "$2" \
+      "$MIHOMO_SPLIT_RULE_DEFS"' sbm_line_owned_by($lines[$idx]; [$cond])' >/dev/null <<<'{}'
+  }
+  owned 'GEOSITE,openai' 0 || { echo '单类别的行应当被自己的条件认领' >&2; exit 1; }
+  owned 'OR,((GEOSITE,a),(GEOIP,us))' 1 || { echo '多类别的行应当被自己的条件认领' >&2; exit 1; }
+  owned 'RULE-SET,r5' 2 || { echo '规则集的行应当被自己的条件认领（对照）' >&2; exit 1; }
+  if owned 'GEOSITE,openai' 1; then echo '一条 geo 行不该被别的条件认领' >&2; exit 1; fi
+  if owned 'GEOSITE,a' 1; then
+    echo 'OR 里的单个类别不该单独认领整条行——那会把多类别分流的行删掉半条' >&2
+    exit 1
+  fi
+
+  # 六、geo 设置只在配置里真的有 geo 规则时才写。**对照是第一条**：一条 geo 规则
+  # 都没有的配置必须一个 geo 键都不多出来。实测过，多写这三个键不会下载数据库，
+  # 但每次启动都会留下一行 error 级日志，说 GeoSite.dat 找不到。
+  geo_settings() {
+    jq -c --argjson geox "$2" "$MIHOMO_GEO_SETTINGS_PROGRAM"' sbm_apply_geo_settings' <<<"$1"
+  }
+  plain='{"log-level":"info","mode":"rule","listeners":[],"proxies":[],"proxy-groups":[],"rules":[]}'
+  expect '没有 geo 规则时不写 geodata-mode（对照）' 'false' \
+    "$(geo_settings "$plain" '{}' | jq 'has("geodata-mode")')"
+  expect '没有 geo 规则时不写 geo-auto-update（对照）' 'false' \
+    "$(geo_settings "$plain" '{}' | jq 'has("geo-auto-update")')"
+  with_geo="$(jq -c '.["sub-rules"] = {"managed-splits":["GEOSITE,openai,out1"]}' <<<"$plain")"
+  expect '有 geo 规则时写 geodata-mode' 'true' "$(geo_settings "$with_geo" '{}' | jq '.["geodata-mode"]')"
+  expect '有 geo 规则时开自动更新' 'true' "$(geo_settings "$with_geo" '{}' | jq '.["geo-auto-update"]')"
+  expect '有 geo 规则时写更新周期' 24 "$(geo_settings "$with_geo" '{}' | jq '.["geo-update-interval"]')"
+  expect '没有自定义源时不写 geox-url' 'false' "$(geo_settings "$with_geo" '{}' | jq 'has("geox-url")')"
+  expect '有自定义源时写 geox-url' '"https://x.example.com/g.dat"' \
+    "$(geo_settings "$with_geo" '{"geosite":"https://x.example.com/g.dat"}' | jq '.["geox-url"].geosite')"
+  # 使用者自己写在顶层 rules 里的 geo 规则同样算数：按「管理器有没有 geo 分流」
+  # 判断会把他的设置删掉。
+  user_geo="$(jq -c '.rules = ["GEOSITE,cn,DIRECT"]' <<<"$plain")"
+  expect '使用者自己的 geo 规则也算' 'true' "$(geo_settings "$user_geo" '{}' | jq '.["geodata-mode"]')"
+  # 已经有取值时不覆盖：geodata-mode 是布尔，用 // 会把使用者显式写的 false 判成缺失。
+  user_false="$(jq -c '.["geodata-mode"] = false | .rules = ["GEOSITE,cn,DIRECT"]' <<<"$plain")"
+  expect '不覆盖使用者显式写的 false' 'false' "$(geo_settings "$user_false" '{}' | jq '.["geodata-mode"]')"
+  # 最后一条 geo 规则没了之后，这几个键由管理器收回去——它们是管理器放进去的，
+  # 留着只剩那行假错。
+  stale="$(jq -c '.["geodata-mode"] = true | .["geo-auto-update"] = true | .["geo-update-interval"] = 24 |
+    .["geox-url"] = {"geosite":"https://x.example.com/g.dat"}' <<<"$plain")"
+  expect '没有 geo 规则时收回 geodata-mode' 'false' "$(geo_settings "$stale" '{}' | jq 'has("geodata-mode")')"
+  expect '没有 geo 规则时收回 geox-url' 'false' "$(geo_settings "$stale" '{}' | jq 'has("geox-url")')"
+
+  # 七、geo 数据源的取值渲染。留空的那一项不写进 geox-url，而不是写一个空字符串
+  # ——空字符串会让 mihomo 拿一个空地址去下载。
+  expect '两个都留空时是空对象' '{}' "$( GEOSITE_URL='' GEOIP_URL='' mihomo_geox_url_json )"
+  expect '只设 GeoSite' '{"geosite":"https://a.example.com/g.dat"}' \
+    "$( GEOSITE_URL='https://a.example.com/g.dat' GEOIP_URL='' mihomo_geox_url_json )"
+  expect '两个都设' '{"geosite":"https://a.example.com/g.dat","geoip":"https://b.example.com/i.dat"}' \
+    "$( GEOSITE_URL='https://a.example.com/g.dat' GEOIP_URL='https://b.example.com/i.dat' mihomo_geox_url_json )"
+
+  # 八、状态里的形状：geo 来源只有类别清单，没有 rule_file／rule_url／rule_behavior。
+  # 这三样对 geo 来源都不适用，留着会让「取来源」的读法读出一个不存在的文件名。
+  printf '%s\n' '{"schema_version":7,"users":[],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
+  atomic_state_update() { # 单元测试里直接改文件，不走事务
+    local filter="$1"; shift
+    jq "$filter" "$@" "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+  }
+  state_add_rule_preset geo-preset '' '' '' '["GEOSITE,openai","GEOIP,us"]'
+  expect '预置存下了类别清单' '["GEOSITE,openai","GEOIP,us"]' \
+    "$(jq -c '.rule_presets[0].rule_geo' "$STATE_FILE")"
+  expect 'geo 预置不写 rule_file' 'false' "$(jq '.rule_presets[0] | has("rule_file")' "$STATE_FILE")"
+  expect 'geo 预置不写 rule_behavior' 'false' "$(jq '.rule_presets[0] | has("rule_behavior")' "$STATE_FILE")"
+  expect 'geo 预置不写 rule_url' 'false' "$(jq '.rule_presets[0] | has("rule_url")' "$STATE_FILE")"
+  # 改成本机文件来源时，类别清单必须被删掉；留着会让这条预置同时是两种来源。
+  state_replace_rule_preset geo-preset 'lab.yaml' classical '' '[]'
+  expect '改回文件来源后没有类别清单' 'false' "$(jq '.rule_presets[0] | has("rule_geo")' "$STATE_FILE")"
+  expect '改回文件来源后有文件名' '"lab.yaml"' "$(jq '.rule_presets[0].rule_file' "$STATE_FILE")"
+)
+
+# ============================================================
+# geo 分流与远程规则集：生成与审计是否同步
+# ============================================================
+# 做法与 2e 那一组一样：夹具不是手写的运行配置，而是用**生成函数**按状态算出来的，
+# 先要求审计报零问题，再逐条破坏、确认变红。这一组要守的是新加进来的两条路
+# ——geo 分流（公开 Issue #219）与网址来源的规则集（公开 Issue #218）。
+(
+  work_geo="$work/geo-audit"
+  mkdir -p "$work_geo/rules"
+  PROXY_KERNEL=mihomo
+  MIHOMO_CONFIG="$work_geo/config.json"
+  MIHOMO_RULES_DIR="$work_geo/rules"
+  STATE_FILE="$work_geo/state.json"
+  HANDSHAKE_PORT=443
+  SHADOWTLS_STRICT_MODE=true
+  GEOSITE_URL=""
+  GEOIP_URL=""
+  probe_handshake_tls13() { printf 'tls13\n'; }
+  printf 'payload:\n  - DOMAIN-SUFFIX,openai.com\n' > "$work_geo/rules/remote.yaml"
+  printf '%s\n' '{
+    "schema_version":7,
+    "users":[
+      {"name":"alice","status":"active","metered":false,
+       "endpoints":[{"protocol":"ss2022","transport":"direct","port":20001,
+                     "ss2022_password":"sspw","method":"2022-blake3-aes-128-gcm"}]}
+    ],
+    "splits":[
+      {"name":"geo-all","rule_geo":["GEOSITE,openai","GEOIP,us"],"scope":"all","user":null,
+       "upstream":{"protocol":"shadowsocks","server":"up.example.com","server_port":8388,
+                   "method":"2022-blake3-aes-128-gcm","password":"pw"},
+       "outbound_tag":"geo-out","rule_set_tag":"geo-rule","status":"active"},
+      {"name":"geo-user","rule_geo":["GEOSITE,github"],"scope":"user","user":"alice",
+       "upstream":{"protocol":"shadowsocks","server":"up2.example.com","server_port":8389,
+                   "method":"2022-blake3-aes-128-gcm","password":"pw2"},
+       "outbound_tag":"geo-user-out","rule_set_tag":"geo-user-rule","status":"active"},
+      {"name":"remote","rule_file":"remote.yaml","rule_url":"https://rules.example.com/remote.yaml",
+       "rule_behavior":"classical","scope":"all","user":null,
+       "upstream":{"protocol":"shadowsocks","server":"up3.example.com","server_port":8390,
+                   "method":"2022-blake3-aes-128-gcm","password":"pw3"},
+       "outbound_tag":"remote-out","rule_set_tag":"remote-rule","status":"active"}
+    ],
+    "outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
+  printf '%s\n' '{"log-level":"info","mode":"rule","listeners":[],"proxies":[],"proxy-groups":[],"rules":[]}' > "$MIHOMO_CONFIG"
+  nfuse() {
+    [[ "${1:-}" == list && "${2:-}" == --json ]] || return 1
+    printf '%s\n' '[{"name":"alice","tier":"c","ports":[{"start":20001,"end":20001}]}]'
+  }
+  rebuild_protocol_inbounds ss2022
+  rebuild_all_split_configs
+  cp "$MIHOMO_CONFIG" "$work_geo/config.good.json"
+
+  # 一、生成出来的东西本身。geo 分流不进 rule-providers，网址来源进而且写成
+  # type:http；三条分流各有一行规则。
+  expect() {
+    [[ "$2" == "$3" ]] && return 0
+    printf '%s：期望 %s，实际 %s\n' "$1" "$2" "$3" >&2
+    cat "$work_geo/config.good.json" >&2
+    exit 1
+  }
+  expect 'rule-providers 里只有网址来源那一条' '["remote-rule"]' \
+    "$(jq -c '[.["rule-providers"] | keys[]]' "$MIHOMO_CONFIG")"
+  expect '网址来源写成自动下载' '"http"' "$(jq '.["rule-providers"]["remote-rule"].type' "$MIHOMO_CONFIG")"
+  expect '托管规则共三行' 3 "$(jq '.["sub-rules"]["managed-splits"] | length' "$MIHOMO_CONFIG")"
+  expect '全部用户的 geo 行' 'true' \
+    "$(jq '.["sub-rules"]["managed-splits"] | index("OR,((GEOSITE,openai),(GEOIP,us)),geo-out") != null' "$MIHOMO_CONFIG")"
+  expect '限定用户的 geo 行' 'true' \
+    "$(jq '.["sub-rules"]["managed-splits"] | index("AND,((GEOSITE,github),(IN-NAME,ss-alice)),geo-user-out") != null' "$MIHOMO_CONFIG")"
+  # 有 geo 分流的机器要写上那三个键；没有的机器一个都不写，那条对照在下面。
+  expect '有 geo 分流时写 geodata-mode' 'true' "$(jq '.["geodata-mode"]' "$MIHOMO_CONFIG")"
+  expect '有 geo 分流时开自动更新' 'true' "$(jq '.["geo-auto-update"]' "$MIHOMO_CONFIG")"
+  expect '没有自定义源时不写 geox-url' 'false' "$(jq 'has("geox-url")' "$MIHOMO_CONFIG")"
+
+  audit_consistency > "$work_geo/audit.clean"
+  if [[ "$AUDIT_ISSUES" != 0 ]]; then
+    echo '生成函数产出的配置必须让审计报零问题；生成与审计已经脱节：' >&2
+    cat "$work_geo/audit.clean" >&2
+    exit 1
+  fi
+
+  break_and_expect() {
+    local label="$1" filter="$2" want="$3" want_count="${4:-1}"
+    jq -c "$filter" "$work_geo/config.good.json" > "$MIHOMO_CONFIG.tmp" && mv "$MIHOMO_CONFIG.tmp" "$MIHOMO_CONFIG"
+    audit_consistency > "$work_geo/audit.broken"
+    if [[ "$AUDIT_ISSUES" != "$want_count" ]]; then
+      printf '破坏「%s」之后期望报 %s 个问题，实际 %s 个：\n' "$label" "$want_count" "$AUDIT_ISSUES" >&2
+      cat "$work_geo/audit.broken" >&2
+      exit 1
+    fi
+    if ! grep -Fq "$want" "$work_geo/audit.broken"; then
+      printf '破坏「%s」之后没有报出预期的那一条（%s）：\n' "$label" "$want" >&2
+      cat "$work_geo/audit.broken" >&2
+      exit 1
+    fi
+  }
+
+  # 二、网址来源漂成本机文件：那条分流从此不再自动更新，而 mihomo 一个字都不说。
+  break_and_expect '把网址来源改回 type:file' \
+    '.["rule-providers"]["remote-rule"] |= (del(.url) | del(.interval) | .type = "file")' \
+    '[可自动修复] 分流 remote 的规则集来源与保存的不一致（保存的来源是网址，配置里却没有写成自动下载，规则不会再更新）'
+  break_and_expect '把网址改成别的地址' \
+    '.["rule-providers"]["remote-rule"].url = "https://other.example.com/remote.yaml"' \
+    '[可自动修复] 分流 remote 的规则集来源与保存的不一致（配置里的规则集网址与保存的不一致）'
+  break_and_expect '把更新周期改掉' \
+    '.["rule-providers"]["remote-rule"].interval = 60' \
+    '[可自动修复] 分流 remote 的规则集来源与保存的不一致（配置里的规则集更新周期与保存的不一致）'
+
+  # 三、geo 分流的行被删掉时必须报出来。geo 来源没有 rule-providers 条目可查，
+  # 「配置完不完整」那一问对它只剩规则行与出口两项——那一问要是恒真，
+  # 这条破坏就不会变红。
+  break_and_expect '删掉全部用户那条 geo 规则行' \
+    '.["sub-rules"]["managed-splits"] = [.["sub-rules"]["managed-splits"][] | select(startswith("OR,((GEOSITE,openai)") | not)]' \
+    '[可自动修复] 分流 geo-all 的规则或出口配置不完整'
+  break_and_expect '删掉限定用户那条 geo 规则行' \
+    '.["sub-rules"]["managed-splits"] = [.["sub-rules"]["managed-splits"][] | select(contains("GEOSITE,github") | not)]' \
+    '[可自动修复] 分流 geo-user 的规则或出口配置不完整' 2
+  break_and_expect '删掉 geo 分流的出口' \
+    '.proxies = [.proxies[] | select(.name != "geo-out")]' \
+    '[可自动修复] 分流 geo-all 的规则或出口配置不完整'
+
+  # 四、对照：一台没有 geo 分流的机器一个 geo 键都不该多出来。2b 当时断言的是
+  # 「部署之后一个 geo 数据库都不下」（公开 Issue #165），加了 geo 类别之后那条
+  # 要改成「没有 geo 分流的机器仍然一个都不下」——这里守的就是它的前提。
+  cp "$work_geo/config.good.json" "$MIHOMO_CONFIG"
+  jq -c '.splits = [.splits[] | select((.rule_geo // []) | length == 0)]' "$STATE_FILE" > "$STATE_FILE.tmp"
+  mv "$STATE_FILE.tmp" "$STATE_FILE"
+  rebuild_all_split_configs
+  expect '去掉 geo 分流之后收回 geodata-mode' 'false' "$(jq 'has("geodata-mode")' "$MIHOMO_CONFIG")"
+  expect '去掉 geo 分流之后收回自动更新' 'false' "$(jq 'has("geo-auto-update")' "$MIHOMO_CONFIG")"
+  expect '去掉 geo 分流之后收回更新周期' 'false' "$(jq 'has("geo-update-interval")' "$MIHOMO_CONFIG")"
+  expect '剩下的网址来源分流没受影响（对照）' '"http"' \
+    "$(jq '.["rule-providers"]["remote-rule"].type' "$MIHOMO_CONFIG")"
+  audit_consistency > "$work_geo/audit.nogeo"
+  if [[ "$AUDIT_ISSUES" != 0 ]]; then
+    echo '去掉 geo 分流之后审计仍应报零问题：' >&2
+    cat "$work_geo/audit.nogeo" >&2
+    exit 1
+  fi
+)
+
 echo 'unit checks passed'

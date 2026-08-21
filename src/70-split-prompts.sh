@@ -162,11 +162,16 @@ print_rule_preset_list() {
     . as $state |
     def source_label($p):
       if $kernel == "mihomo" then
-        ($p.rule_file // "?") + "｜" +
-        (if $p.rule_behavior == "classical" then "完整规则行"
-         elif $p.rule_behavior == "domain" then "域名列表"
-         elif $p.rule_behavior == "ipcidr" then "IP 段列表"
-         else "未知写法" end)
+        (if (($p.rule_geo // []) | length) > 0 then
+           "geo 类别｜" + (($p.rule_geo // []) | join(" "))
+         else
+           ($p.rule_file // "?") + "｜" +
+           (if ($p.rule_url // "") != "" then "网址" else "本机文件" end) + "｜" +
+           (if $p.rule_behavior == "classical" then "完整规则行"
+            elif $p.rule_behavior == "domain" then "域名列表"
+            elif $p.rule_behavior == "ipcidr" then "IP 段列表"
+            else "未知写法" end)
+         end)
       else (if ($p.url | test("\\.srs([?#].*)?$")) then "SRS" else "JSON" end) end;
     if (.rule_presets | length) == 0 then "暂无预置规则"
     else (["名称","来源","关联分流","其中启用"] | @tsv),
@@ -209,11 +214,16 @@ prompt_select_rule_preset() {
   jq -r --arg kernel "$PROXY_KERNEL" '
     def source_label($p):
       if $kernel == "mihomo" then
-        ($p.rule_file // "?") + "｜" +
-        (if $p.rule_behavior == "classical" then "完整规则行"
-         elif $p.rule_behavior == "domain" then "域名列表"
-         elif $p.rule_behavior == "ipcidr" then "IP 段列表"
-         else "未知写法" end)
+        (if (($p.rule_geo // []) | length) > 0 then
+           "geo 类别｜" + (($p.rule_geo // []) | join(" "))
+         else
+           ($p.rule_file // "?") + "｜" +
+           (if ($p.rule_url // "") != "" then "网址" else "本机文件" end) + "｜" +
+           (if $p.rule_behavior == "classical" then "完整规则行"
+            elif $p.rule_behavior == "domain" then "域名列表"
+            elif $p.rule_behavior == "ipcidr" then "IP 段列表"
+            else "未知写法" end)
+         end)
       else (if ($p.url | test("\\.srs([?#].*)?$")) then "SRS" else "JSON" end) end;
     (["编号","名称","来源"] | @tsv),
     (to_entries[] | [(.key+1),.value.name,source_label(.value)] | @tsv)' <<<"$rows" | column -t -s $'\t'
@@ -228,6 +238,7 @@ prompt_select_rule_preset() {
   # 预置若是远程来源，选中它的分流要继承那个地址，否则分流会退化成「指向同名
   # 本机文件」——文件确实在（预置下载过），但从此不再自动更新。
   SELECTED_RULE_URL="$(jq -r --argjson idx "$SELECTED_INDEX" '.[$idx] | (.rule_url // "")' <<<"$rows")"
+  SELECTED_RULE_GEO="$(jq -c --argjson idx "$SELECTED_INDEX" '.[$idx] | (.rule_geo // [])' <<<"$rows")"
 }
 
 prompt_preset_name() {
@@ -354,22 +365,69 @@ prompt_mihomo_rule_behavior() {
   esac
 }
 
-# 规则集从哪里来（公开 Issue #218）。两种来源并存：
-# **网址**——mihomo 自己下载、每天自己更新，使用者什么都不用维护；
-# **本机文件**——使用者自己往规则目录里放一份，适合手工维护的清单。
+# 规则从哪里来。三种来源并存（公开 Issue #218 加了网址，#219 加了 geo 类别）：
+# **网址**——mihomo 自己下载规则集、每天自己更新，使用者什么都不用维护；
+# **本机文件**——使用者自己往规则目录里放一份，适合手工维护的清单；
+# **geo 类别**——不需要任何规则文件，直接写 GEOSITE,openai 这样的类别名。
 prompt_mihomo_rule_kind() {
   SELECTED_RULE_KIND=''
   echo
-  echo '规则集从哪里来？'
-  echo '  1. 网址（自动下载，每天自动更新，推荐）'
-  printf '  2. 本机文件（自己放在 %s 下，自己维护）\n' "$MIHOMO_RULES_DIR"
+  echo '规则从哪里来？'
+  echo '  1. 网址（规则集自动下载，每天自动更新，推荐）'
+  printf '  2. 本机文件（规则集自己放在 %s 下，自己维护）\n' "$MIHOMO_RULES_DIR"
+  echo '  3. GeoSite／GeoIP 类别（例如 GEOSITE,openai，不需要规则文件）'
   echo '  0. 返回上一级'
-  read_menu_choice '请选择：' '0,1,2' 1 '请输入 1、2 或 0' || return 1
+  read_menu_choice '请选择：' '0,1,2,3' 1 '请输入 1、2、3 或 0' || return 1
   case "$PROMPT_VALUE" in
     1) SELECTED_RULE_KIND=remote ;;
     2) SELECTED_RULE_KIND=local ;;
+    3) SELECTED_RULE_KIND=geo ;;
     0) return 1 ;;
   esac
+}
+
+# geo 类别的输入（公开 Issue #219）。一条分流可以填多个类别，命中任意一个就算。
+# 类别名不在这里判对错——那要看 mihomo 自己的数据库，由保存时那次 `mihomo -t`
+# 当场认。这里只挡住会把规则拼坏的写法，并把前缀统一成大写。
+prompt_mihomo_geo_categories() {
+  local entry kind value categories='[]' count
+  SELECTED_RULE_GEO='[]'
+  echo
+  echo 'GeoSite 按域名分类（GEOSITE,openai），GeoIP 按 IP 归属的国家或地区（GEOIP,us）。'
+  echo '可以填多个，命中其中任意一个就走这条分流。一行填一个，填完直接回车结束。'
+  echo '类别名要与数据库里的一致；保存时会用 mihomo 当场校验，写错会指名道姓地告诉你。'
+  while true; do
+    count="$(jq 'length' <<<"$categories")"
+    read -r -p "第 $((count + 1)) 个类别（直接回车结束，输入 0 返回）：" entry || return 1
+    [[ "$entry" != 0 ]] || return 1
+    if [[ -z "$entry" ]]; then
+      ((count > 0)) || { echo '至少要填一个类别。'; continue; }
+      break
+    fi
+    # 只填类别名时按 GeoSite 算：那是绝大多数场景，也是唯一不会引起歧义的默认。
+    if [[ "$entry" == *,* ]]; then
+      kind="$(printf '%s' "${entry%%,*}" | tr '[:lower:]' '[:upper:]')"
+      value="${entry#*,}"
+    else
+      kind=GEOSITE
+      value="$entry"
+    fi
+    entry="${kind},${value}"
+    if ! validate_without_exit validate_geo_category "$entry"; then
+      printf '输入无效：%s\n' "$VALIDATION_ERROR"
+      continue
+    fi
+    if jq -e --arg item "$entry" 'index($item) != null' <<<"$categories" >/dev/null; then
+      echo '这个类别已经填过了，换一个。'
+      continue
+    fi
+    categories="$(jq -c --arg item "$entry" '. + [$item]' <<<"$categories")" || return 1
+    printf '已加入：%s\n' "$entry"
+  done
+  SELECTED_RULE_GEO="$categories"
+  printf '共 %s 个类别：%s\n' "$(jq 'length' <<<"$categories")" "$(jq -r 'join("  ")' <<<"$categories")"
+  echo '保存时会用 mihomo 校验这些类别名；这台机器上第一次用到 geo 规则时'
+  echo '还会自动下载数据库（GeoSite 约 4 MB，用到 GeoIP 再加约 17 MB），可能要等一会。'
 }
 
 # 远程规则集的地址。只接受 yaml，且**文件名原样保留**——保存下来的本机文件就叫
@@ -404,6 +462,7 @@ prompt_split_rule_source() {
   SELECTED_RULE_SOURCE=''
   SELECTED_RULE_BEHAVIOR=''
   SELECTED_RULE_URL=''
+  SELECTED_RULE_GEO='[]'
   case "$PROXY_KERNEL" in
     singbox)
       while true; do
@@ -430,6 +489,10 @@ prompt_split_rule_source() {
           prompt_mihomo_rule_behavior || return 1
           SELECTED_RULE_SOURCE="$(remote_rule_set_file_name "${SELECTED_RULE_URL:-}")"
           ;;
+        geo)
+          # geo 来源没有规则文件，也没有写法可选：类别本身就是匹配条件。
+          prompt_mihomo_geo_categories || return 1
+          ;;
         *)
           prompt_mihomo_rule_file || return 1
           prompt_mihomo_rule_behavior || return 1
@@ -449,14 +512,15 @@ prompt_add_rule_preset() {
   printf '说明：保存预置不会修改 %s，也不会影响现有分流。\n' "$(kernel_display_name)"
   read -r -p '确认检查并保存？[y/N]：' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消保存。'; return 0; }
-  cmd_rule_preset_add "$PRESET_NAME" "$SELECTED_RULE_SOURCE" "$SELECTED_RULE_BEHAVIOR" "${SELECTED_RULE_URL:-}"
+  cmd_rule_preset_add "$PRESET_NAME" "$SELECTED_RULE_SOURCE" "$SELECTED_RULE_BEHAVIOR" "${SELECTED_RULE_URL:-}" "${SELECTED_RULE_GEO:-[]}"
 }
 
 prompt_edit_rule_preset() {
-  local name source behavior total active answer rule_url
+  local name source behavior total active answer rule_url rule_geo
   prepare_core
   prompt_select_rule_preset '修改预置规则' || { MENU_RETURNED=true; return 0; }
-  name="$SELECTED_RULE_PRESET"; source="$SELECTED_RULE_SOURCE"; behavior="$SELECTED_RULE_BEHAVIOR"; rule_url="${SELECTED_RULE_URL:-}"
+  name="$SELECTED_RULE_PRESET"; source="$SELECTED_RULE_SOURCE"; behavior="$SELECTED_RULE_BEHAVIOR"
+  rule_url="${SELECTED_RULE_URL:-}"; rule_geo="${SELECTED_RULE_GEO:-[]}"
   total="$(jq --arg name "$name" '[.splits[] | select((.rule_preset // "") == $name)] | length' "$STATE_FILE")"
   active="$(jq --arg name "$name" '[.splits[] | select((.rule_preset // "") == $name and .status == "active")] | length' "$STATE_FILE")"
   printf '\n关联分流：%s 条，其中启用 %s 条。\n' "$total" "$active"
@@ -465,7 +529,30 @@ prompt_edit_rule_preset() {
   if ((active > 0)); then printf '保存后会同步更新所有关联分流，并只重启一次 %s。\n' "$(kernel_display_name)"; else echo '保存后会同步更新关联记录；当前没有启用中的关联分流，不会重启服务。'; fi
   read -r -p '确认检查并保存？[y/N]：' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消修改。'; return 0; }
-  cmd_rule_preset_edit "$name" "$SELECTED_RULE_SOURCE" "$SELECTED_RULE_BEHAVIOR" "${SELECTED_RULE_URL:-}"
+  cmd_rule_preset_edit "$name" "$SELECTED_RULE_SOURCE" "$SELECTED_RULE_BEHAVIOR" "${SELECTED_RULE_URL:-}" "${SELECTED_RULE_GEO:-[]}"
+}
+
+# 「立即更新规则集」（公开 Issue #218）。mihomo 自己每天更新一次；这里是给
+# 「现在就要用上新规则」准备的。要断几秒必须在动手之前说清楚——新内容只有
+# 重启内核才会立刻被读到，不重启就要等下一个更新周期，可能是一天以后。
+prompt_remote_rule_sets_update() {
+  local count answer
+  prepare_core
+  count="$(jq '[(.splits[]?, .rule_presets[]?) | select((.rule_url // "") != "")] | length' "$STATE_FILE")" || return 1
+  if ((count == 0)); then
+    echo
+    echo '当前没有使用网址来源的规则集。只有来源是网址的规则集才需要更新；'
+    echo '本机文件由你自己维护，管理器不会去改它。'
+    return 0
+  fi
+  echo
+  printf '将重新下载 %s 条网址来源的规则集，逐条校验之后写入本机。\n' "$count"
+  echo '取不到或者内容不对的那几条会保留现在的内容，不会变成空规则。'
+  printf '内容确实有变化时会重启 %s 让新规则立刻生效，现有连接中断几秒；\n' "$(kernel_display_name)"
+  echo '内容没有变化就不重启，连接不受影响。'
+  read -r -p '确认现在更新？[y/N]：' answer
+  [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消更新。'; return 0; }
+  cmd_remote_rule_sets_update || return 0
 }
 
 prompt_remove_rule_preset() {
@@ -483,7 +570,7 @@ prompt_remove_rule_preset() {
 }
 
 prompt_add_split() {
-  local name source behavior rule_preset scope_choice scope user="" outbound_preset outbound_tag upstream answer rule_url
+  local name source behavior rule_preset scope_choice scope user="" outbound_preset outbound_tag upstream answer rule_url rule_geo
   prepare_core
   if ! jq -e '(.rule_presets | length) > 0' "$STATE_FILE" >/dev/null; then echo '尚未添加预置规则，请先到“预置规则管理”中添加。'; return 0; fi
   if ! jq -e '(.outbound_presets | length) > 0' "$STATE_FILE" >/dev/null; then echo '尚未添加预置出口，请先到“预置出口管理”中添加。'; return 0; fi
@@ -497,7 +584,8 @@ prompt_add_split() {
     break
   done
   prompt_select_rule_preset '选择要使用的预置规则' || { MENU_RETURNED=true; return 0; }
-  rule_preset="$SELECTED_RULE_PRESET"; source="$SELECTED_RULE_SOURCE"; behavior="$SELECTED_RULE_BEHAVIOR"; rule_url="${SELECTED_RULE_URL:-}"
+  rule_preset="$SELECTED_RULE_PRESET"; source="$SELECTED_RULE_SOURCE"; behavior="$SELECTED_RULE_BEHAVIOR"
+  rule_url="${SELECTED_RULE_URL:-}"; rule_geo="${SELECTED_RULE_GEO:-[]}"
   while true; do
     cat <<'EOF'
 作用范围：
@@ -516,7 +604,7 @@ EOF
   printf '\n分流预览：\n  名称：%s\n  预置规则：%s\n  范围：%s\n  预置出口：%s\n' "$name" "$rule_preset" "$(if [[ "$scope" == all ]]; then echo 全部用户; else echo "用户:$user"; fi)" "$outbound_preset"
   read -r -p '确认检查并添加？[y/N]：' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消添加。'; return 0; }
-  if ! cmd_split_add "$name" "$source" "$scope" "$user" "$upstream" "$outbound_tag" "$rule_preset" "$outbound_preset" "$behavior" "$rule_url"; then
+  if ! cmd_split_add "$name" "$source" "$scope" "$user" "$upstream" "$outbound_tag" "$rule_preset" "$outbound_preset" "$behavior" "$rule_url" "$rule_geo"; then
     echo '分流没有添加，现有配置没有改变。'
     return 0
   fi
@@ -791,7 +879,7 @@ prompt_split_details() {
 }
 
 prompt_edit_split() {
-  local name split source behavior scope user upstream out_tag choice answer current_scope current_out rule_preset outbound_preset current_source rule_url
+  local name split source behavior scope user upstream out_tag choice answer current_scope current_out rule_preset outbound_preset current_source rule_url rule_geo
   prepare_core
   prompt_select_split all "编辑分流" || return 0
   name="$SELECTED_SPLIT_NAME"
@@ -799,6 +887,11 @@ prompt_edit_split() {
   jq -e '.upstream.protocol' <<<"$split" >/dev/null || die "这条旧版分流缺少出口服务器信息，请删除后重新添加"
   source="$(split_rule_source_from_json "$split")"
   behavior="$(split_rule_behavior_from_json "$split")"
+  # 「保持不变」那一支必须把来源的**全部**字段带上，不只是文件名与写法。
+  # 少带 rule_url 的后果是：编辑一条网址来源的分流时只要不换预置规则，
+  # 它就会被静静地改成「指向同名本机文件」，从此不再自动更新。
+  rule_url="$(split_rule_url_from_json "$split")"
+  rule_geo="$(split_rule_geo_from_json "$split")"
   rule_preset="$(jq -r '.rule_preset // ""' <<<"$split")"
   current_source="${rule_preset:-独立配置}"
   cat <<EOF
@@ -811,7 +904,7 @@ EOF
   choice="$PROMPT_VALUE"
   case "$choice" in
     1) :;;
-    2) prompt_select_rule_preset '选择新的预置规则' || { MENU_RETURNED=true; return 0; }; rule_preset="$SELECTED_RULE_PRESET"; source="$SELECTED_RULE_SOURCE"; behavior="$SELECTED_RULE_BEHAVIOR"; rule_url="${SELECTED_RULE_URL:-}";;
+    2) prompt_select_rule_preset '选择新的预置规则' || { MENU_RETURNED=true; return 0; }; rule_preset="$SELECTED_RULE_PRESET"; source="$SELECTED_RULE_SOURCE"; behavior="$SELECTED_RULE_BEHAVIOR"; rule_url="${SELECTED_RULE_URL:-}"; rule_geo="${SELECTED_RULE_GEO:-[]}";;
     0) MENU_RETURNED=true; return 0;;
   esac
   current_scope="$(jq -r '.scope' <<<"$split")"
@@ -855,7 +948,7 @@ EOF
   printf '  出口来源：%s\n' "${outbound_preset:-独立配置}"
   read -r -p '确认检查并保存？[y/N]：' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo "已取消修改。"; return 0; }
-  if ! cmd_split_edit "$name" "$source" "$scope" "$user" "$upstream" "$out_tag" "$rule_preset" "$outbound_preset" "$behavior" "$rule_url"; then
+  if ! cmd_split_edit "$name" "$source" "$scope" "$user" "$upstream" "$out_tag" "$rule_preset" "$outbound_preset" "$behavior" "$rule_url" "$rule_geo"; then
     echo '分流修改没有保存，原有配置继续使用。'
     return 0
   fi
@@ -961,6 +1054,9 @@ split_management_menu() {
     printf '\n'
     ui_section '预置内容（保存后不会自动生效）'
     ui_menu_items outbound_presets '预置出口管理' rule_presets '预置规则管理'
+    # 「立即更新规则集」只在 mihomo 上出现：sing-box 的规则集由 sing-box 自己
+    # 按配置里的地址下载，管理器没有可更新的本机缓存（公开 Issue #218）。
+    [[ "$PROXY_KERNEL" != mihomo ]] || ui_menu_items update_rules '立即更新规则集'
     printf '\n'
     ui_section '危险操作'
     printf '%s' "$UI_RED"
@@ -980,6 +1076,7 @@ split_management_menu() {
       diagnose) MENU_RETURNED=false; prompt_split_diagnostic; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
       outbound_presets) outbound_preset_management_menu;;
       rule_presets) rule_preset_management_menu;;
+      update_rules) MENU_RETURNED=false; prompt_remote_rule_sets_update; [[ "$MENU_RETURNED" == true ]] || pause_menu;;
       back) return 0;;
     esac
   done

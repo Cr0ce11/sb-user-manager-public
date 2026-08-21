@@ -65,6 +65,11 @@ DEPLOYED_VERSIONS_FILE="${SB_DEPLOYED_VERSIONS_FILE:-/var/lib/sb-user-manager/ve
 DIAGNOSTIC_REPORT_DIR="${SB_DIAGNOSTIC_REPORT_DIR:-/root/sb-user-manager-diagnostics}"
 DEFAULT_SS2022_SHADOWTLS_SNI="publicassets.cdn-apple.com"
 DEFAULT_ANYTLS_SNI="weKbP9SVYU.download.windowsupdate.com"
+# geo 数据源的文件级默认值（公开 Issue #219）。空字符串表示用 mihomo 自带的源。
+# 必须在文件级就有值：管理配置载入之前也可能读到它们（只读查询的早期路径、
+# 以及直接设置变量的单元测试），而 set -u 下读一个没定义的变量会当场结束进程。
+GEOSITE_URL=""
+GEOIP_URL=""
 
 # 由 MANAGER_DATA_DIR 派生的路径。文件级与 load_runtime_config 两处共用这一个
 # 函数，而不是各写一遍拼接：两份写法迟早会漂移。
@@ -148,7 +153,8 @@ parse_runtime_config() {
       STATE_FILE|LOCK_FILE|BACKUP_DIR|TRANSACTION_DIR|TRANSACTION_JOURNAL|\
       CLIENT_SERVER_PORT_OVERRIDE|PUBLIC_SERVER_OVERRIDE|GITHUB_TOKEN|\
       SS_METHOD|HANDSHAKE_SERVER|TLS_SERVER_NAME|PORT_MIN|PORT_MAX|PROXY_KERNEL|\
-      MIHOMO_BIN|MIHOMO_CONFIG|MIHOMO_SERVICE|MIHOMO_WORK_DIR|MANAGER_DATA_DIR) ;;
+      MIHOMO_BIN|MIHOMO_CONFIG|MIHOMO_SERVICE|MIHOMO_WORK_DIR|MANAGER_DATA_DIR|\
+      GEOSITE_URL|GEOIP_URL) ;;
       *) die "管理配置第 ${line_number} 行包含未知配置项：$key" ;;
     esac
     [[ "$seen" != *"|${key}|"* ]] || die "管理配置第 ${line_number} 行重复设置：$key"
@@ -175,6 +181,10 @@ load_runtime_config() {
   # 每次加载都先恢复内置默认，避免回滚到旧配置（尚无 SNI 字段）时沿用进程内的新值。
   SS2022_SHADOWTLS_SNI="$DEFAULT_SS2022_SHADOWTLS_SNI"
   ANYTLS_SNI="$DEFAULT_ANYTLS_SNI"
+  # geo 数据源同理：回滚到还没有这两项的旧配置时，不能沿用进程里的旧取值，
+  # 否则「已经改回默认源」的机器会继续按上一次的自定义地址算（公开 Issue #219）。
+  GEOSITE_URL=""
+  GEOIP_URL=""
   unset GITHUB_TOKEN SB_GITHUB_TOKEN
   # 配置按白名单解析，不能作为 root shell 代码执行。
   parse_runtime_config
@@ -225,6 +235,11 @@ load_runtime_config() {
   : "${ANYTLS_SNI:=$DEFAULT_ANYTLS_SNI}"
   : "${CLIENT_SERVER_PORT_OVERRIDE:=}"
   : "${PUBLIC_SERVER_OVERRIDE:=${SB_PUBLIC_SERVER:-}}"
+  # GeoSite／GeoIP 数据库的下载地址（公开 Issue #219）。留空表示用 mihomo 自带的
+  # 默认源——因此默认值是空字符串，而不是把 mihomo 的默认地址抄一份进来：抄一份
+  # 就等于把上游哪天换地址的责任接过来，而且抄错了没有任何地方会说。
+  : "${GEOSITE_URL:=}"
+  : "${GEOIP_URL:=}"
 }
 
 die() {

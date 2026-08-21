@@ -777,7 +777,7 @@ grep -Fq 'split_preset_fields_are_current()' sb-user-manager.sh
 grep -Fq 'state_normalize_split_preset_fields()' sb-user-manager.sh
 grep -Fq 'migrate_empty_split_preset_fields()' sb-user-manager.sh
 [[ "$(grep -Fc 'migrate_empty_split_preset_fields' sb-user-manager.sh)" == 2 ]]
-grep -Fq 'if ! cmd_split_add "$name" "$source" "$scope" "$user" "$upstream" "$outbound_tag" "$rule_preset" "$outbound_preset" "$behavior" "$rule_url"; then' sb-user-manager.sh
+grep -Fq 'if ! cmd_split_add "$name" "$source" "$scope" "$user" "$upstream" "$outbound_tag" "$rule_preset" "$outbound_preset" "$behavior" "$rule_url" "$rule_geo"; then' sb-user-manager.sh
 grep -Fq '分流没有添加，现有配置没有改变。' sb-user-manager.sh
 grep -Fq 'SHARED_PRESET_RUNTIME_MARKER=' sb-user-manager.sh
 grep -Fq '同一用户不能让同一条预置规则同时使用两个不同出口' sb-user-manager.sh
@@ -951,7 +951,7 @@ managed_operation_finish_count="$(grep -Ec '^[[:space:]]+.*finish_managed_operat
 split_operation_finish_count="$(grep -Ec '^[[:space:]]+.*rebuild_and_finish_split_operation' sb-user-manager.sh || true)"
 # finish_managed_operation 在分流收尾函数内部出现一次；该实现行本身不是新的事务入口。
 managed_operation_finish_coverage=$((managed_operation_finish_count - 1 + split_operation_finish_count))
-if [[ "$managed_operation_start_count" != 26 || "$split_operation_finish_count" != 9 ||
+if [[ "$managed_operation_start_count" != 27 || "$split_operation_finish_count" != 9 ||
       "$managed_operation_finish_coverage" != "$managed_operation_start_count" ]]; then
   echo "managed operations must keep one finish path each: starts=$managed_operation_start_count direct_finishes=$managed_operation_finish_count split_finishes=$split_operation_finish_count coverage=$managed_operation_finish_coverage" >&2
   exit 1
