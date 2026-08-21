@@ -612,7 +612,7 @@ validate_migration_payload_structure() {
         (.rule_behavior == "classical" or .rule_behavior == "domain" or .rule_behavior == "ipcidr") and
         ((.rule_url // "") == "" or (.rule_url | type == "string" and test("^https://") and test("\\.(yaml|yml)$")))) or
        ((.rule_geo | type == "array" and length > 0 and
-         all(.[]; type == "string" and test("^(GEOSITE|GEOIP),[A-Za-z0-9_.:@-]+$")))));
+         all(.[]; type == "string" and test("^(GEOSITE|GEOIP),[A-Za-z0-9_.:@!-]+$")))));
 
     def valid_upstream:
       (type == "object") and

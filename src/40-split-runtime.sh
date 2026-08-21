@@ -418,8 +418,8 @@ mihomo_geox_url_json() {
 # 由保存时那次 `mihomo -t` 当场认。这里只保证它不会把一条规则拼成另一条：
 # 类别名里混进逗号或括号时，mihomo 只会说「规则类型不支持」，看不出是从哪来的。
 validate_geo_category() {
-  [[ "$1" =~ ^(GEOSITE|GEOIP),[A-Za-z0-9_.:@-]+$ ]] ||
-    die "geo 类别只能写成 GEOSITE,<类别> 或 GEOIP,<类别>，类别名里不能有逗号、括号或空格：$1"
+  [[ "$1" =~ ^(GEOSITE|GEOIP),[A-Za-z0-9_.:@!-]+$ ]] ||
+    die "geo 类别只能写成 GEOSITE,<类别> 或 GEOIP,<类别>；类别名只能用字母、数字与 _ . : @ ! -（\`!\` 用于 category-ai-!cn 这类「排除」写法），不能有第二个逗号、括号或空格：$1"
 }
 
 # 状态里的 geo 类别清单（JSON 数组）；不是 geo 来源时是空数组。

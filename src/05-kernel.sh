@@ -775,8 +775,11 @@ kernel_render_split_plan() {
         # 只允许 GEOSITE／GEOIP 加一个不含逗号括号的类别名，多一个逗号
         # （例如 no-resolve 后缀）或任何括号都当场报错，而不是拼出一条
         # mihomo 只会说「规则类型不支持」的规则。
+        # 字符集里的 `!` 是必需的：GeoSite 用 `!cn` 后缀表示「排除中国大陆」，
+        # 例如 category-ai-!cn、geolocation-!cn。实测 1546 个类别名里出现过的
+        # 非字母数字字符只有 `-`（317 次）与 `!`（11 次）。
         def guard_geo($text):
-          if ($text | test("^(GEOSITE|GEOIP),[A-Za-z0-9_.:@-]+$")) then $text
+          if ($text | test("^(GEOSITE|GEOIP),[A-Za-z0-9_.:@!-]+$")) then $text
           else error("geo 类别只能写成 GEOSITE,<类别> 或 GEOIP,<类别>：" + $text) end;
         {
           proxies:[.outbound_groups[].objects[]],
