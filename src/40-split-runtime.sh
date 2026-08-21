@@ -157,6 +157,138 @@ validate_mihomo_rule_set() {
     die "规则文件的内容与所选写法对不上：${mismatch}；选错写法时 mihomo 不会报错，规则会静静地不生效"
 }
 
+# ============================================================
+# 规则集从 sing-box 搬到 mihomo（公开 Issue #203 第三步）
+# ============================================================
+# 两个内核的规则集格式不通用：sing-box 用公网上的 .srs／.json，mihomo 要本机一个
+# 块状 yaml。换内核时这是唯一不能机械照搬的东西，因此单独转一遍。
+#
+# **方向是单向的**：.srs／.json → yaml 能做，反过来做不到。所以迁移的回退靠环境
+# 快照整体恢复，而不是「再转回去」——这也是不提供反向切换入口的原因。
+#
+# 能表达的只有下面五类字段。遇到别的字段**整条流程拒绝**并指出是哪些——静默丢掉
+# 一条规则的后果是那部分流量从「走上游」变成「走直连」，而且没有人会发现。
+SINGBOX_RULE_SET_CONVERTIBLE_KEYS='["domain","domain_keyword","domain_regex","domain_suffix","ip_cidr"]'
+
+# 规则集里 mihomo 表达不了的字段，去重后用顿号连起来；全部可转换时无输出。
+# 顺便挡住逻辑规则（`type`/`rules`）与取反（`invert`）：它们同样落在「不认识的
+# 键」里，不需要单独判断。
+singbox_rule_set_unconvertible_keys() {
+  jq -r --argjson supported "$SINGBOX_RULE_SET_CONVERTIBLE_KEYS" '
+    [.rules[]? | to_entries[] | .key as $key | select(($supported | index($key)) == null) | $key] | unique | join("、")
+  ' "$1"
+}
+
+# 把 sing-box 规则集的 JSON 形态转成 mihomo 的 classical yaml。
+# 成功时写出文件；遇到表达不了的字段或转不出任何规则时**不写文件**并返回 1。
+#
+# 三处写法是实测定下来的（在 mihomo v1.19.30 上逐条试的）：
+#   * IP 段必须带前缀长度，`IP-CIDR,192.0.2.7` 会被拒绝（payloadRule error），
+#     因此裸地址要补 /32 或 /128；
+#   * `IP-CIDR` 对 IPv6 同样有效，不必分出 `IP-CIDR6`；
+#   * `DOMAIN-REGEX` 可用，sing-box 的 domain_regex 因此不必丢弃。
+# 更要紧的是：**mihomo 对认不出的规则行只 warning、不失败**，进程照起、那条规则
+# 静静失效。所以转换完必须自己核对，不能等内核来说。
+singbox_rule_set_json_to_mihomo_yaml() {
+  local input="$1" output="$2" unsupported tmp mismatch
+  unsupported="$(singbox_rule_set_unconvertible_keys "$input")" || return 1
+  if [[ -n "$unsupported" ]]; then
+    printf '规则集里有 mihomo 表达不了的字段：%s\n' "$unsupported" >&2
+    return 1
+  fi
+  tmp="$(mktemp /tmp/sb-rule-convert.XXXXXX)" || return 1
+  register_temp_path "$tmp" || { rm -f -- "$tmp"; return 1; }
+  if ! jq -r '
+    def tolist: if . == null then [] elif type == "array" then . else [.] end;
+    def cidr: if test(":") then (if test("/") then . else . + "/128" end)
+              else (if test("/") then . else . + "/32" end) end;
+    [.rules[]? |
+      ((.domain | tolist)         | map("  - DOMAIN," + .)),
+      ((.domain_suffix | tolist)  | map("  - DOMAIN-SUFFIX," + (. | ltrimstr(".")))),
+      ((.domain_keyword | tolist) | map("  - DOMAIN-KEYWORD," + .)),
+      ((.domain_regex | tolist)   | map("  - DOMAIN-REGEX," + .)),
+      ((.ip_cidr | tolist)        | map("  - IP-CIDR," + (. | cidr)))
+    ] | flatten | ["payload:"] + . | .[]' "$input" > "$tmp"; then
+    rm -f -- "$tmp"
+    unregister_temp_path "$tmp" || true
+    printf '规则集的内容无法解析\n' >&2
+    return 1
+  fi
+  # 一条都没转出来时拒绝：一条规则都没有的分流会静静地变成「全部直连」。
+  if [[ "$(wc -l < "$tmp")" -lt 2 ]]; then
+    rm -f -- "$tmp"
+    unregister_temp_path "$tmp" || true
+    printf '规则集里没有可以转换的规则\n' >&2
+    return 1
+  fi
+  # 用与运行时同一条护栏核对自己的产出：转换器写错了要在这里就红，
+  # 而不是等到那台机器上线之后规则静静地不生效。
+  mismatch="$(mihomo_rule_file_mismatch "$tmp" classical)" || {
+    rm -f -- "$tmp"
+    unregister_temp_path "$tmp" || true
+    return 1
+  }
+  if [[ -n "$mismatch" ]]; then
+    rm -f -- "$tmp"
+    unregister_temp_path "$tmp" || true
+    printf '转换出来的规则文件自检没通过：%s\n' "$mismatch" >&2
+    return 1
+  fi
+  install -m 644 "$tmp" "$output" || {
+    rm -f -- "$tmp"
+    unregister_temp_path "$tmp" || true
+    return 1
+  }
+  rm -f -- "$tmp"
+  unregister_temp_path "$tmp" || true
+}
+
+# 下载一个 sing-box 规则集来源并解出它的 JSON 形态。
+# `.srs` 用**本机现有的 sing-box** 反编译——换内核那一刻它还在，这是这条路成立的
+# 前提；`.json` 直接用。下载沿用与「检查规则集」相同的加固：只允许 HTTPS、
+# 不跟随跳转、地址必须解析到公网。
+fetch_singbox_rule_set_json() {
+  local url="$1" output="$2" format downloaded rc=0
+  format="$(split_rule_format "$url")" || { printf '规则集地址格式不受支持：%s\n' "$url" >&2; return 1; }
+  validate_public_rule_set_url "$url" || {
+    printf '规则集地址必须使用 HTTPS，且不能指向本机或内网地址：%s\n' "$url" >&2
+    return 1
+  }
+  downloaded="$(mktemp /tmp/sb-rule-source.XXXXXX)" || return 1
+  register_temp_path "$downloaded" || { rm -f -- "$downloaded"; return 1; }
+  if ! curl --proto '=https' --proto-redir '=https' --fail --max-redirs 0 \
+    --silent --show-error --connect-timeout 10 --max-time 30 --output "$downloaded" "$url"; then
+    printf '无法下载规则集：%s\n' "$url" >&2
+    rc=1
+  elif [[ "$format" == source ]]; then
+    cat "$downloaded" > "$output" || rc=1
+  else
+    kernel_rule_set_decompile "$SINGBOX_BIN" "$downloaded" "$output" || {
+      printf '无法用本机的 sing-box 解出规则集内容：%s\n' "$url" >&2
+      rc=1
+    }
+  fi
+  if ((rc == 0)) && ! jq -e 'type == "object" and (.rules | type == "array")' "$output" >/dev/null 2>&1; then
+    printf '规则集内容不是预期的结构：%s\n' "$url" >&2
+    rc=1
+  fi
+  rm -f -- "$downloaded"
+  unregister_temp_path "$downloaded" || true
+  return "$rc"
+}
+
+# 一个规则集来源在迁移之后叫什么文件名。
+# 取地址里的文件名做前缀是为了让使用者事后还认得出它是哪来的；后面缀上地址的
+# 摘要，保证两个不同来源永远不会撞到同一个文件名。
+migrated_rule_file_name() {
+  local url="$1" base digest
+  base="$(printf '%s' "${url##*/}" | sed 's/[?#].*$//; s/\.[Ss][Rr][Ss]$//; s/\.[Jj][Ss][Oo][Nn]$//')"
+  base="$(printf '%s' "$base" | tr -c 'A-Za-z0-9._-' '-' | sed 's/^[^A-Za-z0-9]*//' | cut -c1-40)"
+  [[ -n "$base" ]] || base=rule
+  digest="$(printf '%s' "$url" | sha256sum | cut -c1-8)"
+  printf '%s-%s.yaml' "$base" "$digest"
+}
+
 # 来源写法的校验。与「这个来源可不可用」分开：这一条只看写法，
 # 界面上输入即时反馈用得到，不需要下载或读文件。
 validate_split_rule_source_format() {
