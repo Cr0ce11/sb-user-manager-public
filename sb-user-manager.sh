@@ -10975,14 +10975,30 @@ apply_test_only_kernel_selection() {
 # load_runtime_config 发生在子进程里，父进程拿不到结果，而写单元文件、
 # 校验配置、挑选下载资产都发生在父进程。真机上验到的后果是——
 # 一台 mihomo 机器执行「自动修复缺失内容」会去下载并部署 sing-box。
+# 机器上还有没有 sing-box 的部署痕迹。只在管理配置缺失时用来判断这台机器原本是
+# 什么：判据取 sing-box 的三样核心文件，其中任何一样还在就算数。
+singbox_deployment_present() {
+  local path
+  for path in /usr/local/bin/sing-box /etc/sing-box/config.json /etc/systemd/system/sing-box.service; do
+    [[ ! -e "$(system_path "$path")" ]] || return 0
+  done
+  return 1
+}
+
 resolve_deployment_kernel() {
   if [[ -r "$CONF_FILE" ]]; then
     load_runtime_config
     return 0
   fi
-  # 尚未部署的机器：全新安装只装 mihomo（第二步 2f，公开 Issue #157），不给选择。
-  # 已部署的机器一律以管理配置为准——内核与目录名都不会因为升级而改变。
-  PROXY_KERNEL=mihomo
+  # 没有管理配置时先看机器上已经有什么。**管理配置丢了的 sing-box 机器要能被修回
+  # 去**，而不是被当成新机器换成另一个内核——「安装或修复环境」的修复分支走的正是
+  # 这条路。真正干净的机器才按 2f 的规则装 mihomo（公开 Issue #157），不给选择。
+  # 已部署且配置还在的机器一律以管理配置为准，内核与目录名都不会因为升级而改变。
+  if singbox_deployment_present; then
+    PROXY_KERNEL=singbox
+  else
+    PROXY_KERNEL=mihomo
+  fi
   apply_test_only_kernel_selection || return 1
   # 中立数据目录只给新装的 mihomo 机器。用逃生口装 sing-box 时保持老目录，
   # 那条路本来就是为了「装出一台与存量机器一样的机器」。
