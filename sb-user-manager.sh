@@ -15162,10 +15162,20 @@ show_geo_source_settings() {
   printf 'GeoIP 数据源：%s\n' "${GEOIP_URL:-默认（mihomo 自带）}"
   printf '\n用到 GeoSite／GeoIP 类别的分流：%s 条\n' "$geo_splits"
   if ((geo_splits == 0)); then
-    echo '这台机器目前不下载任何 geo 数据库；添加第一条 geo 分流时才会下载。'
+    printf '这两个地址现在还用不上：没有 geo 分流时 %s 里不会有 GeoSite.dat 或 GeoIP.dat。\n' \
+      "$MIHOMO_WORK_DIR"
+    echo '添加第一条 geo 分流时才会按这里的设置去下载。'
   else
     printf '数据库放在 %s，由 mihomo 每 %s 小时自己检查更新。\n' \
       "$MIHOMO_WORK_DIR" "$GEO_UPDATE_INTERVAL_HOURS"
+  fi
+  # 工作目录里还会有一个 ASN.mmdb，它与这两个地址无关：实测确认，只要配置里有
+  # 任何一条规则集条目（本机文件或网址都一样），mihomo 启动时就会自己去下它。
+  # 这不是本项目加进来的行为，在这里说一句是为了让人看到那个文件时不必猜。
+  if [[ -f "$MIHOMO_WORK_DIR/ASN.mmdb" ]]; then
+    echo
+    echo '工作目录里的 ASN.mmdb 由 mihomo 自己下载与维护，与这里的设置无关；'
+    echo '只要有规则集分流它就会存在，删掉也会被重新下载。'
   fi
 }
 
