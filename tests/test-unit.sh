@@ -6951,6 +6951,32 @@ load_migration_reports
 [[ "$(basename "${MIGRATION_REPORTS[0]}")" == migration-restore-20000101.json ]]
 unset MIGRATION_BACKUP_DIR MIGRATION_REPORT_DIR
 
+# 不可逆操作之前的退路提示（ADR 0032）。两个分支都要验：只验「没有备份时会警告」
+# 分不清是护栏真的在看，还是这个函数无论如何都在喊同一句话。
+(
+  MIGRATION_BACKUP_DIR="$work/offsite-none"
+  mkdir -p "$MIGRATION_BACKUP_DIR"
+  none_notice="$(print_offsite_recovery_status)"
+  [[ "$none_notice" == *'没有任何加密迁移备份'* ]]
+  [[ "$none_notice" == *'没有事后手工恢复它的入口'* ]]
+
+  MIGRATION_BACKUP_DIR="$work/offsite-some"
+  mkdir -p "$MIGRATION_BACKUP_DIR"
+  printf '{}\n' > "$MIGRATION_BACKUP_DIR/sb-user-data-4.0.0-20000101-000000.sbm"
+  printf '{}\n' > "$MIGRATION_BACKUP_DIR/sb-user-data-4.0.0-20990101-000000.sbm"
+  python3 - "$MIGRATION_BACKUP_DIR" <<'PY_UTIME'
+import os, sys
+directory = sys.argv[1]
+os.utime(os.path.join(directory, "sb-user-data-4.0.0-20000101-000000.sbm"), (100, 100))
+os.utime(os.path.join(directory, "sb-user-data-4.0.0-20990101-000000.sbm"), (200, 200))
+PY_UTIME
+  some_notice="$(print_offsite_recovery_status)"
+  [[ "$some_notice" == *'2 份'* ]]
+  # 最新一份按 mtime 取，不是按文件名——名字里的日期可以与实际新旧相反。
+  [[ "$some_notice" == *'sb-user-data-4.0.0-20990101-000000.sbm'* ]]
+  [[ "$some_notice" != *'没有任何加密迁移备份'* ]]
+)
+
 # 状态恢复使用同目录临时文件和原子替换。
 atomic_restore_dir="$work/atomic-state-restore"
 mkdir -p "$atomic_restore_dir"

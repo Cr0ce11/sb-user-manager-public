@@ -1015,6 +1015,23 @@ if [[ "$clear_rollback_count" != 13 ]]; then
   exit 1
 fi
 grep -Fq 'set_signal_rollback rollback_manager_handoff' sb-user-manager.sh
+# 换内核与清理 sing-box 残留这两处确认提示，必须当场清点服务器外的退路。
+# 操作前的完整环境快照只服务于自动回滚，菜单里没有手工恢复的入口（ADR 0032），
+# 因此这两处的退路只能是 .sbm 加密迁移备份。一处定义加两处调用。
+offsite_notice_count="$(grep -Fc 'print_offsite_recovery_status' sb-user-manager.sh || true)"
+if [[ "$offsite_notice_count" != 3 ]]; then
+  echo "expected 1 definition and 2 call sites of print_offsite_recovery_status, found $offsite_notice_count" >&2
+  exit 1
+fi
+# 这两句旧文案承诺了一条并不存在的路，不得复活。
+if grep -Fq '真出问题时的退路是从切换前的完整环境快照整体恢复' sb-user-manager.sh; then
+  echo 'kernel switch prompt must not promise recovery from the environment snapshot (ADR 0032)' >&2
+  exit 1
+fi
+if grep -Fq '换内核的退路本来就是从切换前的环境快照恢复' sb-user-manager.sh; then
+  echo 'leftover cleanup prompt must not promise recovery from the environment snapshot (ADR 0032)' >&2
+  exit 1
+fi
 grep -Fq 'MIGRATION_FORMAT_VERSION=1' sb-user-manager.sh
 grep -Fq 'MIGRATION_BUNDLE_VERSION=1' sb-user-manager.sh
 if perl -ne '$found=1 if /\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]/; END { exit($found ? 0 : 1) }' sb-user-manager.sh; then

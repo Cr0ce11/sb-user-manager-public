@@ -291,6 +291,26 @@ load_migration_backups() {
   )
 }
 
+# 不可逆操作之前，把「事后反悔时的退路」摆到眼前。操作前的完整环境快照只服务于
+# 自动回滚，菜单里没有手工恢复的入口（ADR 0032），因此事后唯一的退路是服务器外的
+# `.sbm` 加密迁移备份。这条不能只写在文档里：真需要它的那一刻，人已经站在确认提示
+# 前面了。这里只清点和提醒，不阻止操作——服务器外可能有仓库不知道的副本。
+print_offsite_recovery_status() {
+  local newest
+  load_migration_backups
+  if ((${#MIGRATION_BACKUPS[@]} == 0)); then
+    printf '\n注意：本机没有任何加密迁移备份（.sbm）。\n'
+    printf '这个操作成功之后如果反悔，将没有退路：操作前的完整环境快照只在本次操作失败时\n'
+    printf '由脚本自动还原，菜单里没有事后手工恢复它的入口。\n'
+    printf '建议先返回「数据备份与恢复」创建一份，并复制到服务器之外。\n'
+    return 0
+  fi
+  newest="${MIGRATION_BACKUPS[0]}"
+  printf '\n本机现有加密迁移备份（.sbm）%s 份，最新一份是 %s。\n' \
+    "${#MIGRATION_BACKUPS[@]}" "$(basename "$newest")"
+  printf '事后反悔时的退路就是它——请确认它已经复制到服务器之外，并且内容足够新。\n'
+}
+
 print_migration_backups() {
   local i file size integrity
   load_migration_backups
