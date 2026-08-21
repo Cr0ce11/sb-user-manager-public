@@ -9530,4 +9530,131 @@ Protocol version: TLSv1.2'
   fi
 )
 
+# ============================================================
+# 规则集从 sing-box 转到 mihomo（公开 Issue #203）
+# ============================================================
+# 这一组盯三件事：五类字段转得对、表达不了的字段一定拒绝、拒绝时不留半个文件。
+# 「转得对」里有三条是真机实测定下来的写法（IP 段必须带前缀长度、IP-CIDR 对
+# IPv6 同样有效、DOMAIN-REGEX 可用），改坏了这里会红。
+(
+  conv="$work/rule-convert"
+  mkdir -p "$conv"
+  MIHOMO_RULES_DIR="$conv/rules"
+  mkdir -p "$MIHOMO_RULES_DIR"
+
+  cat > "$conv/full.json" <<'JSON'
+{"version":1,"rules":[
+  {"domain":["a.example.com"],
+   "domain_suffix":[".b.example.com","c.example.com"],
+   "domain_keyword":"kw",
+   "domain_regex":"^x.*\\.example\\.com$",
+   "ip_cidr":["192.0.2.0/24","198.51.100.7","2001:db8::/32","2001:db8::1"]}
+]}
+JSON
+  singbox_rule_set_json_to_mihomo_yaml "$conv/full.json" "$conv/full.yaml" || {
+    echo '五类字段齐备的规则集必须转得出来' >&2
+    exit 1
+  }
+  cat > "$conv/full.expected" <<'YAML'
+payload:
+  - DOMAIN,a.example.com
+  - DOMAIN-SUFFIX,b.example.com
+  - DOMAIN-SUFFIX,c.example.com
+  - DOMAIN-KEYWORD,kw
+  - DOMAIN-REGEX,^x.*\.example\.com$
+  - IP-CIDR,192.0.2.0/24
+  - IP-CIDR,198.51.100.7/32
+  - IP-CIDR,2001:db8::/32
+  - IP-CIDR,2001:db8::1/128
+YAML
+  if ! diff -u "$conv/full.expected" "$conv/full.yaml"; then
+    echo '转换结果与期望不符' >&2
+    exit 1
+  fi
+  # 产物必须通过运行时那条护栏（转换器写错了要在这里红，不是等机器上线之后）
+  if [[ -n "$(mihomo_rule_file_mismatch "$conv/full.yaml" classical)" ]]; then
+    echo '转换产物没通过 classical 写法自检' >&2
+    exit 1
+  fi
+
+  # 表达不了的字段：逐个确认都会被拒绝，并且拒绝时不写出文件。
+  reject_case() {
+    local label="$1" json="$2" expect_key="$3"
+    printf '%s\n' "$json" > "$conv/bad.json"
+    rm -f "$conv/bad.yaml"
+    if singbox_rule_set_json_to_mihomo_yaml "$conv/bad.json" "$conv/bad.yaml" 2>"$conv/bad.err"; then
+      printf '含 %s 的规则集必须被拒绝\n' "$label" >&2
+      exit 1
+    fi
+    if [[ -n "$expect_key" ]] && ! grep -Fq "$expect_key" "$conv/bad.err"; then
+      printf '拒绝 %s 时要说出是哪个字段，实际输出：%s\n' "$label" "$(cat "$conv/bad.err")" >&2
+      exit 1
+    fi
+    if [[ -e "$conv/bad.yaml" ]]; then
+      printf '拒绝 %s 时不得写出文件\n' "$label" >&2
+      exit 1
+    fi
+  }
+  reject_case '端口' '{"version":1,"rules":[{"domain":["a.com"],"port":[443]}]}' port
+  reject_case '进程名' '{"version":1,"rules":[{"domain":["a.com"],"process_name":["curl"]}]}' process_name
+  reject_case '网络类型' '{"version":1,"rules":[{"domain":["a.com"],"network":["udp"]}]}' network
+  reject_case '来源地址' '{"version":1,"rules":[{"domain":["a.com"],"source_ip_cidr":["10.0.0.0/8"]}]}' source_ip_cidr
+  reject_case '取反' '{"version":1,"rules":[{"domain":["a.com"],"invert":true}]}' invert
+  reject_case '逻辑规则' '{"version":1,"rules":[{"type":"logical","mode":"and","rules":[{"domain":["a.com"]}]}]}' type
+  # 字段名必须**精确**匹配：jq 的 inside/contains 是子串语义，用它的话
+  # 一个叫 ip 的字段会被误当成 ip_cidr 的一部分放过去。
+  reject_case '子串型字段名' '{"version":1,"rules":[{"domain":["a.com"],"ip":["192.0.2.1"]}]}' ip
+  # 这两条要盯住**是哪条守卫**拒绝的：转换器自己那句「没有可以转换的规则」比
+  # 产物自检那句「payload 下面一条规则都没有」说得清楚，去掉它两条都还会被拒绝，
+  # 只断言「被拒绝」的话就分不出来。
+  reject_case '空规则集' '{"version":1,"rules":[]}' '没有可以转换的规则'
+  reject_case '一条规则都转不出来' '{"version":1,"rules":[{"domain":[]}]}' '没有可以转换的规则'
+
+  # 文件名：同一地址稳定、不同地址不撞、且一定是合法的规则文件名。
+  name_a="$(migrated_rule_file_name https://example.com/rule-set/geosite-openai.srs)"
+  name_a2="$(migrated_rule_file_name https://example.com/rule-set/geosite-openai.srs)"
+  name_b="$(migrated_rule_file_name https://example.com/other/geosite-openai.srs)"
+  name_c="$(migrated_rule_file_name 'https://example.com/a/b/../weird name!.json?x=1')"
+  [[ "$name_a" == "$name_a2" ]] || { echo '同一个地址应当算出同一个文件名' >&2; exit 1; }
+  [[ "$name_a" != "$name_b" ]] || { echo '不同地址不得算出同一个文件名' >&2; exit 1; }
+  [[ "$name_a" == geosite-openai-*.yaml ]] || { printf '文件名应当保留来源的可读部分：%s\n' "$name_a" >&2; exit 1; }
+  for candidate in "$name_a" "$name_b" "$name_c"; do
+    ( validate_mihomo_rule_file_name "$candidate" ) || {
+      printf '算出来的文件名必须是合法的规则文件名：%s\n' "$candidate" >&2
+      exit 1
+    }
+  done
+
+  # 取来源：.json 直接用，.srs 走本机 sing-box 反编译，非 HTTPS 与结构不对都要拒绝。
+  validate_public_rule_set_url() { [[ "$1" == https://* ]]; }
+  curl() {
+    local target=""
+    while (($#)); do
+      [[ "${1:-}" != --output ]] || { target="$2"; shift; }
+      shift
+    done
+    printf '%s\n' "$fetch_payload" > "$target"
+  }
+  kernel_rule_set_decompile() {
+    printf '%s\n' "$decompiled_payload" > "$3"
+  }
+  fetch_payload='{"version":1,"rules":[{"domain":["json.example.com"]}]}'
+  decompiled_payload='{"version":1,"rules":[{"domain":["srs.example.com"]}]}'
+  fetch_singbox_rule_set_json https://example.com/x.json "$conv/fetched.json" || {
+    echo '.json 来源应当直接可用' >&2; exit 1
+  }
+  grep -Fq json.example.com "$conv/fetched.json" || { echo '.json 来源的内容不对' >&2; exit 1; }
+  fetch_singbox_rule_set_json https://example.com/x.srs "$conv/fetched-srs.json" || {
+    echo '.srs 来源应当经反编译得到' >&2; exit 1
+  }
+  grep -Fq srs.example.com "$conv/fetched-srs.json" || { echo '.srs 来源的内容不对' >&2; exit 1; }
+  if fetch_singbox_rule_set_json http://example.com/x.json "$conv/nope.json" 2>/dev/null; then
+    echo '非 HTTPS 的来源必须被拒绝' >&2; exit 1
+  fi
+  fetch_payload='not-json-at-all'
+  if fetch_singbox_rule_set_json https://example.com/x.json "$conv/nope2.json" 2>/dev/null; then
+    echo '结构不对的规则集必须被拒绝' >&2; exit 1
+  fi
+)
+
 echo 'unit checks passed'
