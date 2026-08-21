@@ -2663,126 +2663,6 @@ cleanup_singbox_leftovers() {
   log "sing-box 的残留已清理；清理前的完整环境快照在 $backup"
 }
 
-takeover_existing_environment() {
-  local iface work normalized tmp nfuse_compatible=false path existing_singbox_bin
-  local -a takeover_created=()
-  if ! acquire_operation_lock; then
-    log "错误：$OPERATION_LOCK_ERROR"
-    return 1
-  fi
-  ensure_safe_ssh_for_kernel_restart || { release_operation_lock; return 0; }
-  validate_manager_shortcut_path || {
-    release_operation_lock
-    die "检测到 /usr/local/bin/sbm 已被其他文件或链接占用；为避免覆盖现有程序，本次操作已停止"
-  }
-  # 接管既有安装按定义只针对既有的 sing-box 部署：它要读的就是现场那份
-  # sing-box 配置。选了别的内核还走这条路会得到一台内核与配置对不上的机器。
-  [[ "$PROXY_KERNEL" == singbox ]] || {
-    release_operation_lock
-    die "接管既有安装目前只支持 sing-box 部署"
-  }
-  existing_singbox_bin="$(command -v sing-box 2>/dev/null || true)"
-  [[ -f /etc/sing-box/config.json && -n "$existing_singbox_bin" && -x "$existing_singbox_bin" ]] || {
-    release_operation_lock
-    die "保留配置接管要求现有 sing-box 配置和 PATH 中可执行的 sing-box 均存在"
-  }
-  kernel_check_config_with "$existing_singbox_bin" /etc/sing-box/config.json || {
-    release_operation_lock
-    die "现有 sing-box 配置校验失败，拒绝接管"
-  }
-  if [[ -f /etc/systemd/system/nfuse.service ]]; then
-    if grep -Fq -- '--db /var/lib/nfuse/nfuse.db' /etc/systemd/system/nfuse.service &&
-       grep -Fq -- '--socket /run/nfuse.sock' /etc/systemd/system/nfuse.service; then nfuse_compatible=true
-    else
-      release_operation_lock
-      die "现有流量统计服务使用了特殊存储或通信位置，脚本无法安全接管；请选择备份后重新安装"
-    fi
-  fi
-  iface="$(default_network_interface)" || { release_operation_lock; die "无法识别默认网络接口"; }
-  [[ -n "$iface" ]] || { release_operation_lock; die "无法识别默认网络接口"; }
-  create_environment_backup || { release_operation_lock; return 1; }
-  for path in \
-    /etc/sb-user-manager.conf \
-    "$MANAGER_DATA_DIR/managed-users.json" \
-    /usr/local/sbin/sb-user-manager \
-    /usr/local/bin/sbm \
-    /etc/systemd/system/sing-box.service \
-    /etc/systemd/system/nfuse.service \
-    /etc/systemd/system/sb-user-expiry.service \
-    /etc/systemd/system/sb-user-expiry.timer \
-    /var/lib/sb-user-manager/versions \
-    "$ANYTLS_CERT_FILE" \
-    "$ANYTLS_KEY_FILE"; do
-    [[ -e "$path" || -L "$path" ]] || takeover_created+=("$path")
-  done
-  work="$(mktemp -d /tmp/sb-user-manager.takeover.XXXXXX)" || { release_operation_lock; return 1; }
-  register_temp_path "$work" || { rm -rf -- "$work"; release_operation_lock; return 1; }
-  rollback_takeover() {
-    local rc="${1:-$?}"
-    trap - ERR
-    clear_signal_rollback
-    for path in "${takeover_created[@]}"; do rm -f -- "$path" || true; done
-    restore_failed_environment_change 接管 "$ENV_BACKUP" "$work"
-    release_operation_lock
-    return "$rc"
-  }
-  if ! begin_environment_transaction "takeover-environment" "$ENV_BACKUP" "${takeover_created[@]}"; then
-    rm -rf -- "$work"
-    release_operation_lock
-    return 1
-  fi
-  trap rollback_takeover ERR
-  set_signal_rollback rollback_takeover
-  run_step_or_rollback rollback_takeover fetch_latest_releases false || return 1
-  run_step_or_rollback rollback_takeover download_binaries "$work" || return 1
-  if normalized="$(mktemp /etc/sing-box/.takeover-normalized.XXXXXX)"; then :; else
-    rollback_takeover 1 || true
-    return 1
-  fi
-  run_step_or_rollback rollback_takeover register_temp_path "$normalized" || return 1
-  if tmp="$(mktemp /etc/sing-box/.takeover-config.XXXXXX)"; then :; else
-    rm -f -- "$normalized"
-    rollback_takeover 1 || true
-    return 1
-  fi
-  run_step_or_rollback rollback_takeover register_temp_path "$tmp" || return 1
-  run_step_or_rollback rollback_takeover write_command_output "$normalized" \
-    kernel_normalized_default_install || return 1
-  # 与全新安装共用同一份骨架定义，避免接管出来的部署与全新安装不一致。
-  run_step_or_rollback rollback_takeover write_command_output "$tmp" \
-    jq "$SINGBOX_SKELETON_ENSURE_PROGRAM" "$normalized" || return 1
-  run_step_or_rollback rollback_takeover rm -f -- "$normalized" || return 1
-  if chmod --reference=/etc/sing-box/config.json "$tmp" 2>/dev/null || chmod 600 "$tmp"; then :; else
-    rollback_takeover 1 || true
-    return 1
-  fi
-  chown --reference=/etc/sing-box/config.json "$tmp" 2>/dev/null || true
-  run_step_or_rollback rollback_takeover mv "$tmp" /etc/sing-box/config.json || return 1
-  run_step_or_rollback rollback_takeover kernel_check_default_install || return 1
-
-  if [[ ! -f "$CONF_FILE" ]]; then run_step_or_rollback rollback_takeover write_manager_config || return 1; fi
-  run_step_or_rollback rollback_takeover load_runtime_config || return 1
-  run_step_or_rollback rollback_takeover init_state || return 1
-  run_step_or_rollback rollback_takeover install_manager_binary "$work" false || return 1
-  run_step_or_rollback rollback_takeover install_manager_shortcut || return 1
-  run_step_or_rollback rollback_takeover install -d -m 700 \
-    /var/lib/nfuse /var/lib/sb-user-manager "$MANAGER_DATA_DIR/backups" "$CERT_DIR" || return 1
-  run_step_or_rollback rollback_takeover ensure_anytls_certificate || return 1
-  if [[ ! -f /etc/systemd/system/sing-box.service ]]; then
-    run_step_or_rollback rollback_takeover write_singbox_unit || return 1
-  fi
-  if [[ "$nfuse_compatible" != true ]]; then
-    run_step_or_rollback rollback_takeover write_nfuse_unit "$iface" || return 1
-  fi
-  run_step_or_rollback rollback_takeover write_expiry_units || return 1
-  run_step_or_rollback rollback_takeover write_deployed_versions "$SCRIPT_VERSION" || return 1
-  run_step_or_rollback rollback_takeover activate_managed_services || return 1
-  run_step_or_rollback rollback_takeover complete_environment_change "$work" || return 1
-  release_operation_lock
-  log "现有环境已在保留 sing-box 配置的前提下接管；原环境备份：$ENV_BACKUP"
-  log "原有节点和路由会继续保留，但不会自动出现在本脚本的用户或分流列表中"
-}
-
 # 仅供测试使用的内核选择。菜单里没有这个入口：内核选择要等第二步 2f，
 # 而 2f 必须排在 2e 的审计护栏之后——把一台无法自检的机器交出去是不行的。
 # 只对尚未部署的机器生效：已部署机器的内核由管理配置决定，部署后不允许更改，
@@ -2893,32 +2773,20 @@ EOF
       esac
       ;;
     external)
+      # 接管既有 sing-box 安装已经撤除（第二步 2f，公开 Issue #157）：本项目的全新
+      # 安装只装 mihomo，不再把别人手工装的 sing-box 收编进来。
+      # 覆盖重装那一条也一并撤掉——它现在意味着「在一套还活着的 sing-box 旁边再装
+      # 一个 mihomo」，两套东西会抢同一批端口，装出来的机器不一定能用。
+      # 因此这里明确走到头，并说清楚下一步该干什么，而不是给一个半通不通的选项。
       cat <<'EOF'
 
-检测到这台服务器已有其他方式安装的 sing-box。脚本默认不会覆盖现有配置。
-处理方式：
-  1. 保留现有配置并加入本脚本管理（推荐）
-  2. 备份后重新安装（会覆盖现有配置）
-  0. 返回上一级
+检测到这台服务器上已经有其他方式安装的 sing-box。
+
+本项目不会接管它，也不会在它旁边再装一个内核——两套代理会抢同一批端口。
+如果要在这台服务器上使用本项目，请先自行停用并清理那套 sing-box，再回到这里安装。
+清理时请自己确认那套配置里有没有还在用的节点。
 EOF
-      read_menu_choice '请选择：' '0,1,2' '' '请输入 1、2 或 0' || return 1
-      choice="$PROMPT_VALUE"
-      case "$choice" in
-        1)
-          read -r -p '将保留现有节点，并安装用户管理和流量统计功能。确认继续？[y/N]：' answer
-          [[ "$answer" =~ ^[Yy]$ ]] || return 0
-          install_prerequisites || return 1
-          takeover_existing_environment
-          ;;
-        2)
-          read -r -p '现有节点配置将被覆盖，确认重新安装？[y/N]：' answer
-          [[ "$answer" =~ ^[Yy]$ ]] || return 0
-          install_prerequisites || return 1
-          fetch_latest_releases false || return 1
-          deploy_environment true
-          ;;
-        0) return 0;;
-      esac
+      return 0
       ;;
   esac
 }

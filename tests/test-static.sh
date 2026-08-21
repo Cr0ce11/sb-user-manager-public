@@ -873,7 +873,6 @@ grep -Fq 'ensure_manager_shortcut_for_interactive_startup()' sb-user-manager.sh
 grep -Fq "target='/usr/local/sbin/sb-user-manager'" sb-user-manager.sh
 grep -Fq 'shortcut="$(system_path /usr/local/bin/sbm)"' sb-user-manager.sh
 grep -Fq 'run_step_or_rollback rollback_deploy install_manager_shortcut' sb-user-manager.sh
-grep -Fq 'run_step_or_rollback rollback_takeover install_manager_shortcut' sb-user-manager.sh
 grep -Fq '/usr/local/bin/sbm|/usr/local/bin/sing-box' sb-user-manager.sh
 [[ "$(grep -Fc 'ensure_manager_shortcut_for_interactive_startup' sb-user-manager.sh)" == 2 ]]
 grep -Fq 'write_deployed_versions()' sb-user-manager.sh
@@ -883,17 +882,19 @@ grep -Fq 'complete_environment_change()' sb-user-manager.sh
 # 这几个助手必须被复用而不是各写一份。调用点数量钉死，多出来一处通常意味着
 # 有人又抄了一遍实现；改动调用点时同步改这里的期望值，并想清楚新增的那一处
 # 为什么必须存在。
-# default_network_interface 的五处：全新部署、接管既有安装、服务单元漂移的检查与
-# 修复（公开 Issue #190），以及换内核（公开 Issue #203）——后三处必须现场识别接口，
-# 不能读旧单元里的那个，那正是可能不对的东西。
-# activate_managed_services 的四处：部署、接管、重写单元之后的重新激活（不
-# daemon-reload 就等于「修了但没生效」），以及换内核之后启用新内核的服务。
-# restore_failed_environment_change 与 complete_environment_change 的五处：部署、
-# 接管、卸载，加上换内核与清理 sing-box 残留——这两条也是改环境的动作，
-# 必须与前三条走同一套事务与回滚，而不是各写一份。
-for shared_helper in default_network_interface:5 ensure_anytls_certificate:2 install_manager_binary:2 \
-  write_deployed_versions:2 activate_managed_services:4 restore_failed_environment_change:5 \
-  complete_environment_change:5; do
+# 这些数字在 2f 撤除「接管既有 sing-box 安装」之后整体降了一档：那条流程曾经是
+# 其中每一个的第二个调用点（公开 Issue #157）。
+# default_network_interface 的四处：全新部署、服务单元漂移的检查与修复（公开
+# Issue #190），以及换内核（公开 Issue #203）——后三处必须现场识别接口，不能读旧
+# 单元里的那个，那正是可能不对的东西。
+# activate_managed_services 的三处：部署、重写单元之后的重新激活（不 daemon-reload
+# 就等于「修了但没生效」），以及换内核之后启用新内核的服务。
+# restore_failed_environment_change 与 complete_environment_change 的四处：部署、
+# 卸载、换内核、清理 sing-box 残留——四条都是改环境的动作，必须走同一套事务与回滚。
+# 后面三个降到 1 之后这条断言只剩「别再抄一份实现」这一层意思，仍然值得留着。
+for shared_helper in default_network_interface:4 ensure_anytls_certificate:1 install_manager_binary:1 \
+  write_deployed_versions:1 activate_managed_services:3 restore_failed_environment_change:4 \
+  complete_environment_change:4; do
   expected_calls="${shared_helper##*:}"
   shared_helper="${shared_helper%%:*}"
   shared_helper_calls="$(awk -v helper="$shared_helper" 'index($0, helper) && !index($0, helper "()") {count++} END {print count+0}' sb-user-manager.sh)"
@@ -912,9 +913,9 @@ grep -Fq 'run_managed_step()' sb-user-manager.sh
 grep -Fq 'begin_environment_transaction()' sb-user-manager.sh
 grep -Fq 'recover_environment_transaction()' sb-user-manager.sh
 grep -Fq 'acquire_operation_lock()' sb-user-manager.sh
-# 取锁的六处：部署、接管、卸载、迁移恢复，加上换内核与清理 sing-box 残留
-# （公开 Issue #203）——后两条同样是改环境的动作，不取锁就会与别的写入撞车。
-[[ "$(grep -Fc 'if ! acquire_operation_lock; then' sb-user-manager.sh)" == 6 ]]
+# 取锁的五处：部署、卸载、迁移恢复，加上换内核与清理 sing-box 残留（公开 Issue
+# #203）——都是改环境的动作，不取锁就会与别的写入撞车。接管既有安装曾经是第六处。
+[[ "$(grep -Fc 'if ! acquire_operation_lock; then' sb-user-manager.sh)" == 5 ]]
 for serialized_recovery in recover_environment_transaction acquire_manager_handoff_lock; do
   if ! awk -v function_name="$serialized_recovery" '
       $0 == function_name "() {" {inside=1}
@@ -960,10 +961,17 @@ if ((managed_step_count < 50)); then
   echo "expected managed operations to use the shared step runner, found $managed_step_count calls" >&2
   exit 1
 fi
+# 改环境的三条流程都必须把会失败的步骤显式包进事务：部署、换内核、清理 sing-box
+# 残留。接管既有安装曾经是第四条，2f 之后已整段删掉（公开 Issue #157）。
 deploy_step_count="$(grep -Ec '^[[:space:]]+run_step_or_rollback rollback_deploy ' sb-user-manager.sh || true)"
-takeover_step_count="$(grep -Ec '^[[:space:]]+run_step_or_rollback rollback_takeover ' sb-user-manager.sh || true)"
-if ((deploy_step_count < 10 || takeover_step_count < 15)); then
-  echo "environment flows must explicitly wrap failure-prone steps: deploy=$deploy_step_count takeover=$takeover_step_count" >&2
+switch_step_count="$(grep -Ec '^[[:space:]]+run_step_or_rollback rollback_switch ' sb-user-manager.sh || true)"
+cleanup_step_count="$(grep -Ec '^[[:space:]]+run_step_or_rollback rollback_cleanup ' sb-user-manager.sh || true)"
+if ((deploy_step_count < 10 || switch_step_count < 10 || cleanup_step_count < 2)); then
+  echo "environment flows must explicitly wrap failure-prone steps: deploy=$deploy_step_count switch=$switch_step_count cleanup=$cleanup_step_count" >&2
+  exit 1
+fi
+if grep -Fq 'rollback_takeover' sb-user-manager.sh; then
+  echo 'takeover flow should be gone; no rollback_takeover steps must remain' >&2
   exit 1
 fi
 if grep -Fq 'repair_consistency_step' sb-user-manager.sh; then
@@ -995,15 +1003,15 @@ grep -Fq "trap 'handle_runtime_signal INT 130' INT" sb-user-manager.sh
 grep -Fq "trap 'handle_runtime_signal TERM 143' TERM" sb-user-manager.sh
 signal_rollback_count="$(grep -Ec '^[[:space:]]+set_signal_rollback rollback_' sb-user-manager.sh || true)"
 clear_rollback_count="$(grep -Ec '^[[:space:]]+clear_signal_rollback$' sb-user-manager.sh || true)"
-# 九处登记：部署、接管、卸载、迁移恢复、用户与分流的写入路径，加上换内核与
-# 清理 sing-box 残留（公开 Issue #203）。收到 INT/TERM 时没登记回滚的那条路，
-# 会把机器停在改了一半的状态上。
-if [[ "$signal_rollback_count" != 9 ]]; then
-  echo "expected 9 signal rollback registrations, found $signal_rollback_count" >&2
+# 八处登记：部署、卸载、迁移恢复、用户与分流的写入路径，加上换内核与清理
+# sing-box 残留（公开 Issue #203）。接管既有安装曾经是第九处。收到 INT/TERM 时
+# 没登记回滚的那条路，会把机器停在改了一半的状态上。
+if [[ "$signal_rollback_count" != 8 ]]; then
+  echo "expected 8 signal rollback registrations, found $signal_rollback_count" >&2
   exit 1
 fi
-if [[ "$clear_rollback_count" != 14 ]]; then
-  echo "expected 14 signal rollback clears, found $clear_rollback_count" >&2
+if [[ "$clear_rollback_count" != 13 ]]; then
+  echo "expected 13 signal rollback clears, found $clear_rollback_count" >&2
   exit 1
 fi
 grep -Fq 'set_signal_rollback rollback_manager_handoff' sb-user-manager.sh
