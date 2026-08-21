@@ -28,10 +28,7 @@ prompt_global_sni_change() {
   if [[ "$protocol" == ss2022 ]]; then current="$SS2022_SHADOWTLS_SNI"
   else current="$ANYTLS_SNI"
   fi
-  total="$(jq --arg protocol "$protocol" '[.users[] | select(
-    if (.endpoints | type) == "array" then
-      any(.endpoints[]; .protocol == $protocol and ($protocol != "ss2022" or .transport == "shadowtls"))
-    else (.protocol // "ss2022") == $protocol and ($protocol != "ss2022" or (.transport // "shadowtls") == "shadowtls") end)] | length' "$STATE_FILE")"
+  total="$(count_protocol_sni_users "$protocol")" || return 1
   printf '\n%s 当前默认连接域名（SNI）：%s\n' "$label" "$current"
   while true; do
     read -r -p '请输入新的连接域名（留空取消）：' new_sni

@@ -737,6 +737,73 @@ kernel_entries_ss2022_shadowtls() {
   esac
 }
 
+# ============================================================
+# ShadowTLS 握手目标的 TLS 1.3 预检
+# ============================================================
+# 严格模式的行为是实测出来的（公开 Issue #182）：握手目标不支持 TLS 1.3 时，开着
+# 严格模式的监听器拒绝承载代理，退化成把连接原样转给握手目标。反过来读就是这条
+# 预检存在的理由——握手目标哪天不再支持 TLS 1.3，这台机器上所有 ShadowTLS 入口
+# 会整体不通，而配置校验、启动日志与既有审计都不会提前提示，现象只是「连不上」
+# （公开 Issue #194）。
+#
+# 结果分四类，因为处置不同：
+#   tls13        握手目标支持 TLS 1.3
+#   tls-older    说 TLS，但握不出 1.3 —— 明确是问题
+#   not-tls      TCP 通，但那个端口上根本不是 TLS —— 明确是问题
+#   unreachable  连 TCP 都连不上，或者本机没有 timeout 命令不敢做兜底判断
+#   invalid      域名或端口本身不合法
+# 把 unreachable 单独分出来是刻意的：网络抖动一次就拒绝改配置、或者把检查刷红，
+# 是标准的「狼来了」，而它会自愈。
+#
+# 判定看协商出来的版本而不是 openssl 的退出码：s_client 在证书验证失败时也会以
+# 非零退出，而「这个域名说不说 TLS 1.3」与证书是否可信无关。openssl 默认就会尽量
+# 协商最高版本，因此一次握手足以回答这个问题。
+probe_handshake_tls13() {
+  local host="$1" port="$2" output="" version
+  # 调用点传进来的都是校验过的域名与端口。这里再挡一次：下面 /dev/tcp 的重定向词
+  # 会经历参数展开，不该把没校验过的东西放进去。
+  [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && "$port" =~ ^[0-9]+$ ]] || {
+    printf 'invalid\n'
+    return 0
+  }
+  if command -v timeout >/dev/null 2>&1; then
+    output="$(timeout 10 openssl s_client -connect "$host:$port" -servername "$host" -brief </dev/null 2>&1)" || true
+  else
+    output="$(openssl s_client -connect "$host:$port" -servername "$host" -brief </dev/null 2>&1)" || true
+  fi
+  version="$(sed -n 's/^Protocol version: //p' <<<"$output" | head -n1)"
+  case "$version" in
+    TLSv1.3) printf 'tls13\n'; return 0;;
+    TLS*) printf 'tls-older\n'; return 0;;
+  esac
+  # 握不出 TLS 时还要分清「那个端口上不是 TLS」与「根本连不上」。没有 timeout
+  # 命令就不做这一步：/dev/tcp 没有自带超时，宁可报成只提示的 unreachable，
+  # 也不冒把菜单挂住的风险。
+  if command -v timeout >/dev/null 2>&1 && timeout 5 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null; then
+    printf 'not-tls\n'
+  else
+    printf 'unreachable\n'
+  fi
+}
+
+# 这条预检只对 mihomo 做。sing-box 的 strict_mode 行为本项目没有实测过，而项目
+# 方向是逐步放弃 sing-box（公开 Issue #172），不再为它新加护栏——它那一侧保持
+# 一字不变。另外两个条件同样是必要的：严格模式关着时握手目标不支持 TLS 1.3
+# 并不会让入口不通（公开 Issue #182 的对照格证明了这一点），而一台没有旧版
+# ShadowTLS 用户的机器上这条检查恒真，报了也没有人要处理。
+shadowtls_handshake_probe_applies() {
+  local total
+  case "$PROXY_KERNEL" in
+    mihomo) ;;
+    singbox) return 1;;
+    *) kernel_unknown;;
+  esac
+  [[ "${SHADOWTLS_STRICT_MODE:-true}" == true ]] || return 1
+  total="$(count_protocol_sni_users ss2022)" || return 1
+  [[ "$total" =~ ^[0-9]+$ ]] || return 1
+  ((total > 0))
+}
+
 kernel_entries_ss2022_direct() {
   local name="$1" port="$2" ss_password="$3" method="$4" entry_name="${5:-ss-$1}"
   case "$PROXY_KERNEL" in
@@ -5980,6 +6047,27 @@ cmd_edit_user() {
   fi
 }
 
+# 某个协议下有多少个用户带着对应入口。全局 SNI 的提示、修改与 ShadowTLS 握手目标
+# 的预检都要这个数，写三遍迟早只改一处。
+count_protocol_sni_users() {
+  local protocol="$1"
+  jq --arg protocol "$protocol" '[.users[] |
+    select(any(if (.endpoints | type) == "array" then .endpoints[]
+      else {protocol:(.protocol // "ss2022"),transport:(.transport // "shadowtls")} end;
+      .protocol == $protocol and ($protocol != "ss2022" or .transport == "shadowtls")))] | length' "$STATE_FILE"
+}
+
+# 实际在用的握手目标域名，去重。mihomo 的监听器是按**用户状态里的**
+# shadowtls_sni 生成的，不是按管理配置里的默认值——两者通常一致，但生成的来源
+# 是前者，所以预检也要按前者来问（公开 Issue #194）。
+active_shadowtls_handshake_hosts() {
+  jq -r '[.users[]? |
+    (if (.endpoints | type) == "array" then .endpoints[]
+     else {protocol:(.protocol // "ss2022"),transport:(.transport // "shadowtls"),shadowtls_sni:.shadowtls_sni} end) |
+    select(.protocol == "ss2022" and .transport == "shadowtls") |
+    (.shadowtls_sni // empty)] | unique | .[]' "$STATE_FILE"
+}
+
 cmd_set_global_sni() {
   local protocol="$1" new_sni="$2" current_sni total mismatched active_count
   validate_shadowtls_sni "$new_sni"
@@ -5988,10 +6076,7 @@ cmd_set_global_sni() {
     anytls) current_sni="$ANYTLS_SNI";;
     *) die "未知 SNI 协议：$protocol";;
   esac
-  total="$(jq --arg protocol "$protocol" '[.users[] |
-    select(any(if (.endpoints | type) == "array" then .endpoints[]
-      else {protocol:(.protocol // "ss2022"),transport:(.transport // "shadowtls")} end;
-      .protocol == $protocol and ($protocol != "ss2022" or .transport == "shadowtls")))] | length' "$STATE_FILE")" || return 1
+  total="$(count_protocol_sni_users "$protocol")" || return 1
   mismatched="$(jq --arg protocol "$protocol" --arg sni "$new_sni" '[.users[] |
     (if (.endpoints | type) == "array" then .endpoints[]
      else {protocol:(.protocol // "ss2022"),transport:(.transport // "shadowtls"),tls_sni:.tls_sni,shadowtls_sni:.shadowtls_sni} end) |
@@ -6006,6 +6091,29 @@ cmd_set_global_sni() {
     return 0
   fi
 
+  # 换握手目标之前先探一次（公开 Issue #194）。放在改动任何东西之前：严格模式下
+  # 换成一个不支持 TLS 1.3 的域名，会让这台机器上所有 ShadowTLS 用户静静连不上，
+  # 而配置校验与启动日志都不会提示。网络本身探不通只提示不拦——那多半是临时
+  # 问题，硬拦会变成「网络一抖就改不了配置」。
+  if [[ "$protocol" == ss2022 ]] && shadowtls_handshake_probe_applies; then
+    case "$(probe_handshake_tls13 "$new_sni" "$HANDSHAKE_PORT")" in
+      tls13) log "已确认握手目标 ${new_sni}:${HANDSHAKE_PORT} 支持 TLS 1.3";;
+      tls-older)
+        printf '错误：%s:%s 不支持 TLS 1.3。严格模式开着时换成它，本机所有 ShadowTLS 用户都会连不上，而服务日志不会报错。请换一个支持 TLS 1.3 的域名。\n' \
+          "$new_sni" "$HANDSHAKE_PORT" >&2
+        return 1;;
+      not-tls)
+        printf '错误：%s:%s 上不是 TLS 服务。ShadowTLS 要把握手转给一台真正的 TLS 1.3 服务器，换成它会让本机所有 ShadowTLS 用户连不上。请换一个域名。\n' \
+          "$new_sni" "$HANDSHAKE_PORT" >&2
+        return 1;;
+      invalid)
+        printf '错误：握手目标 %s:%s 的域名或端口不合法，未做修改。\n' "$new_sni" "$HANDSHAKE_PORT" >&2
+        return 1;;
+      *)
+        printf '提示：这次没能连上 %s:%s，未能确认它是否支持 TLS 1.3。修改会照常进行；若之后 ShadowTLS 用户连不上，先回来核对这个域名。\n' \
+          "$new_sni" "$HANDSHAKE_PORT";;
+    esac
+  fi
   if [[ "$protocol" == ss2022 ]] && ((active_count > 0)); then ensure_safe_ssh_for_kernel_restart || return 0; fi
   start_managed_operation "set-global-sni:$protocol" || return 1
   if [[ "$protocol" == ss2022 ]]; then
@@ -11656,7 +11764,7 @@ audit_consistency() {
   local config_json nfuse_json skeleton_missing_rows skeleton_path user_issue_rows issue_repairable issue_message expiry_rows split_rows split name split_status rule_tag out_tag scope scope_user scope_user_status scope_tags expires
   local preset_link_rows preset_kind preset_reason managed_tags legacy_cleanup legacy_count
   local normalise_program skeleton_program skeleton_filter sub_rule_name managed_lines
-  local unit_drift_rows unit_path unit_drift_rc=0
+  local unit_drift_rows unit_path unit_drift_rc=0 handshake_host
   AUDIT_ISSUES=0
   AUDIT_REPAIRABLE=0
   config_json="$(kernel_normalized_config)" || return 1
@@ -11832,6 +11940,35 @@ audit_consistency() {
       printf '  [可自动修复] 服务单元 %s 与当前版本不一致\n' "$unit_path"
       ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
     done <<<"$unit_drift_rows"
+  fi
+
+  # 严格模式下，握手目标不支持 TLS 1.3 会让所有 ShadowTLS 入口静静不通
+  # （公开 Issue #182 实测出这条行为，#194 据此加了这项检查）。三个前提缺一
+  # 不可，见 shadowtls_handshake_probe_applies。
+  if shadowtls_handshake_probe_applies; then
+    while IFS= read -r handshake_host; do
+      [[ -n "$handshake_host" ]] || continue
+      case "$(probe_handshake_tls13 "$handshake_host" "$HANDSHAKE_PORT")" in
+        tls13) ;;
+        tls-older)
+          printf '  [需要处理] ShadowTLS 握手目标 %s:%s 不支持 TLS 1.3；严格模式开着时这些入口无法连接，请在「默认连接域名（SNI）」里换一个支持 TLS 1.3 的域名\n' \
+            "$handshake_host" "$HANDSHAKE_PORT"
+          ((AUDIT_ISSUES+=1));;
+        not-tls)
+          printf '  [需要处理] ShadowTLS 握手目标 %s:%s 上不是 TLS 服务；严格模式开着时这些入口无法连接，请在「默认连接域名（SNI）」里换一个域名\n' \
+            "$handshake_host" "$HANDSHAKE_PORT"
+          ((AUDIT_ISSUES+=1));;
+        invalid)
+          printf '  [需要处理] ShadowTLS 握手目标不合法（%s:%s）\n' "$handshake_host" "$HANDSHAKE_PORT"
+          ((AUDIT_ISSUES+=1));;
+        *)
+          # 探不通多半是临时网络问题，会自愈：标记但不计为问题。计成问题的话，
+          # 一次网络抖动就会把这台机器的检查刷红，还会挡住要求「只读检查零失败」
+          # 的写入型验收。
+          printf '  [提示] 这次没能连上 ShadowTLS 握手目标 %s:%s，未能确认它是否支持 TLS 1.3\n' \
+            "$handshake_host" "$HANDSHAKE_PORT";;
+      esac
+    done <<<"$(active_shadowtls_handshake_hosts)"
   fi
 
   if ((AUDIT_ISSUES==0)); then echo '  一切正常：用户、分流、连接配置和流量统计相互一致。'
@@ -13799,10 +13936,7 @@ prompt_global_sni_change() {
   if [[ "$protocol" == ss2022 ]]; then current="$SS2022_SHADOWTLS_SNI"
   else current="$ANYTLS_SNI"
   fi
-  total="$(jq --arg protocol "$protocol" '[.users[] | select(
-    if (.endpoints | type) == "array" then
-      any(.endpoints[]; .protocol == $protocol and ($protocol != "ss2022" or .transport == "shadowtls"))
-    else (.protocol // "ss2022") == $protocol and ($protocol != "ss2022" or (.transport // "shadowtls") == "shadowtls") end)] | length' "$STATE_FILE")"
+  total="$(count_protocol_sni_users "$protocol")" || return 1
   printf '\n%s 当前默认连接域名（SNI）：%s\n' "$label" "$current"
   while true; do
     read -r -p '请输入新的连接域名（留空取消）：' new_sni

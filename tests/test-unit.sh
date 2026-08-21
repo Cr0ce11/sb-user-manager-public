@@ -9096,6 +9096,9 @@ EOF
   STATE_FILE="$work_2e/state.json"
   HANDSHAKE_PORT=443
   SHADOWTLS_STRICT_MODE=true
+  # 这一组有一个旧版 ShadowTLS 用户，握手目标预检（公开 Issue #194）因此会命中。
+  # 单元测试不碰网络：在这里打桩，预检自己的判定由下面单独一组用 timeout 打桩覆盖。
+  probe_handshake_tls13() { printf 'tls13\n'; }
   cat > "$work_2e/rules/lab.yaml" <<'YAML'
 payload:
   - DOMAIN-SUFFIX,openai.com
@@ -9357,6 +9360,172 @@ YAML
      ! grep -Fxq /etc/systemd/system/sing-box.service <<<"$singbox_units" ||
      ! grep -Fxq /etc/systemd/system/mihomo.service <<<"$mihomo_units"; then
     echo '要核对的单元清单必须随内核变，且各自包含自己的内核服务单元' >&2
+    exit 1
+  fi
+)
+
+# ============================================================
+# ShadowTLS 握手目标的 TLS 1.3 预检（公开 Issue #194）
+# ============================================================
+# 三件事分开锁：探测函数怎么判、什么时候才该探、探出问题之后审计与改 SNI 各自
+# 怎么表现。探测函数自己不碰网络——timeout 打桩，因此这一组在没有出网的机器上
+# 也是确定性的。
+(
+  probe_work="$work/handshake-probe"
+  mkdir -p "$probe_work"
+
+  # ---- 一、探测函数的判定 ----
+  probe_openssl_output=""
+  probe_tcp_rc=1
+  timeout() {
+    shift  # 秒数
+    case "${1:-}" in
+      openssl) printf '%s\n' "$probe_openssl_output"; return 0;;
+      bash) return "$probe_tcp_rc";;
+      *) return 127;;
+    esac
+  }
+  expect_probe() {
+    local label="$1" want="$2" got
+    got="$(probe_handshake_tls13 hs.example.com 443)"
+    [[ "$got" == "$want" ]] || {
+      printf '握手目标预检「%s」：期望 %s，实际 %s\n' "$label" "$want" "$got" >&2
+      exit 1
+    }
+  }
+  probe_openssl_output='CONNECTION ESTABLISHED
+Protocol version: TLSv1.3
+Ciphersuite: TLS_AES_256_GCM_SHA384'
+  expect_probe '握手目标说 TLS 1.3' tls13
+  probe_openssl_output='CONNECTION ESTABLISHED
+Protocol version: TLSv1.2'
+  expect_probe '握手目标只说 TLS 1.2' tls-older
+  # 不是 TLS 的服务：openssl 什么版本都协商不出来，再看 TCP 通不通。
+  probe_openssl_output='40E7C4A7A87F0000:error:0A00010B:SSL routines:tls_validate_record_header:wrong version number'
+  probe_tcp_rc=0
+  expect_probe '端口上不是 TLS 服务' not-tls
+  probe_tcp_rc=1
+  expect_probe '连 TCP 都连不上' unreachable
+  # 非法域名不做任何网络动作，直接说不合法。
+  if [[ "$(probe_handshake_tls13 'bad host' 443)" != invalid ]] ||
+     [[ "$(probe_handshake_tls13 hs.example.com 44a)" != invalid ]]; then
+    echo '域名或端口不合法时，预检必须返回 invalid' >&2
+    exit 1
+  fi
+  unset -f timeout
+
+  # ---- 二、什么时候才该探 ----
+  STATE_FILE="$probe_work/state.json"
+  printf '%s\n' '{"schema_version":7,"users":[
+    {"name":"legacy","status":"active","metered":false,
+     "endpoints":[{"protocol":"ss2022","transport":"shadowtls","port":20001,
+                   "shadowtls_password":"stpw","ss2022_password":"sspw",
+                   "method":"2022-blake3-aes-128-gcm","shadowtls_sni":"a.example.com"}]}],
+    "splits":[],"outbound_presets":[],"rule_presets":[]}' > "$STATE_FILE"
+  SHADOWTLS_STRICT_MODE=true
+  if ! ( PROXY_KERNEL=mihomo; shadowtls_handshake_probe_applies ); then
+    echo 'mihomo + 严格模式开 + 有旧版 ShadowTLS 用户时必须探' >&2
+    exit 1
+  fi
+  # 要探的是状态里真正在用的握手目标，去重后逐个；管理配置里的默认值不参与。
+  if [[ "$(active_shadowtls_handshake_hosts)" != a.example.com ]]; then
+    printf '实际在用的握手目标应当是 a.example.com，得到：%s\n' "$(active_shadowtls_handshake_hosts)" >&2
+    exit 1
+  fi
+  # 三个对照：换成 sing-box、关掉严格模式、没有旧版用户，都不该探。
+  if ( PROXY_KERNEL=singbox; shadowtls_handshake_probe_applies ); then
+    echo 'sing-box 部署不做这条预检（项目方向是放弃 sing-box）' >&2
+    exit 1
+  fi
+  if ( PROXY_KERNEL=mihomo; SHADOWTLS_STRICT_MODE=false; shadowtls_handshake_probe_applies ); then
+    echo '严格模式关着时握手目标不支持 TLS 1.3 也不影响连接，不该探' >&2
+    exit 1
+  fi
+  printf '%s\n' '{"schema_version":7,"users":[],"splits":[],"outbound_presets":[],"rule_presets":[]}' \
+    > "$probe_work/state-empty.json"
+  if ( PROXY_KERNEL=mihomo; STATE_FILE="$probe_work/state-empty.json"; shadowtls_handshake_probe_applies ); then
+    echo '没有旧版 ShadowTLS 用户时这条检查恒真，不该探' >&2
+    exit 1
+  fi
+
+  # ---- 三、审计在四种探测结果下的表现 ----
+  audit_work="$probe_work/audit"
+  mkdir -p "$audit_work/rules"
+  PROXY_KERNEL=mihomo
+  MIHOMO_CONFIG="$audit_work/config.json"
+  MIHOMO_RULES_DIR="$audit_work/rules"
+  # 刻意把管理配置里的默认域名设成另一个值：监听器是按**用户状态里的**
+  # shadowtls_sni 生成的，预检也必须问那一个。下面的断言都盯 a.example.com，
+  # 如果哪天改成读管理配置，这一组会立刻变红。
+  SS2022_SHADOWTLS_SNI=default.example.com
+  HANDSHAKE_PORT=443
+  SB_SYSTEM_ROOT="$audit_work/system"
+  mkdir -p "$SB_SYSTEM_ROOT/etc/systemd/system"
+  default_network_interface() { printf 'eth0\n'; }
+  nfuse() {
+    [[ "${1:-}" == list && "${2:-}" == --json ]] || return 1
+    printf '%s\n' '[{"name":"legacy","tier":"c","ports":[{"start":20001,"end":20001}]}]'
+  }
+  printf '%s\n' '{"log-level":"info","mode":"rule","listeners":[],"proxies":[],"proxy-groups":[],"rules":[]}' > "$MIHOMO_CONFIG"
+  rebuild_protocol_inbounds ss2022
+  write_systemd_units eth0
+
+  expect_audit() {
+    local label="$1" status="$2" want_issues="$3" want_line="$4"
+    probe_handshake_tls13() { printf '%s\n' "$status"; }
+    audit_consistency > "$audit_work/audit.$status"
+    if [[ "$AUDIT_ISSUES" != "$want_issues" ]]; then
+      printf '探测结果为 %s（%s）时期望 %s 个问题，实际 %s：\n' "$status" "$label" "$want_issues" "$AUDIT_ISSUES" >&2
+      cat "$audit_work/audit.$status" >&2
+      exit 1
+    fi
+    if [[ -n "$want_line" ]] && ! grep -Fq "$want_line" "$audit_work/audit.$status"; then
+      printf '探测结果为 %s 时，输出里应当出现「%s」：\n' "$status" "$want_line" >&2
+      cat "$audit_work/audit.$status" >&2
+      exit 1
+    fi
+  }
+  # 对照放在最前面：握手目标正常时这条检查一个字都不说，否则每台正常机器天天喊。
+  expect_audit '握手目标正常' tls13 0 ''
+  if grep -q '握手目标' "$audit_work/audit.tls13"; then
+    echo '握手目标支持 TLS 1.3 时，审计不得提到它' >&2
+    cat "$audit_work/audit.tls13" >&2
+    exit 1
+  fi
+  expect_audit '只说 TLS 1.2' tls-older 1 '[需要处理] ShadowTLS 握手目标 a.example.com:443 不支持 TLS 1.3'
+  expect_audit '不是 TLS 服务' not-tls 1 '[需要处理] ShadowTLS 握手目标 a.example.com:443 上不是 TLS 服务'
+  expect_audit '握手目标不合法' invalid 1 '[需要处理] ShadowTLS 握手目标不合法'
+  # 探不通会自愈，因此标记但不计为问题：计成问题会让一次网络抖动挡住写入型验收。
+  expect_audit '网络探不通' unreachable 0 '[提示] 这次没能连上 ShadowTLS 握手目标 a.example.com:443'
+
+  # ---- 四、改 SNI 时，明确的问题必须拦住且不动任何东西 ----
+  sni_marker="$probe_work/managed-operation-started"
+  start_managed_operation() { printf 'started\n' > "$sni_marker"; return 1; }
+  ensure_safe_ssh_for_kernel_restart() { return 0; }
+  for bad in tls-older not-tls invalid; do
+    rm -f "$sni_marker"
+    probe_handshake_tls13() { printf '%s\n' "$bad"; }
+    if cmd_set_global_sni ss2022 b.example.com > "$probe_work/sni.$bad" 2>&1; then
+      printf '探测结果为 %s 时，改 SNI 必须失败\n' "$bad" >&2
+      exit 1
+    fi
+    if [[ -f "$sni_marker" ]]; then
+      printf '探测结果为 %s 时，改 SNI 必须在动任何东西之前就停下\n' "$bad" >&2
+      exit 1
+    fi
+  done
+  # 对照：网络探不通只提示不拦，流程照常往下走（这里在取锁那一步被桩挡住）。
+  rm -f "$sni_marker"
+  probe_handshake_tls13() { printf 'unreachable\n'; }
+  cmd_set_global_sni ss2022 b.example.com > "$probe_work/sni.unreachable" 2>&1 || true
+  if [[ ! -f "$sni_marker" ]]; then
+    echo '网络探不通时不应拦住修改，应当继续往下走' >&2
+    cat "$probe_work/sni.unreachable" >&2
+    exit 1
+  fi
+  if ! grep -Fq '未能确认它是否支持 TLS 1.3' "$probe_work/sni.unreachable"; then
+    echo '网络探不通时必须明确说出「未能确认」，不能默默放过' >&2
+    cat "$probe_work/sni.unreachable" >&2
     exit 1
   fi
 )
