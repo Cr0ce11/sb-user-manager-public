@@ -840,7 +840,7 @@ audit_consistency() {
   local config_json nfuse_json skeleton_missing_rows skeleton_path user_issue_rows issue_repairable issue_message expiry_rows split_rows split name split_status rule_tag out_tag scope scope_user scope_user_status scope_tags expires
   local preset_link_rows preset_kind preset_reason managed_tags legacy_cleanup legacy_count
   local normalise_program skeleton_program skeleton_filter sub_rule_name managed_lines
-  local unit_drift_rows unit_path unit_drift_rc=0
+  local unit_drift_rows unit_path unit_drift_rc=0 handshake_host
   AUDIT_ISSUES=0
   AUDIT_REPAIRABLE=0
   config_json="$(kernel_normalized_config)" || return 1
@@ -1016,6 +1016,35 @@ audit_consistency() {
       printf '  [可自动修复] 服务单元 %s 与当前版本不一致\n' "$unit_path"
       ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
     done <<<"$unit_drift_rows"
+  fi
+
+  # 严格模式下，握手目标不支持 TLS 1.3 会让所有 ShadowTLS 入口静静不通
+  # （公开 Issue #182 实测出这条行为，#194 据此加了这项检查）。三个前提缺一
+  # 不可，见 shadowtls_handshake_probe_applies。
+  if shadowtls_handshake_probe_applies; then
+    while IFS= read -r handshake_host; do
+      [[ -n "$handshake_host" ]] || continue
+      case "$(probe_handshake_tls13 "$handshake_host" "$HANDSHAKE_PORT")" in
+        tls13) ;;
+        tls-older)
+          printf '  [需要处理] ShadowTLS 握手目标 %s:%s 不支持 TLS 1.3；严格模式开着时这些入口无法连接，请在「默认连接域名（SNI）」里换一个支持 TLS 1.3 的域名\n' \
+            "$handshake_host" "$HANDSHAKE_PORT"
+          ((AUDIT_ISSUES+=1));;
+        not-tls)
+          printf '  [需要处理] ShadowTLS 握手目标 %s:%s 上不是 TLS 服务；严格模式开着时这些入口无法连接，请在「默认连接域名（SNI）」里换一个域名\n' \
+            "$handshake_host" "$HANDSHAKE_PORT"
+          ((AUDIT_ISSUES+=1));;
+        invalid)
+          printf '  [需要处理] ShadowTLS 握手目标不合法（%s:%s）\n' "$handshake_host" "$HANDSHAKE_PORT"
+          ((AUDIT_ISSUES+=1));;
+        *)
+          # 探不通多半是临时网络问题，会自愈：标记但不计为问题。计成问题的话，
+          # 一次网络抖动就会把这台机器的检查刷红，还会挡住要求「只读检查零失败」
+          # 的写入型验收。
+          printf '  [提示] 这次没能连上 ShadowTLS 握手目标 %s:%s，未能确认它是否支持 TLS 1.3\n' \
+            "$handshake_host" "$HANDSHAKE_PORT";;
+      esac
+    done <<<"$(active_shadowtls_handshake_hosts)"
   fi
 
   if ((AUDIT_ISSUES==0)); then echo '  一切正常：用户、分流、连接配置和流量统计相互一致。'

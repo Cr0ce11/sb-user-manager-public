@@ -1579,6 +1579,27 @@ cmd_edit_user() {
   fi
 }
 
+# 某个协议下有多少个用户带着对应入口。全局 SNI 的提示、修改与 ShadowTLS 握手目标
+# 的预检都要这个数，写三遍迟早只改一处。
+count_protocol_sni_users() {
+  local protocol="$1"
+  jq --arg protocol "$protocol" '[.users[] |
+    select(any(if (.endpoints | type) == "array" then .endpoints[]
+      else {protocol:(.protocol // "ss2022"),transport:(.transport // "shadowtls")} end;
+      .protocol == $protocol and ($protocol != "ss2022" or .transport == "shadowtls")))] | length' "$STATE_FILE"
+}
+
+# 实际在用的握手目标域名，去重。mihomo 的监听器是按**用户状态里的**
+# shadowtls_sni 生成的，不是按管理配置里的默认值——两者通常一致，但生成的来源
+# 是前者，所以预检也要按前者来问（公开 Issue #194）。
+active_shadowtls_handshake_hosts() {
+  jq -r '[.users[]? |
+    (if (.endpoints | type) == "array" then .endpoints[]
+     else {protocol:(.protocol // "ss2022"),transport:(.transport // "shadowtls"),shadowtls_sni:.shadowtls_sni} end) |
+    select(.protocol == "ss2022" and .transport == "shadowtls") |
+    (.shadowtls_sni // empty)] | unique | .[]' "$STATE_FILE"
+}
+
 cmd_set_global_sni() {
   local protocol="$1" new_sni="$2" current_sni total mismatched active_count
   validate_shadowtls_sni "$new_sni"
@@ -1587,10 +1608,7 @@ cmd_set_global_sni() {
     anytls) current_sni="$ANYTLS_SNI";;
     *) die "未知 SNI 协议：$protocol";;
   esac
-  total="$(jq --arg protocol "$protocol" '[.users[] |
-    select(any(if (.endpoints | type) == "array" then .endpoints[]
-      else {protocol:(.protocol // "ss2022"),transport:(.transport // "shadowtls")} end;
-      .protocol == $protocol and ($protocol != "ss2022" or .transport == "shadowtls")))] | length' "$STATE_FILE")" || return 1
+  total="$(count_protocol_sni_users "$protocol")" || return 1
   mismatched="$(jq --arg protocol "$protocol" --arg sni "$new_sni" '[.users[] |
     (if (.endpoints | type) == "array" then .endpoints[]
      else {protocol:(.protocol // "ss2022"),transport:(.transport // "shadowtls"),tls_sni:.tls_sni,shadowtls_sni:.shadowtls_sni} end) |
@@ -1605,6 +1623,29 @@ cmd_set_global_sni() {
     return 0
   fi
 
+  # 换握手目标之前先探一次（公开 Issue #194）。放在改动任何东西之前：严格模式下
+  # 换成一个不支持 TLS 1.3 的域名，会让这台机器上所有 ShadowTLS 用户静静连不上，
+  # 而配置校验与启动日志都不会提示。网络本身探不通只提示不拦——那多半是临时
+  # 问题，硬拦会变成「网络一抖就改不了配置」。
+  if [[ "$protocol" == ss2022 ]] && shadowtls_handshake_probe_applies; then
+    case "$(probe_handshake_tls13 "$new_sni" "$HANDSHAKE_PORT")" in
+      tls13) log "已确认握手目标 ${new_sni}:${HANDSHAKE_PORT} 支持 TLS 1.3";;
+      tls-older)
+        printf '错误：%s:%s 不支持 TLS 1.3。严格模式开着时换成它，本机所有 ShadowTLS 用户都会连不上，而服务日志不会报错。请换一个支持 TLS 1.3 的域名。\n' \
+          "$new_sni" "$HANDSHAKE_PORT" >&2
+        return 1;;
+      not-tls)
+        printf '错误：%s:%s 上不是 TLS 服务。ShadowTLS 要把握手转给一台真正的 TLS 1.3 服务器，换成它会让本机所有 ShadowTLS 用户连不上。请换一个域名。\n' \
+          "$new_sni" "$HANDSHAKE_PORT" >&2
+        return 1;;
+      invalid)
+        printf '错误：握手目标 %s:%s 的域名或端口不合法，未做修改。\n' "$new_sni" "$HANDSHAKE_PORT" >&2
+        return 1;;
+      *)
+        printf '提示：这次没能连上 %s:%s，未能确认它是否支持 TLS 1.3。修改会照常进行；若之后 ShadowTLS 用户连不上，先回来核对这个域名。\n' \
+          "$new_sni" "$HANDSHAKE_PORT";;
+    esac
+  fi
   if [[ "$protocol" == ss2022 ]] && ((active_count > 0)); then ensure_safe_ssh_for_kernel_restart || return 0; fi
   start_managed_operation "set-global-sni:$protocol" || return 1
   if [[ "$protocol" == ss2022 ]]; then

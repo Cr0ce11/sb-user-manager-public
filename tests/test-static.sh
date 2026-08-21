@@ -665,6 +665,39 @@ if [[ -n "$(strictmode_key_typos "$manager_data_fixture/92-strictmode.sh")" ]]; 
   exit 1
 fi
 rm -f -- "$manager_data_fixture/92-strictmode.sh"
+# 握手目标的 TLS 1.3 预检必须走适用条件（公开 Issue #194）。绕过
+# shadowtls_handshake_probe_applies 直接探，会在 sing-box 机器上、严格模式关着时、
+# 或者根本没有旧版 ShadowTLS 用户的机器上凭空多出一次网络请求和一条没人要处理的
+# 提示——那正是「狼来了」的做法。
+unguarded_handshake_probes() {
+  awk '
+    /shadowtls_handshake_probe_applies/ { guarded = NR }
+    /\$\(probe_handshake_tls13 / { if (guarded == 0 || NR - guarded > 8) print FILENAME ":" NR ": " $0 }
+  ' "$1"
+}
+if [[ -n "$(unguarded_handshake_probes sb-user-manager.sh)" ]]; then
+  unguarded_handshake_probes sb-user-manager.sh >&2
+  echo 'handshake TLS 1.3 probe must be guarded by shadowtls_handshake_probe_applies' >&2
+  exit 1
+fi
+# 反面样本：不带守卫的探测必须被抓到，带守卫的不得误伤。
+printf 'x() {\n  status="$(probe_handshake_tls13 "$sni" 443)"\n}\n' > "$manager_data_fixture/93-probe.sh"
+if [[ -z "$(unguarded_handshake_probes "$manager_data_fixture/93-probe.sh")" ]]; then
+  echo 'probe guard check must reject an unguarded probe call' >&2
+  exit 1
+fi
+printf 'x() {\n  if shadowtls_handshake_probe_applies; then\n    status="$(probe_handshake_tls13 "$sni" 443)"\n  fi\n}\n' \
+  > "$manager_data_fixture/93-probe.sh"
+if [[ -n "$(unguarded_handshake_probes "$manager_data_fixture/93-probe.sh")" ]]; then
+  echo 'probe guard check must not flag a guarded probe call' >&2
+  exit 1
+fi
+rm -f -- "$manager_data_fixture/93-probe.sh"
+# 网络探测只能有这一处实现：第二处 openssl s_client 会带来第二套判定与第二套超时。
+[[ "$(grep -Fc 'openssl s_client' sb-user-manager.sh)" == 2 ]] || {
+  echo 'openssl s_client must appear only inside probe_handshake_tls13 (timeout 与无 timeout 两支)' >&2
+  exit 1
+}
 grep -Fq 'shadow-tls-version=3, udp-relay=true' sb-user-manager.sh
 grep -Fq 'shadowrocket_anytls_url()' sb-user-manager.sh
 grep -Fq 'shadowrocket_ss2022_url()' sb-user-manager.sh

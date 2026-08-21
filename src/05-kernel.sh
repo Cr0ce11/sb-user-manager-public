@@ -273,6 +273,73 @@ kernel_entries_ss2022_shadowtls() {
   esac
 }
 
+# ============================================================
+# ShadowTLS 握手目标的 TLS 1.3 预检
+# ============================================================
+# 严格模式的行为是实测出来的（公开 Issue #182）：握手目标不支持 TLS 1.3 时，开着
+# 严格模式的监听器拒绝承载代理，退化成把连接原样转给握手目标。反过来读就是这条
+# 预检存在的理由——握手目标哪天不再支持 TLS 1.3，这台机器上所有 ShadowTLS 入口
+# 会整体不通，而配置校验、启动日志与既有审计都不会提前提示，现象只是「连不上」
+# （公开 Issue #194）。
+#
+# 结果分四类，因为处置不同：
+#   tls13        握手目标支持 TLS 1.3
+#   tls-older    说 TLS，但握不出 1.3 —— 明确是问题
+#   not-tls      TCP 通，但那个端口上根本不是 TLS —— 明确是问题
+#   unreachable  连 TCP 都连不上，或者本机没有 timeout 命令不敢做兜底判断
+#   invalid      域名或端口本身不合法
+# 把 unreachable 单独分出来是刻意的：网络抖动一次就拒绝改配置、或者把检查刷红，
+# 是标准的「狼来了」，而它会自愈。
+#
+# 判定看协商出来的版本而不是 openssl 的退出码：s_client 在证书验证失败时也会以
+# 非零退出，而「这个域名说不说 TLS 1.3」与证书是否可信无关。openssl 默认就会尽量
+# 协商最高版本，因此一次握手足以回答这个问题。
+probe_handshake_tls13() {
+  local host="$1" port="$2" output="" version
+  # 调用点传进来的都是校验过的域名与端口。这里再挡一次：下面 /dev/tcp 的重定向词
+  # 会经历参数展开，不该把没校验过的东西放进去。
+  [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && "$port" =~ ^[0-9]+$ ]] || {
+    printf 'invalid\n'
+    return 0
+  }
+  if command -v timeout >/dev/null 2>&1; then
+    output="$(timeout 10 openssl s_client -connect "$host:$port" -servername "$host" -brief </dev/null 2>&1)" || true
+  else
+    output="$(openssl s_client -connect "$host:$port" -servername "$host" -brief </dev/null 2>&1)" || true
+  fi
+  version="$(sed -n 's/^Protocol version: //p' <<<"$output" | head -n1)"
+  case "$version" in
+    TLSv1.3) printf 'tls13\n'; return 0;;
+    TLS*) printf 'tls-older\n'; return 0;;
+  esac
+  # 握不出 TLS 时还要分清「那个端口上不是 TLS」与「根本连不上」。没有 timeout
+  # 命令就不做这一步：/dev/tcp 没有自带超时，宁可报成只提示的 unreachable，
+  # 也不冒把菜单挂住的风险。
+  if command -v timeout >/dev/null 2>&1 && timeout 5 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null; then
+    printf 'not-tls\n'
+  else
+    printf 'unreachable\n'
+  fi
+}
+
+# 这条预检只对 mihomo 做。sing-box 的 strict_mode 行为本项目没有实测过，而项目
+# 方向是逐步放弃 sing-box（公开 Issue #172），不再为它新加护栏——它那一侧保持
+# 一字不变。另外两个条件同样是必要的：严格模式关着时握手目标不支持 TLS 1.3
+# 并不会让入口不通（公开 Issue #182 的对照格证明了这一点），而一台没有旧版
+# ShadowTLS 用户的机器上这条检查恒真，报了也没有人要处理。
+shadowtls_handshake_probe_applies() {
+  local total
+  case "$PROXY_KERNEL" in
+    mihomo) ;;
+    singbox) return 1;;
+    *) kernel_unknown;;
+  esac
+  [[ "${SHADOWTLS_STRICT_MODE:-true}" == true ]] || return 1
+  total="$(count_protocol_sni_users ss2022)" || return 1
+  [[ "$total" =~ ^[0-9]+$ ]] || return 1
+  ((total > 0))
+}
+
 kernel_entries_ss2022_direct() {
   local name="$1" port="$2" ss_password="$3" method="$4" entry_name="${5:-ss-$1}"
   case "$PROXY_KERNEL" in
