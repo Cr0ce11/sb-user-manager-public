@@ -12,7 +12,7 @@ PROGRAM="sb-user-manager"
 CONF_FILE="${SB_USER_CONF:-/etc/sb-user-manager.conf}"
 SELF_SOURCE_PATH="${BASH_SOURCE[0]}"
 SELF_PATH="$(readlink -f -- "$SELF_SOURCE_PATH")"
-SCRIPT_VERSION="4.25.22"
+SCRIPT_VERSION="4.25.23"
 SCRIPT_EDITION_LABEL="公开版"
 STATE_SCHEMA_VERSION=7
 # 代理内核的文件级默认值。载入管理配置之前也可能被读到（例如只读查询的早期路径），
