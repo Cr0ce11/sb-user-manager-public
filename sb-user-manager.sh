@@ -10667,6 +10667,11 @@ EOF
   run_step_or_rollback rollback_switch apply_rule_set_migration "$plan" "$staged" || return 1
   PROXY_KERNEL=mihomo
   run_step_or_rollback rollback_switch write_manager_config || return 1
+  # download_binaries 依赖 fetch_latest_releases 填好的那几个变量；忘了它的后果
+  # 不是「下载失败」而是**未定义变量导致整个进程当场退出**，回滚都来不及跑，
+  # 机器停在半迁移状态上（真机演练撞到过，靠启动时的事务恢复才回去的）。
+  # 传 false：管理脚本自身不在这次切换的更新范围内。
+  run_step_or_rollback rollback_switch fetch_latest_releases false || return 1
   run_step_or_rollback rollback_switch download_binaries "$work" || return 1
   run_step_or_rollback rollback_switch write_base_config || return 1
   run_step_or_rollback rollback_switch rebuild_protocol_inbounds ss2022 || return 1
