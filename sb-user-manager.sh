@@ -714,6 +714,12 @@ kernel_entries_ss2022_shadowtls() {
       # 严格模式的键名是 strict-mode，不是 strictmode——监听器配置走的是
       # inbound 结构体标签而不是 yaml 标签，二进制里 strictmode 出现 0 次。
       # 公开 Issue #154 正文那条相反的推导已在该 Issue 中更正。
+      # 这个取值的行为差异已经真机观测到（公开 Issue #182）：握手目标不说 TLS 1.3
+      # 时，严格模式开着的监听器拒绝承载代理、退化成把连接原样转给握手目标
+      # （日志 [ShadowTLS] TLS 1.3 is not supported, will copy bidirectional），
+      # 关着时照常代理；握手目标说 TLS 1.3 时两种取值都照常代理。因此写对这个键
+      # 不只是「配置能加载」。反过来也成立：握手目标哪天不再支持 TLS 1.3，严格
+      # 模式下这些入口会整体不通，而配置校验与启动日志都不会提前提示。
       # udp 显式写出而不是依赖默认值：这里不是「重申默认值的虚假安全感」，
       # 因为它有可观测断言把守——监听套接字里 UDP 在不在是能直接看到的。
       SB_JQ_ST_PASSWORD="$st_password" SB_JQ_SS_PASSWORD="$ss_password" jq -n \
