@@ -16,6 +16,7 @@ cat > "$work/expected-direct-functions" <<'EOF'
 activate_managed_services
 append_inbounds
 append_inbounds_from_new_user_snapshot
+apply_rule_set_migration
 atomic_install_file
 begin_environment_transaction
 check_singbox_and_restart
@@ -60,8 +61,11 @@ state_set_split_status
 state_set_status
 state_sync_linked_split_snapshots
 stop_managed_services_for_uninstall
+stop_singbox_for_switch
 update_deployed_singbox_version
+verify_kernel_switch
 verify_managed_uninstall_paths_removed
+verify_singbox_cleanup
 write_base_config
 write_command_output
 write_deployed_versions

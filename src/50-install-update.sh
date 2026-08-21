@@ -2298,6 +2298,353 @@ deploy_environment() {
   log "部署完成；备份位于 $backup"
 }
 
+# ============================================================
+# 换内核：把一台在跑的 sing-box 机器整机切到 mihomo（公开 Issue #203）
+# ============================================================
+# 这不是「改一下管理配置」——部署之后改内核会得到一台配置属于旧内核、服务属于新
+# 内核的半迁移机器（见 apply_test_only_kernel_selection 的注释）。因此走一次完整的
+# 环境事务：先把要做的事整个算清楚，再动手，任何一步失败整体回到切换前。
+#
+# **分流规则集的转换是单向的**（.srs／.json → yaml 能做，反过来做不到）。所以回退
+# 靠的是切换前的环境快照，而不是「切回 sing-box」；也因此**不提供反向切换入口**——
+# 那会让人以为分流也能跟着回去。
+#
+# 使用者这一侧：客户端配置一个字都不用改（`#154` 实测三种入口互通），端口、密码、
+# 有效期、配额与累计用量都不变，服务会断几秒。
+
+# 状态里所有需要转换的规则集来源，去重。分流与规则预置都存 url，两处都要转。
+singbox_rule_sources_in_state() {
+  jq -r '[(.splits[]?, .rule_presets[]?) | .url // empty] | unique | .[]' "$STATE_FILE"
+}
+
+# 把状态里的每一个规则集来源转成一个 mihomo 规则文件，全部落到 $1 这个目录里。
+# 输出一份 JSON：{来源地址: 文件名}。**任何一个来源转不了就整体失败**——静默丢掉
+# 一条规则的后果是那部分流量从「走上游」变成「走直连」，没有人会发现。
+plan_rule_set_migration() {
+  local outdir="$1" source name json rc=0
+  local -a pairs=()
+  while IFS= read -r source; do
+    [[ -n "$source" ]] || continue
+    name="$(migrated_rule_file_name "$source")" || return 1
+    json="$(mktemp /tmp/sb-rule-source-json.XXXXXX)" || return 1
+    register_temp_path "$json" || { rm -f -- "$json"; return 1; }
+    if ! fetch_singbox_rule_set_json "$source" "$json"; then
+      printf '规则集无法取得：%s\n' "$source" >&2
+      rc=1
+    elif ! singbox_rule_set_json_to_mihomo_yaml "$json" "$outdir/$name"; then
+      printf '上面这条说的是这个规则集：%s\n' "$source" >&2
+      rc=1
+    else
+      pairs+=("$source" "$name")
+    fi
+    rm -f -- "$json"
+    unregister_temp_path "$json" || true
+    ((rc == 0)) || return 1
+  done <<<"$(singbox_rule_sources_in_state)"
+  # 没有分流的机器是常态，这一支必须单独走：把空数组喂给 printf 会打出一个空行，
+  # 那一行会被后面的 jq 当成一个来源，算出一个键为空串的假条目。
+  if ((${#pairs[@]} == 0)); then
+    printf '{}\n'
+    return 0
+  fi
+  printf '%s\n' "${pairs[@]}" | jq -Rn '[inputs] |
+    [range(0; length; 2) as $i | {key: .[$i], value: .[$i + 1]}] | from_entries'
+}
+
+# 把算好的规则文件装进规则目录，并把状态里的 url 换成 rule_file。
+# 写法一律是 classical：转换器产出的就是完整规则行。
+apply_rule_set_migration() {
+  local plan="$1" staged="$2" name
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    install -m 644 "$staged/$name" "$(mihomo_rule_file_path "$name")" || return 1
+  done <<<"$(jq -r '.[]' <<<"$plan")"
+  # 状态改写走既有的原子更新，权限与属主的处理与别处一致。
+  atomic_state_update '
+      def migrate:
+        if has("url") then
+          ($plan[.url] // error("规则集来源没有对应的规则文件：" + .url)) as $file |
+          .rule_file = $file | .rule_behavior = "classical" | del(.url)
+        else . end;
+      .splits = [.splits[]? | migrate] |
+      .rule_presets = [.rule_presets[]? | migrate]' --argjson plan "$plan"
+}
+
+# 切换前的检查。任一条不过就拒绝，且**什么都不动**。
+switch_kernel_preflight() {
+  [[ "$PROXY_KERNEL" == singbox ]] || {
+    echo "错误：本机的代理内核不是 sing-box，无需切换。" >&2
+    return 1
+  }
+  environment_is_deployed || {
+    echo "错误：本机尚未完成部署，请先选择「安装或修复环境」。" >&2
+    return 1
+  }
+  [[ "$(uname -m)" == x86_64 ]] || { echo "错误：仅支持 x86_64 Linux。" >&2; return 1; }
+  need_cmd curl; need_cmd jq
+  [[ -x "$SINGBOX_BIN" ]] || {
+    echo "错误：找不到本机的 sing-box，可执行文件是转换分流规则集的前提。" >&2
+    return 1
+  }
+}
+
+# 只算不改：把要做的事和转换结果打印出来，机器一个字节都不动。
+# 项目所有者要的就是这一步——在动生产机器之前先看一眼转出来的规则对不对。
+preview_kernel_switch() {
+  local staged="$1" plan count users splits
+  plan="$(plan_rule_set_migration "$staged")" || return 1
+  count="$(jq 'length' <<<"$plan")" || return 1
+  users="$(jq '[.users[]?] | length' "$STATE_FILE")" || return 1
+  splits="$(jq '[.splits[]?] | length' "$STATE_FILE")" || return 1
+  printf '\n将要发生的事\n'
+  printf '  用户 %s 个：端口、密码、加密方式、有效期、配额与累计用量都不变，客户端配置不用改。\n' "$users"
+  printf '  分流 %s 条：规则集会被转换成 mihomo 的规则文件（见下），关联关系不变。\n' "$splits"
+  printf '  服务会切换：停 sing-box、起 mihomo，中间会断几秒。\n'
+  printf '  sing-box 不会被删除，只是停用并取消开机启动；确认无误后可以另行清理。\n'
+  if ((count > 0)); then
+    printf '\n规则集的转换结果（共 %s 个来源）\n' "$count"
+    while IFS=$'\t' read -r source name; do
+      [[ -n "$source" ]] || continue
+      printf '  %s\n    → %s（%s 条规则）\n' "$source" "$(mihomo_rule_file_path "$name")" \
+        "$(($(wc -l < "$staged/$name") - 1))"
+    done <<<"$(jq -r 'to_entries[] | "\(.key)\t\(.value)"' <<<"$plan")"
+    printf '\n这些文件生成之后归你维护，管理器不会再改它们的内容。\n'
+  else
+    printf '\n本机没有分流，也就没有规则集要转换。\n'
+  fi
+  printf '%s\n' "$plan" > "$staged/.plan.json"
+}
+
+switch_kernel_to_mihomo() {
+  local iface work backup staged plan singbox_was_enabled=false
+  local -a switch_created=()
+  local switch_created_count=0
+  resolve_deployment_kernel || return 1
+  load_runtime_config || return 1
+  switch_kernel_preflight || return 1
+  if ! acquire_operation_lock; then
+    log "错误：$OPERATION_LOCK_ERROR"
+    return 1
+  fi
+  ensure_safe_ssh_for_kernel_restart || { release_operation_lock; return 0; }
+  staged="$(mktemp -d /tmp/sb-kernel-switch.XXXXXX)" || { release_operation_lock; return 1; }
+  register_temp_path "$staged" || { rm -rf -- "$staged"; release_operation_lock; return 1; }
+  # 先只算不改。算不出来就停在这里，机器一个字节都没动。
+  if ! preview_kernel_switch "$staged"; then
+    echo '错误：切换没有开始，本机未做任何改动。' >&2
+    rm -rf -- "$staged"
+    unregister_temp_path "$staged" || true
+    release_operation_lock
+    return 1
+  fi
+  plan="$(cat "$staged/.plan.json")" || { rm -rf -- "$staged"; release_operation_lock; return 1; }
+  cat <<'EOF'
+
+切换之后不能用「切回 sing-box」退回来：分流的规则集只能从 sing-box 的格式转成
+mihomo 的，反过来转不了。真出问题时的退路是从切换前的完整环境快照整体恢复。
+EOF
+  local answer
+  read -r -p '确认现在切换到 mihomo？[y/N]：' answer || { rm -rf -- "$staged"; release_operation_lock; return 1; }
+  [[ "$answer" =~ ^[Yy]$ ]] || {
+    echo '已取消，本机未做任何改动。'
+    rm -rf -- "$staged"
+    unregister_temp_path "$staged" || true
+    release_operation_lock
+    return 0
+  }
+  iface="$(default_network_interface)" || { rm -rf -- "$staged"; release_operation_lock; die "无法识别默认网络接口"; }
+  [[ -n "$iface" ]] || { rm -rf -- "$staged"; release_operation_lock; die "无法识别默认网络接口"; }
+  work="$(mktemp -d /tmp/sb-user-manager.XXXXXX)" || { rm -rf -- "$staged"; release_operation_lock; return 1; }
+  register_temp_path "$work" || { rm -rf -- "$work" "$staged"; release_operation_lock; return 1; }
+  create_environment_backup || { rm -rf -- "$work" "$staged"; release_operation_lock; return 1; }
+  backup="$ENV_BACKUP"
+  systemctl is-enabled --quiet sing-box 2>/dev/null && singbox_was_enabled=true
+  rollback_switch() {
+    local rc="${1:-$?}"
+    trap - ERR
+    clear_signal_rollback
+    systemctl stop sb-user-expiry.timer mihomo nfuse 2>/dev/null || true
+    if ((switch_created_count > 0)); then
+      cleanup_deploy_created_paths "${switch_created[@]}"
+    fi
+    restore_failed_environment_change 切换内核 "$backup" "$work"
+    # 快照恢复只还原文件；sing-box 的开机启用状态与服务本身要显式拉回来。
+    if [[ "$singbox_was_enabled" == true ]]; then systemctl enable sing-box >/dev/null 2>&1 || true; fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl restart nfuse sing-box >/dev/null 2>&1 || true
+    systemctl start sb-user-expiry.timer >/dev/null 2>&1 || true
+    rm -rf -- "$staged"
+    release_operation_lock
+    return "$rc"
+  }
+  local path
+  while IFS= read -r path; do
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+      switch_created[switch_created_count]="$path"
+      ((switch_created_count+=1))
+    fi
+  done < <(deploy_tracked_paths)
+  if ! begin_environment_transaction "switch-kernel" "$backup" "${switch_created[@]}"; then
+    rm -rf -- "$work" "$staged"
+    release_operation_lock
+    return 1
+  fi
+  trap rollback_switch ERR
+  set_signal_rollback rollback_switch
+  # 目录先建：规则文件要落进规则目录，而它必须与单元里 SAFE_PATHS 的第二条一字不差。
+  run_step_or_rollback rollback_switch install -d -m 700 /etc/mihomo || return 1
+  run_step_or_rollback rollback_switch install -d -m 755 "$MIHOMO_WORK_DIR" || return 1
+  run_step_or_rollback rollback_switch install -d -m 755 "$MIHOMO_RULES_DIR" || return 1
+  # 规则集与状态改写要在**翻内核之前**做完：转换靠的是本机现有的 sing-box。
+  run_step_or_rollback rollback_switch apply_rule_set_migration "$plan" "$staged" || return 1
+  PROXY_KERNEL=mihomo
+  run_step_or_rollback rollback_switch write_manager_config || return 1
+  # download_binaries 依赖 fetch_latest_releases 填好的那几个变量；忘了它的后果
+  # 不是「下载失败」而是**未定义变量导致整个进程当场退出**，回滚都来不及跑，
+  # 机器停在半迁移状态上（真机演练撞到过，靠启动时的事务恢复才回去的）。
+  # 传 false：管理脚本自身不在这次切换的更新范围内。
+  run_step_or_rollback rollback_switch fetch_latest_releases false || return 1
+  run_step_or_rollback rollback_switch download_binaries "$work" || return 1
+  run_step_or_rollback rollback_switch write_base_config || return 1
+  run_step_or_rollback rollback_switch rebuild_protocol_inbounds ss2022 || return 1
+  run_step_or_rollback rollback_switch rebuild_protocol_inbounds anytls || return 1
+  run_step_or_rollback rollback_switch rebuild_all_split_configs || return 1
+  run_step_or_rollback rollback_switch write_systemd_units "$iface" || return 1
+  run_step_or_rollback rollback_switch kernel_check_default_install || return 1
+  run_step_or_rollback rollback_switch stop_singbox_for_switch || return 1
+  run_step_or_rollback rollback_switch activate_managed_services || return 1
+  run_step_or_rollback rollback_switch verify_kernel_switch || return 1
+  run_step_or_rollback rollback_switch complete_environment_change "$work" || return 1
+  rm -rf -- "$staged"
+  unregister_temp_path "$staged" || true
+  release_operation_lock
+  log "已切换到 mihomo；切换前的完整环境快照在 $backup"
+  cat <<'EOF'
+
+切换完成。请自己连一次确认客户端还能用——客户端配置不需要改。
+sing-box 已停用并取消开机启动，文件还在；确认无误之后可以在「部署与卸载」里清理它。
+EOF
+}
+
+# 停掉 sing-box 并取消开机启动。**不删文件**：项目所有者定的是「保留但停用」，
+# 出事时机器上还留着旧二进制与旧配置，排查便宜得多。
+stop_singbox_for_switch() {
+  systemctl disable --now sing-box >/dev/null 2>&1 || true
+  if systemctl is-active --quiet sing-box 2>/dev/null; then
+    echo '错误：sing-box 停不下来，切换不能继续。' >&2
+    return 1
+  fi
+}
+
+# 切换之后的自检。任一条不过都会触发整体回滚——一台切了一半的机器比没切更糟。
+verify_kernel_switch() {
+  local expected_ports listening port
+  kernel_service_is_active || { echo '错误：mihomo 没有起来。' >&2; return 1; }
+  systemctl is-active --quiet nfuse || { echo '错误：Nfuse 没有起来。' >&2; return 1; }
+  expected_ports="$(jq -r '[.users[]? | select(.status == "active") | .endpoints[]?.port] | unique | .[]' "$STATE_FILE")" || return 1
+  [[ -n "$expected_ports" ]] || return 0
+  listening="$(ss -lntup 2>/dev/null | awk '/mihomo/ {print $5}' | sed 's/.*://')" || return 1
+  while IFS= read -r port; do
+    [[ -n "$port" ]] || continue
+    grep -Fxq "$port" <<<"$listening" || {
+      printf '错误：切换后端口 %s 没有被 mihomo 监听。\n' "$port" >&2
+      return 1
+    }
+  done <<<"$expected_ports"
+}
+
+# sing-box 自己的东西，写死的字面量清单。展示、删除与删除后的复检共用这一份，
+# 三处各写一遍迟早只改一处。
+# **不包含管理器的数据目录**：它今天恰好也叫 /etc/sing-box，里面是用户资料、内部
+# 备份与 AnyTLS 证书，删掉就没了。这里只删那个目录里属于内核的配置文件。
+singbox_leftover_paths() {
+  printf '%s\n' \
+    /usr/local/bin/sing-box \
+    /etc/systemd/system/sing-box.service \
+    /etc/systemd/system/multi-user.target.wants/sing-box.service \
+    /var/lib/sing-box \
+    "$SINGBOX_CONFIG" \
+    "$SINGBOX_CHANNEL_STATE"
+}
+
+# 清理之后的复检：mihomo 还在跑，且清单上的东西确实都没了。
+verify_singbox_cleanup() {
+  local path
+  kernel_service_is_active || { echo '错误：清理之后 mihomo 不在运行。' >&2; return 1; }
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    if [[ -e "$path" || -L "$path" ]]; then
+      printf '错误：%s 仍然存在。\n' "$path" >&2
+      return 1
+    fi
+  done <<<"$(singbox_leftover_paths)"
+}
+
+# 切换完成、确认无误之后，把 sing-box 自己的东西清掉。
+# **单独一个动作而不是切换的一部分**：项目所有者定的是「保留但停用」，留着旧
+# 二进制与旧配置，出事时排查便宜得多；等你自己连过、确认没问题了再来清。
+#
+# 清单是写死的字面量，且**只包含 sing-box 自己的东西**。管理器的数据目录今天恰好
+# 也叫 /etc/sing-box（用户资料、内部备份、AnyTLS 证书都在里面），**绝不能删**——
+# 这里删的是那个目录里属于内核的那一个配置文件，以及内核的可执行文件、单元与
+# 工作目录。
+cleanup_singbox_leftovers() {
+  local answer backup work path
+  resolve_deployment_kernel || return 1
+  load_runtime_config || return 1
+  [[ "$PROXY_KERNEL" == mihomo ]] || {
+    echo '错误：本机的代理内核仍是 sing-box，不能清理它。' >&2
+    return 1
+  }
+  if systemctl is-active --quiet sing-box 2>/dev/null; then
+    echo '错误：sing-box 仍在运行，先确认本机已经切换完成。' >&2
+    return 1
+  fi
+  printf '\n将要删除的内容\n'
+  local found=false
+  while IFS= read -r path; do
+    if [[ -e "$path" || -L "$path" ]]; then printf '  %s\n' "$path"; found=true; fi
+  done <<<"$(singbox_leftover_paths)"
+  [[ "$found" == true ]] || { echo '  没有找到 sing-box 的残留文件，无需清理。'; return 0; }
+  printf '\n管理器自己的数据目录（%s）不会被动，用户资料、内部备份与证书都在里面。\n' "$MANAGER_DATA_DIR"
+  printf '删除之后**再也无法回到 sing-box**：换内核的退路本来就是从切换前的环境快照恢复，\n'
+  printf '而那份快照仍然有效——这里删掉的只是当前这台机器上的残留。\n'
+  read -r -p '确认删除？[y/N]：' answer || return 1
+  [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消。'; return 0; }
+  if ! acquire_operation_lock; then
+    log "错误：$OPERATION_LOCK_ERROR"
+    return 1
+  fi
+  work="$(mktemp -d /tmp/sb-user-manager.XXXXXX)" || { release_operation_lock; return 1; }
+  register_temp_path "$work" || { rm -rf -- "$work"; release_operation_lock; return 1; }
+  create_environment_backup || { rm -rf -- "$work"; release_operation_lock; return 1; }
+  backup="$ENV_BACKUP"
+  if ! begin_environment_transaction "cleanup-singbox" "$backup"; then
+    rm -rf -- "$work"
+    release_operation_lock
+    return 1
+  fi
+  rollback_cleanup() {
+    local rc="${1:-$?}"
+    trap - ERR
+    clear_signal_rollback
+    restore_failed_environment_change 清理 "$backup" "$work"
+    release_operation_lock
+    return "$rc"
+  }
+  trap rollback_cleanup ERR
+  set_signal_rollback rollback_cleanup
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    run_step_or_rollback rollback_cleanup rm -rf -- "$path" || return 1
+  done <<<"$(singbox_leftover_paths)"
+  run_step_or_rollback rollback_cleanup systemctl daemon-reload || return 1
+  run_step_or_rollback rollback_cleanup verify_singbox_cleanup || return 1
+  run_step_or_rollback rollback_cleanup complete_environment_change "$work" || return 1
+  release_operation_lock
+  log "sing-box 的残留已清理；清理前的完整环境快照在 $backup"
+}
+
 takeover_existing_environment() {
   local iface work normalized tmp nfuse_compatible=false path existing_singbox_bin
   local -a takeover_created=()

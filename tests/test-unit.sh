@@ -9657,4 +9657,138 @@ YAML
   fi
 )
 
+# ============================================================
+# 换内核：可以脱机断言的那几块（公开 Issue #203）
+# ============================================================
+# 整条流程要装二进制、写单元、停起服务，那部分只能真机演练。这一组盯的是流程
+# 里能脱机验的四块：要转哪些来源、状态怎么改写、前置检查拦不拦、切换后的自检
+# 与清理后的复检认不认账。
+(
+  sw="$work/switch-kernel"
+  mkdir -p "$sw/rules" "$sw/staged"
+  STATE_FILE="$sw/state.json"
+  MIHOMO_RULES_DIR="$sw/rules"
+  PROXY_KERNEL=singbox
+  SINGBOX_BIN="$sw/sing-box-stub"
+  SINGBOX_CONFIG="$sw/singbox-config.json"
+  SINGBOX_CHANNEL_STATE="$sw/singbox-channel.json"
+  printf '#!/bin/sh\nexit 0\n' > "$SINGBOX_BIN"
+  chmod +x "$SINGBOX_BIN"
+  printf '%s\n' '{
+    "schema_version":7,
+    "users":[{"name":"u1","status":"active","metered":false,
+              "endpoints":[{"protocol":"ss2022","transport":"direct","port":20001,
+                            "ss2022_password":"pw","method":"2022-blake3-aes-128-gcm"}]}],
+    "splits":[
+      {"name":"s1","url":"https://example.com/a.srs","scope":"all","status":"active",
+       "upstream":{"protocol":"shadowsocks","server":"up.example.com","server_port":8388,
+                   "method":"2022-blake3-aes-128-gcm","password":"pw"},
+       "outbound_tag":"s1-out","rule_set_tag":"s1-rule"},
+      {"name":"s2","url":"https://example.com/a.srs","scope":"all","status":"active",
+       "upstream":{"protocol":"shadowsocks","server":"up.example.com","server_port":8388,
+                   "method":"2022-blake3-aes-128-gcm","password":"pw"},
+       "outbound_tag":"s2-out","rule_set_tag":"s2-rule"}],
+    "outbound_presets":[],
+    "rule_presets":[{"name":"p1","url":"https://example.com/b.json"}]}' > "$STATE_FILE"
+
+  # 一、要转的来源：两条分流共用一个地址只算一次，预置里的那个也要算进来。
+  sources="$(singbox_rule_sources_in_state)"
+  expected_sources='https://example.com/a.srs
+https://example.com/b.json'
+  if [[ "$(printf '%s\n' "$sources" | LC_ALL=C sort)" != "$(printf '%s\n' "$expected_sources" | LC_ALL=C sort)" ]]; then
+    printf '要转换的来源不对：\n%s\n' "$sources" >&2
+    exit 1
+  fi
+
+  # 二、算计划：每个来源转出一个文件；任何一个转不了，整体就得失败。
+  fetch_json='{"version":1,"rules":[{"domain":["x.example.com"]}]}'
+  fetch_singbox_rule_set_json() { printf '%s\n' "$fetch_json" > "$2"; }
+  plan="$(plan_rule_set_migration "$sw/staged")" || { echo '计划应当能算出来' >&2; exit 1; }
+  if [[ "$(jq 'length' <<<"$plan")" != 2 ]]; then
+    printf '计划里应当有两个来源：%s\n' "$plan" >&2
+    exit 1
+  fi
+  while IFS= read -r staged_name; do
+    [[ -f "$sw/staged/$staged_name" ]] || { printf '计划里的文件没有落地：%s\n' "$staged_name" >&2; exit 1; }
+  done <<<"$(jq -r '.[]' <<<"$plan")"
+  # 对照：有一个来源取不到时必须整体失败，而不是少转一个继续往下走。
+  fetch_singbox_rule_set_json() {
+    [[ "$1" != https://example.com/b.json ]] || return 1
+    printf '%s\n' "$fetch_json" > "$2"
+  }
+  if plan_rule_set_migration "$sw/staged" >/dev/null 2>&1; then
+    echo '有来源取不到时，计划必须整体失败' >&2
+    exit 1
+  fi
+  fetch_singbox_rule_set_json() { printf '%s\n' "$fetch_json" > "$2"; }
+  plan="$(plan_rule_set_migration "$sw/staged")"
+
+  # 没有分流的机器是常态：计划必须是一个干干净净的空对象，不能是键为空串的假条目。
+  ( printf '%s\n' '{"schema_version":7,"users":[],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$sw/empty-state.json"
+    STATE_FILE="$sw/empty-state.json"
+    empty_plan="$(plan_rule_set_migration "$sw/staged")"
+    [[ "$empty_plan" == '{}' ]] || { printf '没有分流时计划应当是 {}，实际：%s\n' "$empty_plan" >&2; exit 1; }
+    apply_rule_set_migration "$empty_plan" "$sw/staged" || { echo '没有分流时状态改写也应当成功' >&2; exit 1; }
+  ) || exit 1
+
+  # 三、改写状态：url 换成 rule_file，写法一律 classical，url 必须消失。
+  apply_rule_set_migration "$plan" "$sw/staged" || { echo '状态改写应当成功' >&2; exit 1; }
+  if [[ "$(jq '[(.splits[], .rule_presets[]) | select(has("url"))] | length' "$STATE_FILE")" != 0 ]]; then
+    echo '改写之后状态里不得再有 url' >&2
+    exit 1
+  fi
+  if [[ "$(jq -r '[(.splits[], .rule_presets[]) | .rule_behavior] | unique | join(",")' "$STATE_FILE")" != classical ]]; then
+    echo '改写之后写法应当一律是 classical' >&2
+    exit 1
+  fi
+  if [[ "$(jq -r '.splits[0].rule_file' "$STATE_FILE")" != "$(jq -r '.splits[1].rule_file' "$STATE_FILE")" ]]; then
+    echo '同一个来源的两条分流应当指向同一个规则文件' >&2
+    exit 1
+  fi
+  while IFS= read -r installed; do
+    [[ -f "$MIHOMO_RULES_DIR/$installed" ]] || { printf '规则文件没有装进规则目录：%s\n' "$installed" >&2; exit 1; }
+  done <<<"$(jq -r '(.splits[], .rule_presets[]) | .rule_file' "$STATE_FILE")"
+
+  # 四、前置检查：已经是 mihomo 的机器、以及没有 sing-box 可执行文件时都要拒绝。
+  environment_is_deployed() { return 0; }
+  need_cmd() { return 0; }
+  if ( PROXY_KERNEL=mihomo; switch_kernel_preflight ) 2>/dev/null; then
+    echo '已经是 mihomo 的机器不该允许再切一次' >&2
+    exit 1
+  fi
+  if ( SINGBOX_BIN="$sw/missing"; switch_kernel_preflight ) 2>/dev/null; then
+    echo '没有 sing-box 可执行文件时必须拒绝：规则集就是靠它解出来的' >&2
+    exit 1
+  fi
+  switch_kernel_preflight || { echo '正常的 sing-box 机器应当可以切' >&2; exit 1; }
+
+  # 五、切换后的自检：状态里在用的端口必须真的被 mihomo 监听。
+  kernel_service_is_active() { return 0; }
+  systemctl() { [[ "${1:-}" != is-active ]] || return 0; return 0; }
+  ss() { printf '%s\n' 'tcp LISTEN 0 4096 *:20001 *:* users:(("mihomo",pid=1,fd=6))'; }
+  verify_kernel_switch || { echo '端口对得上时自检应当通过' >&2; exit 1; }
+  ss() { printf '%s\n' 'tcp LISTEN 0 4096 *:29999 *:* users:(("mihomo",pid=1,fd=6))'; }
+  if verify_kernel_switch 2>/dev/null; then
+    echo '端口没被监听时自检必须失败——一台切了一半的机器比没切更糟' >&2
+    exit 1
+  fi
+
+  # 六、清理 sing-box：清单是同一份，复检要盯住「真的没了」。
+  leftovers="$(singbox_leftover_paths)"
+  grep -Fxq /usr/local/bin/sing-box <<<"$leftovers" || { echo '清单里应当有 sing-box 可执行文件' >&2; exit 1; }
+  grep -Fxq "$SINGBOX_CONFIG" <<<"$leftovers" || { echo '清单里应当有 sing-box 的运行配置' >&2; exit 1; }
+  if grep -Fxq "$MANAGER_DATA_DIR" <<<"$leftovers"; then
+    echo '清单里绝不能有管理器的数据目录：用户资料、内部备份与证书都在里面' >&2
+    exit 1
+  fi
+  singbox_leftover_paths() { printf '%s\n' "$sw/leftover-a" "$sw/leftover-b"; }
+  : > "$sw/leftover-a"
+  if verify_singbox_cleanup 2>/dev/null; then
+    echo '还有残留时复检必须失败' >&2
+    exit 1
+  fi
+  rm -f "$sw/leftover-a"
+  verify_singbox_cleanup || { echo '残留清干净之后复检应当通过' >&2; exit 1; }
+)
+
 echo 'unit checks passed'

@@ -181,7 +181,9 @@ deployment_management_menu() {
     ui_menu_begin
     ui_header '部署与卸载' '安装、修复或移除运行环境'
     ui_menu_items \
-      install '安装或修复环境'
+      install '安装或修复环境' \
+      switch '切换到 mihomo 内核' \
+      cleanup '清理 sing-box 残留'
     printf '\n'
     ui_section '危险操作'
     printf '%s' "$UI_RED"
@@ -191,6 +193,8 @@ deployment_management_menu() {
     ui_menu_select || return 0
     case "$UI_MENU_ACTION" in
       install) install_environment; pause_menu;;
+      switch) switch_kernel_to_mihomo; pause_menu;;
+      cleanup) cleanup_singbox_leftovers; pause_menu;;
       uninstall)
         MENU_RETURNED=false
         uninstall_environment

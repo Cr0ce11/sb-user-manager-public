@@ -883,14 +883,17 @@ grep -Fq 'complete_environment_change()' sb-user-manager.sh
 # 这几个助手必须被复用而不是各写一份。调用点数量钉死，多出来一处通常意味着
 # 有人又抄了一遍实现；改动调用点时同步改这里的期望值，并想清楚新增的那一处
 # 为什么必须存在。
-# default_network_interface 的四处：全新部署、接管既有安装，以及服务单元漂移的
-# 检查与修复（公开 Issue #190）——后两处必须现场识别接口，不能读旧单元里的那个，
-# 那正是可能不对的东西。
-# activate_managed_services 的三处：部署、接管，以及重写单元之后的重新激活
-# ——不 daemon-reload 就等于「修了但没生效」。
-for shared_helper in default_network_interface:4 ensure_anytls_certificate:2 install_manager_binary:2 \
-  write_deployed_versions:2 activate_managed_services:3 restore_failed_environment_change:3 \
-  complete_environment_change:3; do
+# default_network_interface 的五处：全新部署、接管既有安装、服务单元漂移的检查与
+# 修复（公开 Issue #190），以及换内核（公开 Issue #203）——后三处必须现场识别接口，
+# 不能读旧单元里的那个，那正是可能不对的东西。
+# activate_managed_services 的四处：部署、接管、重写单元之后的重新激活（不
+# daemon-reload 就等于「修了但没生效」），以及换内核之后启用新内核的服务。
+# restore_failed_environment_change 与 complete_environment_change 的五处：部署、
+# 接管、卸载，加上换内核与清理 sing-box 残留——这两条也是改环境的动作，
+# 必须与前三条走同一套事务与回滚，而不是各写一份。
+for shared_helper in default_network_interface:5 ensure_anytls_certificate:2 install_manager_binary:2 \
+  write_deployed_versions:2 activate_managed_services:4 restore_failed_environment_change:5 \
+  complete_environment_change:5; do
   expected_calls="${shared_helper##*:}"
   shared_helper="${shared_helper%%:*}"
   shared_helper_calls="$(awk -v helper="$shared_helper" 'index($0, helper) && !index($0, helper "()") {count++} END {print count+0}' sb-user-manager.sh)"
@@ -909,7 +912,9 @@ grep -Fq 'run_managed_step()' sb-user-manager.sh
 grep -Fq 'begin_environment_transaction()' sb-user-manager.sh
 grep -Fq 'recover_environment_transaction()' sb-user-manager.sh
 grep -Fq 'acquire_operation_lock()' sb-user-manager.sh
-[[ "$(grep -Fc 'if ! acquire_operation_lock; then' sb-user-manager.sh)" == 4 ]]
+# 取锁的六处：部署、接管、卸载、迁移恢复，加上换内核与清理 sing-box 残留
+# （公开 Issue #203）——后两条同样是改环境的动作，不取锁就会与别的写入撞车。
+[[ "$(grep -Fc 'if ! acquire_operation_lock; then' sb-user-manager.sh)" == 6 ]]
 for serialized_recovery in recover_environment_transaction acquire_manager_handoff_lock; do
   if ! awk -v function_name="$serialized_recovery" '
       $0 == function_name "() {" {inside=1}
@@ -990,12 +995,15 @@ grep -Fq "trap 'handle_runtime_signal INT 130' INT" sb-user-manager.sh
 grep -Fq "trap 'handle_runtime_signal TERM 143' TERM" sb-user-manager.sh
 signal_rollback_count="$(grep -Ec '^[[:space:]]+set_signal_rollback rollback_' sb-user-manager.sh || true)"
 clear_rollback_count="$(grep -Ec '^[[:space:]]+clear_signal_rollback$' sb-user-manager.sh || true)"
-if [[ "$signal_rollback_count" != 7 ]]; then
-  echo "expected 7 signal rollback registrations, found $signal_rollback_count" >&2
+# 九处登记：部署、接管、卸载、迁移恢复、用户与分流的写入路径，加上换内核与
+# 清理 sing-box 残留（公开 Issue #203）。收到 INT/TERM 时没登记回滚的那条路，
+# 会把机器停在改了一半的状态上。
+if [[ "$signal_rollback_count" != 9 ]]; then
+  echo "expected 9 signal rollback registrations, found $signal_rollback_count" >&2
   exit 1
 fi
-if [[ "$clear_rollback_count" != 12 ]]; then
-  echo "expected 12 signal rollback clears, found $clear_rollback_count" >&2
+if [[ "$clear_rollback_count" != 14 ]]; then
+  echo "expected 14 signal rollback clears, found $clear_rollback_count" >&2
   exit 1
 fi
 grep -Fq 'set_signal_rollback rollback_manager_handoff' sb-user-manager.sh
