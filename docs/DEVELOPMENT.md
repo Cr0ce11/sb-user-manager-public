@@ -23,10 +23,23 @@
 
 ## 本地发布门禁
 
-从仓库根目录运行：
+**门禁的权威运行环境是 Linux 上的 Bash 5，不是开发机。** 测试大量使用裸
+`[[ ... ]]` 作为断言，靠 Bash 因它求值为假而中止脚本来变红；开发机 macOS 自带的
+Bash 3.2 不会中止，那里这类断言全部空转，门禁照常打印通过（[公开 Issue #167](https://github.com/Cr0ce11/sb-user-manager-public/issues/167)）。
+每个门禁脚本开头都 source `tests/require-strict-errexit.sh`，当场探一次当前解释器
+是否具备该行为，不具备就拒绝运行并提示改到门禁机——不会再跑出一个不可信的绿。
+
+开发机上的门禁机是 OrbStack 的 `sbm-gate`（Debian 12，Bash 5.2），仓库通过
+`/Users/...` 直接可见。从仓库根目录运行：
 
 ```bash
-bash -n sb-user-manager.sh tests/acceptance.sh tests/check-managed-step-errexit.sh tests/check-bare-negation.sh tests/test-acceptance.sh tests/test-standalone-startup.sh tests/test-manager-handoff.sh tools/build-manager.sh tools/audit-public-readiness.sh tools/export-public-snapshot.sh tools/check-immutable-release-setting.sh tests/test-build.sh tests/test-public.sh tests/test-public-readiness.sh tests/test-public-snapshot.sh tests/test-release-workflow.sh
+orb -m sbm-gate bash tests/test-static.sh
+```
+
+完整门禁清单（逐条在门禁机上运行）：
+
+```bash
+bash -n sb-user-manager.sh tests/acceptance.sh tests/require-strict-errexit.sh tests/check-managed-step-errexit.sh tests/check-bare-negation.sh tests/test-acceptance.sh tests/test-standalone-startup.sh tests/test-manager-handoff.sh tools/build-manager.sh tools/audit-public-readiness.sh tools/export-public-snapshot.sh tools/check-immutable-release-setting.sh tests/test-build.sh tests/test-public.sh tests/test-public-readiness.sh tests/test-public-snapshot.sh tests/test-release-workflow.sh
 bash tools/build-manager.sh --check
 bash tests/test-build.sh
 bash tests/test-static.sh
@@ -44,7 +57,8 @@ bash tests/test-release-workflow.sh
 
 GitHub 分支保护要求 `validate`、`jq16-compat` 和 `debian-standalone-e2e`。Debian 检查只运行固定 Debian 12 容器中的 standalone 启动、旧私有版接管和公开就绪验证，不申请 `NET_ADMIN`、创建 SSH 账户或运行任何已退役的 v5 落地测试。
 
-安装了 ShellCheck 时还应运行 CI 中的对应检查。测试失败时不得通过修改测试期望来掩盖行为回归。
+门禁机没有装 ShellCheck，上面这份清单里不含它；跑完门禁后要在开发机补跑 CI 中的
+两条 ShellCheck 检查。测试失败时不得通过修改测试期望来掩盖行为回归。
 
 ## 代码约定门禁
 
@@ -73,6 +87,11 @@ GitHub 分支保护要求 `validate`、`jq16-compat` 和 `debian-standalone-e2e`
   sing-box 自己的 `config.json` 不受这条约束——那是内核的文件，不是管理器的。
 - 适配层（`src/05-kernel.sh`）里提到某个内核的函数必须同时提到另一个内核；
   尚未实现的操作也要写出该内核的分支并在其中明确报错，不得回落到另一个内核。
+- 门禁测试脚本（`tests/test-*.sh`）必须在 `set -Eeuo pipefail` 之后立刻
+  source `tests/require-strict-errexit.sh`。裸 `[[ ]]` 断言只在会因它中止的
+  Bash 上才有效，漏掉这一行的脚本在开发机上会跑出不可信的通过。
+  `tests/acceptance.sh` 不在此列：它在 Debian 测试机上运行、可能被单独复制过去，
+  不应依赖同目录下的另一个文件。
 - 可选文本字段（`outbound_preset`、`rule_preset` 以及三个 `runtime_*_tag`）
   在本项目里「空字符串」和「字段不存在」是同一个意思，判空一律写
   `(.field // "") == ""`。`(.field // null)` 对空字符串求值仍是空字符串，

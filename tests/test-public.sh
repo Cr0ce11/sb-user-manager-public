@@ -2,6 +2,8 @@
 # 每组 source 都必须在独立子进程中运行，环境修改不应跨用例保留。
 # shellcheck disable=SC2030,SC2031
 set -Eeuo pipefail
+# shellcheck source=./require-strict-errexit.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/require-strict-errexit.sh"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/sb-public-test.XXXXXX")"
