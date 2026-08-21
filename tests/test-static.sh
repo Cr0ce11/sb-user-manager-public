@@ -777,7 +777,7 @@ grep -Fq 'split_preset_fields_are_current()' sb-user-manager.sh
 grep -Fq 'state_normalize_split_preset_fields()' sb-user-manager.sh
 grep -Fq 'migrate_empty_split_preset_fields()' sb-user-manager.sh
 [[ "$(grep -Fc 'migrate_empty_split_preset_fields' sb-user-manager.sh)" == 2 ]]
-grep -Fq 'if ! cmd_split_add "$name" "$source" "$scope" "$user" "$upstream" "$outbound_tag" "$rule_preset" "$outbound_preset" "$behavior"; then' sb-user-manager.sh
+grep -Fq 'if ! cmd_split_add "$name" "$source" "$scope" "$user" "$upstream" "$outbound_tag" "$rule_preset" "$outbound_preset" "$behavior" "$rule_url"; then' sb-user-manager.sh
 grep -Fq '分流没有添加，现有配置没有改变。' sb-user-manager.sh
 grep -Fq 'SHARED_PRESET_RUNTIME_MARKER=' sb-user-manager.sh
 grep -Fq '同一用户不能让同一条预置规则同时使用两个不同出口' sb-user-manager.sh

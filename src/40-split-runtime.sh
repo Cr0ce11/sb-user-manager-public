@@ -135,6 +135,94 @@ mihomo_rule_file_mismatch() {
   ' "$file"
 }
 
+# ============================================================
+# 远程规则集（公开 Issue #218）
+# ============================================================
+# mihomo 原生支持 `type:http` 的规则集：启动时自己下载、按 interval 自己更新，
+# 不用管理器造更新机制。实测（v1.19.30）确认了这三件事：会下载并写到 path、
+# 到点会自己重新拉、取不到但本地有缓存时会用旧的。
+#
+# **但取不到且没有缓存时它只留一行警告，服务照常起来，那条分流静静地完全不生效。**
+# 这与本机文件被删掉是同一类失效（公开 Issue #186）。内核不报，只能管理器来报——
+# 因此保存那一刻由管理器自己先下载一次、校验一遍，并把内容落成初始缓存。
+REMOTE_RULE_SET_UPDATE_INTERVAL=86400
+
+# 远程规则集在本机的文件名：**原样取地址里的那个文件名**，不做改写。
+# 项目所有者的要求是「保持原有命名以方便识别」，因此这里宁可拒绝也不悄悄改名。
+remote_rule_set_file_name() {
+  local url="$1" name
+  name="${url##*/}"
+  name="${name%%\?*}"
+  name="${name%%#*}"
+  printf '%s' "$name"
+}
+
+# 远程规则集地址的写法校验。只看写法，不下载。
+# 只接受 yaml：mihomo 还认 text 与 mrs 两种格式，本片不做——与 sing-box 侧只接受
+# .srs／.json 是同一个思路，多一种格式就多一套校验与一种说不清的失败。
+validate_remote_rule_set_url() {
+  local url="$1" name
+  [[ "$url" == https://* ]] || die "规则集地址必须使用 HTTPS：$url"
+  [[ "$url" =~ \.(yaml|yml)$ ]] ||
+    die "规则集地址必须指向 .yaml 或 .yml 文件（本项目只支持 yaml 格式的远程规则集）：$url"
+  name="$(remote_rule_set_file_name "$url")"
+  [[ -n "$name" ]] || die "从地址里看不出文件名：$url"
+  validate_mihomo_rule_file_name "$name"
+}
+
+# 下载远程规则集并校验内容，成功后写到 $2。
+# 五件要挡住的事在这里挡掉四件（地址写法在上面那个函数）：指向内网、取不到、
+# 内容不是规则集、写法与所选 behavior 对不上。失败时**不写出文件**。
+download_remote_rule_set() {
+  local url="$1" output="$2" behavior="$3" tmp mismatch
+  validate_public_rule_set_url "$url" ||
+    die "规则集地址必须解析到公网，不能指向本机或内网：$url"
+  tmp="$(mktemp /tmp/sb-remote-rule.XXXXXX)" || return 1
+  register_temp_path "$tmp" || { rm -f -- "$tmp"; return 1; }
+  # 不跟随跳转、限时限量：规则集是使用者贴进来的地址，按不可信输入对待。
+  if ! curl --proto '=https' --proto-redir '=https' --fail --max-redirs 0 \
+    --silent --show-error --connect-timeout 10 --max-time 60 \
+    --max-filesize 10485760 --output "$tmp" "$url"; then
+    rm -f -- "$tmp"
+    unregister_temp_path "$tmp" || true
+    printf '错误：取不到规则集：%s\n' "$url" >&2
+    return 1
+  fi
+  mismatch="$(mihomo_rule_file_mismatch "$tmp" "$behavior")" || {
+    rm -f -- "$tmp"
+    unregister_temp_path "$tmp" || true
+    return 1
+  }
+  if [[ -n "$mismatch" ]]; then
+    rm -f -- "$tmp"
+    unregister_temp_path "$tmp" || true
+    printf '错误：规则集的内容与所选写法对不上：%s\n' "$mismatch" >&2
+    printf '选错写法时 mihomo 不会报错，规则会静静地不生效，因此这里必须拒绝。\n' >&2
+    return 1
+  fi
+  install -m 644 "$tmp" "$output" || {
+    rm -f -- "$tmp"
+    unregister_temp_path "$tmp" || true
+    return 1
+  }
+  rm -f -- "$tmp"
+  unregister_temp_path "$tmp" || true
+}
+
+# 这个文件名有没有被**另一个地址**占用。同一个地址被多条分流共用不算冲突。
+remote_rule_set_name_conflict() {
+  local name="$1" url="$2"
+  jq -r --arg name "$name" --arg url "$url" '
+    [(.splits[]?, .rule_presets[]?) |
+      select((.rule_file // "") == $name and (.rule_url // "") != $url) |
+      (.name // "")] | first // empty' "$STATE_FILE"
+}
+
+# 一条分流／预置的远程地址；本机文件来源时为空。
+split_rule_url_from_json() {
+  jq -r '(.rule_url // "")' <<<"$1"
+}
+
 # mihomo 部署下的规则集来源：使用者自己放在规则目录里的一个块状 yaml 文件。
 # 管理器只读它，永远不改它的内容（公开 Issue #157 的决定）。
 validate_mihomo_rule_set() {
@@ -306,7 +394,21 @@ validate_split_rule_source_format() {
 # sing-box 是公网 HTTPS 上的 .srs / .json，由 sing-box 自己下载并检查；
 # mihomo 是本机上一个块状 yaml 文件，由管理器检查存在性与写法。
 validate_split_rule_source() {
-  local source="$1" behavior="${2:-}"
+  local source="$1" behavior="${2:-}" rule_url="${3:-}" conflict
+  # 远程来源（公开 Issue #218）：先看写法与重名，再**真的下载一次**并核对内容。
+  # mihomo 取不到远程规则集时只留一行警告、服务照常起来，那条分流静静地不生效；
+  # 因此这一关必须在保存之前由管理器自己过一遍，并把这次下载的内容落成初始缓存。
+  if [[ -n "$rule_url" ]]; then
+    [[ "$PROXY_KERNEL" == mihomo ]] || die "远程规则集只支持 mihomo 部署"
+    validate_remote_rule_set_url "$rule_url"
+    [[ "$source" == "$(remote_rule_set_file_name "$rule_url")" ]] ||
+      die "规则文件名必须与地址里的文件名一致：$source"
+    conflict="$(remote_rule_set_name_conflict "$source" "$rule_url")" || return 1
+    [[ -z "$conflict" ]] ||
+      die "规则文件名 ${source} 已经被「${conflict}」用在另一个地址上；请换一个来源，或先处理那一条"
+    download_remote_rule_set "$rule_url" "$(mihomo_rule_file_path "$source")" "$behavior" || return 1
+    return 0
+  fi
   case "$PROXY_KERNEL" in
     singbox)
       validate_public_rule_set_url "$source" ||
@@ -751,7 +853,7 @@ split_user_inbound_tags() {
 # 出口条目与规则集条目本身已经是内核形状（由适配层生成），计划只负责摆放；
 # 最后一步的渲染同样在适配层——sing-box 的路由是对象数组，mihomo 是字符串数组。
 build_split_runtime_plan() {
-  local split_rows split plan name source behavior scope user user_status upstream out_tag rule_tag transport_tag outbounds rule_set inbounds conflict rule_file_path
+  local split_rows split plan name source behavior scope user user_status upstream out_tag rule_tag transport_tag outbounds rule_set inbounds conflict rule_file_path rule_url
   split_rows="$(jq -c '.splits[] | select(.status == "active")' "$STATE_FILE")" || return 1
   plan='{"outbound_groups":[],"rule_sets":[],"routes":[]}'
   while IFS= read -r split; do
@@ -759,6 +861,7 @@ build_split_runtime_plan() {
     name="$(jq -er '.name | select(type == "string" and length > 0)' <<<"$split")" || return 1
     source="$(jq -er '(.url // .rule_file) | select(type == "string" and length > 0)' <<<"$split")" || return 1
     behavior="$(split_rule_behavior_from_json "$split")" || return 1
+    rule_url="$(split_rule_url_from_json "$split")" || return 1
     scope="$(jq -er '.scope | select(. == "all" or . == "user")' <<<"$split")" || return 1
     user="$(jq -er '.user // ""' <<<"$split")" || return 1
     if [[ "$scope" == user ]]; then
@@ -779,7 +882,9 @@ build_split_runtime_plan() {
     # 起得来，只在启动日志里留一行 error，而那条分流从此静静地不生效
     # ——本该走上游的流量会改走直连。因此每次重建都真的看一眼。
     # 计划在任何配置改动之前完整生成，这里失败不会留下改了一半的运行配置。
-    if [[ "$PROXY_KERNEL" == mihomo ]]; then
+    # 远程来源不查这一条：本地那个文件是 mihomo 自己的缓存，删了它会重新下载。
+    # 该挡的是「地址取不到」，那在保存与「立即更新」时由管理器自己下载来挡。
+    if [[ "$PROXY_KERNEL" == mihomo && -z "$rule_url" ]]; then
       rule_file_path="$(mihomo_rule_file_path "$source")"
       if [[ ! -f "$rule_file_path" || -L "$rule_file_path" ]]; then
         printf '错误：分流 %s 的规则文件不存在或不是普通文件：%s\n' "$name" "$rule_file_path" >&2
@@ -787,7 +892,7 @@ build_split_runtime_plan() {
         return 1
       fi
     fi
-    rule_set="$(kernel_split_rule_set_entry "$rule_tag" "$source" "$behavior")" || return 1
+    rule_set="$(kernel_split_rule_set_entry "$rule_tag" "$source" "$behavior" "$rule_url")" || return 1
     if jq -e --arg tag "$out_tag" 'any(.outbound_groups[]; .tag == $tag)' <<<"$plan" >/dev/null; then
       if ! SB_JQ_OUTBOUNDS="$outbounds" jq -e --arg tag "$out_tag" \
         '($ENV.SB_JQ_OUTBOUNDS | fromjson) as $objects | any(.outbound_groups[]; .tag == $tag and .objects == $objects)' <<<"$plan" >/dev/null; then
@@ -1086,12 +1191,13 @@ state_add_split() {
       rule_preset:$rule_preset,outbound_preset:$outbound_preset,status:"active",created_at:$created_at}
       | .[$source_key] = $source
       | (if $behavior == "" then . else .rule_behavior = $behavior end)
+      | (if $rule_url == "" then . else .rule_url = $rule_url end)
       | (if $rule_preset == "" then del(.rule_preset) else . end)
       | (if $outbound_preset == "" then del(.outbound_preset) else . end)]
   ' --arg name "$1" --arg source "$2" --arg scope "$3" --arg user "$4" \
     --arg out_tag "$6" --arg rule_tag "$7" --arg rule_preset "$8" --arg outbound_preset "$9" \
     --arg runtime_rule_tag "${10}" --arg runtime_outbound_tag "${11}" --arg runtime_transport_tag "${12}" \
-    --arg behavior "${13:-}" --arg source_key "$source_key" \
+    --arg behavior "${13:-}" --arg rule_url "${14:-}" --arg source_key "$source_key" \
     --arg created_at "$(date -Iseconds)"
 }
 
@@ -1112,12 +1218,13 @@ state_replace_split() {
         updated_at:$updated_at}
        | .[$source_key] = $source
        | (if $behavior == "" then . else .rule_behavior = $behavior end)
+       | (if $rule_url == "" then del(.rule_url) else .rule_url = $rule_url end)
        | (if $rule_preset == "" then del(.rule_preset) else .rule_preset = $rule_preset end)
        | (if $outbound_preset == "" then del(.outbound_preset) else .outbound_preset = $outbound_preset end))
   ' --arg name "$1" --arg source "$2" --arg scope "$3" --arg user "$4" \
     --arg out_tag "$6" --arg rule_preset "$7" --arg outbound_preset "$8" \
     --arg runtime_rule_tag "$9" --arg runtime_outbound_tag "${10}" --arg runtime_transport_tag "${11}" \
-    --arg behavior "${12:-}" --arg source_key "$source_key" \
+    --arg behavior "${12:-}" --arg rule_url "${13:-}" --arg source_key "$source_key" \
     --arg updated_at "$(date -Iseconds)"
 }
 
@@ -1229,8 +1336,9 @@ state_add_rule_preset() {
   atomic_state_update '
     .rule_presets += [{name:$name,created_at:$created_at}
       | .[$source_key] = $source
-      | (if $behavior == "" then . else .rule_behavior = $behavior end)]
-  ' --arg name "$1" --arg source "$2" --arg behavior "${3:-}" \
+      | (if $behavior == "" then . else .rule_behavior = $behavior end)
+      | (if $rule_url == "" then . else .rule_url = $rule_url end)]
+  ' --arg name "$1" --arg source "$2" --arg behavior "${3:-}" --arg rule_url "${4:-}" \
     --arg source_key "$source_key" --arg created_at "$(date -Iseconds)"
 }
 
@@ -1239,14 +1347,15 @@ state_replace_rule_preset() {
   source_key="$(kernel_rule_source_key)" || return 1
   atomic_state_update '
     def apply_source: .[$source_key] = $source |
-      (if $behavior == "" then . else .rule_behavior = $behavior end);
+      (if $behavior == "" then . else .rule_behavior = $behavior end) |
+      (if $rule_url == "" then del(.rule_url) else .rule_url = $rule_url end);
     (.rule_presets[] | select(.name == $name)) |= ((. + {updated_at:$updated_at}) | apply_source) |
     .splits |= map(
       if (.rule_preset // "") == $name then
         ((. + {updated_at:$updated_at}) | apply_source)
       else . end
     )
-  ' --arg name "$1" --arg source "$2" --arg behavior "${3:-}" \
+  ' --arg name "$1" --arg source "$2" --arg behavior "${3:-}" --arg rule_url "${4:-}" \
     --arg source_key "$source_key" --arg updated_at "$(date -Iseconds)"
 }
 
@@ -1323,27 +1432,27 @@ cmd_outbound_preset_remove() {
 }
 
 cmd_rule_preset_add() {
-  local name="$1" source="$2" behavior="${3:-}"
+  local name="$1" source="$2" behavior="${3:-}" rule_url="${4:-}"
   validate_preset_name "$name"
   rule_preset_exists "$name" && die "同名预置规则已经存在"
-  validate_split_rule_source_format "$source"
-  validate_split_rule_source "$source" "$behavior"
-  state_add_rule_preset "$name" "$source" "$behavior" || return 1
+  [[ -n "$rule_url" ]] || validate_split_rule_source_format "$source"
+  validate_split_rule_source "$source" "$behavior" "$rule_url"
+  state_add_rule_preset "$name" "$source" "$behavior" "$rule_url" || return 1
   log "预置规则已保存：${name}；它不会改变当前分流"
 }
 
 cmd_rule_preset_edit() {
-  local name="$1" source="$2" behavior="${3:-}" active
+  local name="$1" source="$2" behavior="${3:-}" rule_url="${4:-}" active
   rule_preset_exists "$name" || die "预置规则不存在：$name"
-  validate_split_rule_source_format "$source"
-  validate_split_rule_source "$source" "$behavior"
+  [[ -n "$rule_url" ]] || validate_split_rule_source_format "$source"
+  validate_split_rule_source "$source" "$behavior" "$rule_url"
   active="$(jq --arg name "$name" '[.splits[] | select((.rule_preset // "") == $name and .status == "active")] | length' "$STATE_FILE")" || return 1
   if ((active == 0)); then
-    state_replace_rule_preset "$name" "$source" "$behavior" || return 1
+    state_replace_rule_preset "$name" "$source" "$behavior" "$rule_url" || return 1
   else
     ensure_safe_ssh_for_kernel_restart || return 0
     start_managed_operation "edit-rule-preset:$name" || return 1
-    run_managed_step state_replace_rule_preset "$name" "$source" "$behavior" || return 1
+    run_managed_step state_replace_rule_preset "$name" "$source" "$behavior" "$rule_url" || return 1
     rebuild_and_finish_split_operation || return 1
   fi
   log "预置规则已更新：${name}；关联分流已经同步"
@@ -1526,7 +1635,7 @@ runtime_outbound_tag_owned_by_state() {
 }
 
 cmd_split_add() {
-  local name="$1" source="$2" scope="$3" user="$4" upstream="$5" out_tag="$6" rule_preset="${7:-}" outbound_preset="${8:-}" behavior="${9:-}" rule_tag="$1"
+  local name="$1" source="$2" scope="$3" user="$4" upstream="$5" out_tag="$6" rule_preset="${7:-}" outbound_preset="${8:-}" behavior="${9:-}" rule_url="${10:-}" rule_tag="$1"
   local runtime_rule_tag runtime_outbound_tag runtime_transport_tag kernel_name
   kernel_name="$(kernel_display_name)" || return 1
   validate_split_name "$name"; split_exists "$name" && die "分流规则已存在：$name"
@@ -1552,11 +1661,11 @@ cmd_split_add() {
     die "这个预置出口与现有 ${kernel_name} 配置重名，请更换预置名称"
   fi
   validate_split_relationships "$name" "$runtime_rule_tag" "$runtime_outbound_tag" "$scope" "$user" false || return 1
-  validate_split_rule_source "$source" "$behavior"
+  validate_split_rule_source "$source" "$behavior" "$rule_url"
   ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "add-split:$name" || return 1
   run_managed_step state_add_split "$name" "$source" "$scope" "$user" "$upstream" "$out_tag" "$rule_tag" "$rule_preset" "$outbound_preset" \
-    "$runtime_rule_tag" "$runtime_outbound_tag" "$runtime_transport_tag" "$behavior" || return 1
+    "$runtime_rule_tag" "$runtime_outbound_tag" "$runtime_transport_tag" "$behavior" "$rule_url" || return 1
   rebuild_and_finish_split_operation || return 1
   log "分流增加成功：$name"
 }
@@ -1606,7 +1715,7 @@ cmd_split_remove() {
 }
 
 cmd_split_edit() {
-  local name="$1" source="$2" scope="$3" user="$4" upstream="$5" out_tag="$6" rule_preset="${7:-}" outbound_preset="${8:-}" behavior="${9:-}" split old_out
+  local name="$1" source="$2" scope="$3" user="$4" upstream="$5" out_tag="$6" rule_preset="${7:-}" outbound_preset="${8:-}" behavior="${9:-}" rule_url="${10:-}" split old_out
   local runtime_rule_tag runtime_outbound_tag runtime_transport_tag
   split_exists "$name" || die "分流不存在：$name"
   [[ -z "$rule_preset" ]] || rule_preset_exists "$rule_preset" || die "预置规则不存在：$rule_preset"
@@ -1633,12 +1742,12 @@ cmd_split_edit() {
     runtime_config_has_outbound "$out_tag" && die "$(kernel_display_name) 已存在同名出站"
   fi
   validate_split_relationships "$name" "$runtime_rule_tag" "$runtime_outbound_tag" "$scope" "$user" false || return 1
-  validate_split_rule_source "$source" "$behavior"
+  validate_split_rule_source "$source" "$behavior" "$rule_url"
   ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "edit-split:$name" || return 1
   run_managed_step remove_split_config "$name" || return 1
   run_managed_step state_replace_split "$name" "$source" "$scope" "$user" "$upstream" "$out_tag" "$rule_preset" "$outbound_preset" \
-    "$runtime_rule_tag" "$runtime_outbound_tag" "$runtime_transport_tag" "$behavior" || return 1
+    "$runtime_rule_tag" "$runtime_outbound_tag" "$runtime_transport_tag" "$behavior" "$rule_url" || return 1
   rebuild_and_finish_split_operation || return 1
   log "分流修改成功：$name"
 }

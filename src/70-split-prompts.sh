@@ -225,6 +225,9 @@ prompt_select_rule_preset() {
   # 文件剩下的部分从此不再受检（公开 Issue #102）。
   SELECTED_RULE_SOURCE="$(jq -r --argjson idx "$SELECTED_INDEX" '.[$idx] | (.url // .rule_file // "")' <<<"$rows")"
   SELECTED_RULE_BEHAVIOR="$(jq -r --argjson idx "$SELECTED_INDEX" '.[$idx] | (.rule_behavior // "")' <<<"$rows")"
+  # 预置若是远程来源，选中它的分流要继承那个地址，否则分流会退化成「指向同名
+  # 本机文件」——文件确实在（预置下载过），但从此不再自动更新。
+  SELECTED_RULE_URL="$(jq -r --argjson idx "$SELECTED_INDEX" '.[$idx] | (.rule_url // "")' <<<"$rows")"
 }
 
 prompt_preset_name() {
@@ -351,6 +354,48 @@ prompt_mihomo_rule_behavior() {
   esac
 }
 
+# 规则集从哪里来（公开 Issue #218）。两种来源并存：
+# **网址**——mihomo 自己下载、每天自己更新，使用者什么都不用维护；
+# **本机文件**——使用者自己往规则目录里放一份，适合手工维护的清单。
+prompt_mihomo_rule_kind() {
+  SELECTED_RULE_KIND=''
+  echo
+  echo '规则集从哪里来？'
+  echo '  1. 网址（自动下载，每天自动更新，推荐）'
+  printf '  2. 本机文件（自己放在 %s 下，自己维护）\n' "$MIHOMO_RULES_DIR"
+  echo '  0. 返回上一级'
+  read_menu_choice '请选择：' '0,1,2' 1 '请输入 1、2 或 0' || return 1
+  case "$PROMPT_VALUE" in
+    1) SELECTED_RULE_KIND=remote ;;
+    2) SELECTED_RULE_KIND=local ;;
+    0) return 1 ;;
+  esac
+}
+
+# 远程规则集的地址。只接受 yaml，且**文件名原样保留**——保存下来的本机文件就叫
+# 地址里那个名字，方便使用者自己认出它是哪来的（项目所有者的要求）。
+prompt_mihomo_remote_rule_url() {
+  local url name
+  SELECTED_RULE_URL=''
+  echo
+  echo '规则集的网址要满足三条：HTTPS、指向 .yaml 或 .yml、内容是 mihomo 的规则清单。'
+  echo '保存下来的文件会沿用网址里的文件名，放进规则目录，之后由 mihomo 每天自动更新。'
+  while true; do
+    read -r -p '规则集网址（输入 0 返回）：' url || return 1
+    [[ "$url" != 0 ]] || return 1
+    [[ "$url" == https://* ]] || { echo '输入无效：必须使用 HTTPS，请重新输入。'; continue; }
+    [[ "$url" =~ \.(yaml|yml)$ ]] || { echo '输入无效：地址要指向 .yaml 或 .yml 文件，请重新输入。'; continue; }
+    name="$(remote_rule_set_file_name "$url")"
+    if ! validate_without_exit validate_mihomo_rule_file_name "$name"; then
+      printf '输入无效：%s，请换一个地址。\n' "$VALIDATION_ERROR"
+      continue
+    fi
+    break
+  done
+  SELECTED_RULE_URL="$url"
+  printf '保存后的规则文件：%s\n' "$(mihomo_rule_file_path "$name")"
+}
+
 # 规则来源的输入。sing-box 要一个公网 HTTPS 地址，mihomo 要本机的一个文件
 # 加上它的写法——两个内核的规则集格式不通用，界面上也就没有共同的问法。
 # 第一个参数是当前取值：修改时留空表示保持不变，新增时不传。
@@ -358,6 +403,7 @@ prompt_split_rule_source() {
   local current="${1:-}" source answer
   SELECTED_RULE_SOURCE=''
   SELECTED_RULE_BEHAVIOR=''
+  SELECTED_RULE_URL=''
   case "$PROXY_KERNEL" in
     singbox)
       while true; do
@@ -377,9 +423,19 @@ prompt_split_rule_source() {
       SELECTED_RULE_SOURCE="$source"
       ;;
     mihomo)
-      prompt_mihomo_rule_file || return 1
-      prompt_mihomo_rule_behavior || return 1
-      SELECTED_RULE_SOURCE="$SELECTED_RULE_FILE"
+      prompt_mihomo_rule_kind || return 1
+      case "$SELECTED_RULE_KIND" in
+        remote)
+          prompt_mihomo_remote_rule_url || return 1
+          prompt_mihomo_rule_behavior || return 1
+          SELECTED_RULE_SOURCE="$(remote_rule_set_file_name "${SELECTED_RULE_URL:-}")"
+          ;;
+        *)
+          prompt_mihomo_rule_file || return 1
+          prompt_mihomo_rule_behavior || return 1
+          SELECTED_RULE_SOURCE="$SELECTED_RULE_FILE"
+          ;;
+      esac
       ;;
     *) kernel_unknown; return 1 ;;
   esac
@@ -393,14 +449,14 @@ prompt_add_rule_preset() {
   printf '说明：保存预置不会修改 %s，也不会影响现有分流。\n' "$(kernel_display_name)"
   read -r -p '确认检查并保存？[y/N]：' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消保存。'; return 0; }
-  cmd_rule_preset_add "$PRESET_NAME" "$SELECTED_RULE_SOURCE" "$SELECTED_RULE_BEHAVIOR"
+  cmd_rule_preset_add "$PRESET_NAME" "$SELECTED_RULE_SOURCE" "$SELECTED_RULE_BEHAVIOR" "${SELECTED_RULE_URL:-}"
 }
 
 prompt_edit_rule_preset() {
-  local name source behavior total active answer
+  local name source behavior total active answer rule_url
   prepare_core
   prompt_select_rule_preset '修改预置规则' || { MENU_RETURNED=true; return 0; }
-  name="$SELECTED_RULE_PRESET"; source="$SELECTED_RULE_SOURCE"; behavior="$SELECTED_RULE_BEHAVIOR"
+  name="$SELECTED_RULE_PRESET"; source="$SELECTED_RULE_SOURCE"; behavior="$SELECTED_RULE_BEHAVIOR"; rule_url="${SELECTED_RULE_URL:-}"
   total="$(jq --arg name "$name" '[.splits[] | select((.rule_preset // "") == $name)] | length' "$STATE_FILE")"
   active="$(jq --arg name "$name" '[.splits[] | select((.rule_preset // "") == $name and .status == "active")] | length' "$STATE_FILE")"
   printf '\n关联分流：%s 条，其中启用 %s 条。\n' "$total" "$active"
@@ -409,7 +465,7 @@ prompt_edit_rule_preset() {
   if ((active > 0)); then printf '保存后会同步更新所有关联分流，并只重启一次 %s。\n' "$(kernel_display_name)"; else echo '保存后会同步更新关联记录；当前没有启用中的关联分流，不会重启服务。'; fi
   read -r -p '确认检查并保存？[y/N]：' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消修改。'; return 0; }
-  cmd_rule_preset_edit "$name" "$SELECTED_RULE_SOURCE" "$SELECTED_RULE_BEHAVIOR"
+  cmd_rule_preset_edit "$name" "$SELECTED_RULE_SOURCE" "$SELECTED_RULE_BEHAVIOR" "${SELECTED_RULE_URL:-}"
 }
 
 prompt_remove_rule_preset() {
@@ -427,7 +483,7 @@ prompt_remove_rule_preset() {
 }
 
 prompt_add_split() {
-  local name source behavior rule_preset scope_choice scope user="" outbound_preset outbound_tag upstream answer
+  local name source behavior rule_preset scope_choice scope user="" outbound_preset outbound_tag upstream answer rule_url
   prepare_core
   if ! jq -e '(.rule_presets | length) > 0' "$STATE_FILE" >/dev/null; then echo '尚未添加预置规则，请先到“预置规则管理”中添加。'; return 0; fi
   if ! jq -e '(.outbound_presets | length) > 0' "$STATE_FILE" >/dev/null; then echo '尚未添加预置出口，请先到“预置出口管理”中添加。'; return 0; fi
@@ -441,7 +497,7 @@ prompt_add_split() {
     break
   done
   prompt_select_rule_preset '选择要使用的预置规则' || { MENU_RETURNED=true; return 0; }
-  rule_preset="$SELECTED_RULE_PRESET"; source="$SELECTED_RULE_SOURCE"; behavior="$SELECTED_RULE_BEHAVIOR"
+  rule_preset="$SELECTED_RULE_PRESET"; source="$SELECTED_RULE_SOURCE"; behavior="$SELECTED_RULE_BEHAVIOR"; rule_url="${SELECTED_RULE_URL:-}"
   while true; do
     cat <<'EOF'
 作用范围：
@@ -460,7 +516,7 @@ EOF
   printf '\n分流预览：\n  名称：%s\n  预置规则：%s\n  范围：%s\n  预置出口：%s\n' "$name" "$rule_preset" "$(if [[ "$scope" == all ]]; then echo 全部用户; else echo "用户:$user"; fi)" "$outbound_preset"
   read -r -p '确认检查并添加？[y/N]：' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消添加。'; return 0; }
-  if ! cmd_split_add "$name" "$source" "$scope" "$user" "$upstream" "$outbound_tag" "$rule_preset" "$outbound_preset" "$behavior"; then
+  if ! cmd_split_add "$name" "$source" "$scope" "$user" "$upstream" "$outbound_tag" "$rule_preset" "$outbound_preset" "$behavior" "$rule_url"; then
     echo '分流没有添加，现有配置没有改变。'
     return 0
   fi
@@ -735,7 +791,7 @@ prompt_split_details() {
 }
 
 prompt_edit_split() {
-  local name split source behavior scope user upstream out_tag choice answer current_scope current_out rule_preset outbound_preset current_source
+  local name split source behavior scope user upstream out_tag choice answer current_scope current_out rule_preset outbound_preset current_source rule_url
   prepare_core
   prompt_select_split all "编辑分流" || return 0
   name="$SELECTED_SPLIT_NAME"
@@ -755,7 +811,7 @@ EOF
   choice="$PROMPT_VALUE"
   case "$choice" in
     1) :;;
-    2) prompt_select_rule_preset '选择新的预置规则' || { MENU_RETURNED=true; return 0; }; rule_preset="$SELECTED_RULE_PRESET"; source="$SELECTED_RULE_SOURCE"; behavior="$SELECTED_RULE_BEHAVIOR";;
+    2) prompt_select_rule_preset '选择新的预置规则' || { MENU_RETURNED=true; return 0; }; rule_preset="$SELECTED_RULE_PRESET"; source="$SELECTED_RULE_SOURCE"; behavior="$SELECTED_RULE_BEHAVIOR"; rule_url="${SELECTED_RULE_URL:-}";;
     0) MENU_RETURNED=true; return 0;;
   esac
   current_scope="$(jq -r '.scope' <<<"$split")"
@@ -799,7 +855,7 @@ EOF
   printf '  出口来源：%s\n' "${outbound_preset:-独立配置}"
   read -r -p '确认检查并保存？[y/N]：' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo "已取消修改。"; return 0; }
-  if ! cmd_split_edit "$name" "$source" "$scope" "$user" "$upstream" "$out_tag" "$rule_preset" "$outbound_preset" "$behavior"; then
+  if ! cmd_split_edit "$name" "$source" "$scope" "$user" "$upstream" "$out_tag" "$rule_preset" "$outbound_preset" "$behavior" "$rule_url"; then
     echo '分流修改没有保存，原有配置继续使用。'
     return 0
   fi

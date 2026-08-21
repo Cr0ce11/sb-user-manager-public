@@ -471,7 +471,7 @@ kernel_rule_source_key() {
 # mihomo 放在 rule-providers{} 里，是以名字为键的对象成员。
 # 因此这里统一返回 {tag: ..., entry: {...}}，由各自的渲染函数决定怎么摆。
 kernel_split_rule_set_entry() {
-  local tag="$1" source="$2" behavior="$3" format
+  local tag="$1" source="$2" behavior="$3" rule_url="${4:-}" format
   case "$PROXY_KERNEL" in
     singbox)
       format="$(split_rule_format "$source")" || return 1
@@ -486,8 +486,18 @@ kernel_split_rule_set_entry() {
       # 写绝对路径。状态里存的是文件名，而 mihomo 会把相对路径按**工作目录**
       # 解析，那是 /var/lib/mihomo，不是规则目录——写相对路径会指到一个
       # 根本不存在的文件上，而且服务照样起得来，只在日志里留一行 error。
-      jq -cn --arg tag "$tag" --arg path "$(mihomo_rule_file_path "$source")" --arg behavior "$behavior" \
-        '{tag:$tag,entry:{type:"file",behavior:$behavior,format:"yaml",path:$path}}'
+      # 远程来源写 type:http，mihomo 自己下载并按 interval 更新（公开 Issue #218）；
+      # path 仍然是规则目录里那个文件，它既是缓存也是取不到时的兜底。
+      # 本机来源保持原样。两种都写绝对路径，理由同上。
+      if [[ -n "$rule_url" ]]; then
+        jq -cn --arg tag "$tag" --arg path "$(mihomo_rule_file_path "$source")" \
+          --arg behavior "$behavior" --arg url "$rule_url" \
+          --argjson interval "$REMOTE_RULE_SET_UPDATE_INTERVAL" \
+          '{tag:$tag,entry:{type:"http",behavior:$behavior,format:"yaml",url:$url,path:$path,interval:$interval}}'
+      else
+        jq -cn --arg tag "$tag" --arg path "$(mihomo_rule_file_path "$source")" --arg behavior "$behavior" \
+          '{tag:$tag,entry:{type:"file",behavior:$behavior,format:"yaml",path:$path}}'
+      fi
       ;;
     *) kernel_unknown ;;
   esac
