@@ -2,6 +2,8 @@
 # 启动测试会替换已加载函数，只验证 standalone 编排，不执行真实安装或服务操作。
 # shellcheck disable=SC2034,SC2317,SC2329
 set -Eeuo pipefail
+# shellcheck source=./require-strict-errexit.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/require-strict-errexit.sh"
 
 cd "$(dirname "$0")/.."
 

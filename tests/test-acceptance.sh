@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
 set -Eeuo pipefail
+# shellcheck source=./require-strict-errexit.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/require-strict-errexit.sh"
 
 cd "$(dirname "$0")/.."
 work="$(mktemp -d /tmp/sb-acceptance-test.XXXXXX)"
