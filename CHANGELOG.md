@@ -6,6 +6,21 @@
 - 新增重要功能、结构或数据模型发生重大变化：递增大版本号，例如 `4.2.x` → `4.3.0`。
 - 每次迭代必须保留上一版本作为回退点，在本文件顶部追加增量记录，并通过本地门禁与 GitHub CI 后再发布。
 
+## 4.25.23 - 2026-08-21
+
+- **全新安装从此只装 mihomo。**这是 [公开 Issue #157](https://github.com/Cr0ce11/sb-user-manager-public/issues/157) 所规划的接入第二内核的最后一片，做完之后第二步全部完成。装出来的机器不再有 sing-box，也没有「sing-box 版本管理」这一项菜单——mihomo 没有正式版／测试版通道这回事。
+
+  **存量机器升级之后一个字都不会变**：内核、管理器数据目录、菜单，全都按各自管理配置里的声明来。sing-box 机器仍然是 sing-box，「sing-box 版本管理」照旧在。
+
+- 新装机器的**管理器自身数据**（用户资料、内部备份、AnyTLS 证书）改放在 `/etc/sb-user-manager`，不再借用 `/etc/sing-box` 这个名字（[公开 Issue #172](https://github.com/Cr0ce11/sb-user-manager-public/issues/172) 三步走的第二步）。**存量机器不搬家**：它们的目录名写在自己的管理配置里，升级不会动。新机器上没有存量数据，改名的代价在这一刻是零。
+
+- **不再支持接管别人手工装的 sing-box。**这台机器上如果已经有其他方式装的 sing-box，脚本会说明情况并请你先自行停用清理，再回来安装；它不会接管，也不会在旁边再装一个内核——两套代理会抢同一批端口。
+
+  相关的实现整段删除，而不是把入口藏起来：留着一段谁都调不到的部署代码，迟早有人以为它还能用。
+
+- 已经在跑的服务器要换到 mihomo，走的仍然是上一版的「切换到 mihomo 内核」（[公开 Issue #203](https://github.com/Cr0ce11/sb-user-manager-public/issues/203)），本版本没有改动那条路。
+
+
 ## 4.25.22 - 2026-08-21
 
 - **一台在跑的 sing-box 服务器现在可以整机换成 mihomo。**「部署与卸载」下多了「切换到 mihomo 内核」（[公开 Issue #203](https://github.com/Cr0ce11/sb-user-manager-public/issues/203)）。这是 [公开 Issue #122](https://github.com/Cr0ce11/sb-user-manager-public/issues/122) 三步计划的第三步，也是正式服务器将来搬到 mihomo 的那条路。
