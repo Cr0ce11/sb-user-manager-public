@@ -155,11 +155,14 @@ system_management_menu() {
     prepare_menu_screen
     ui_menu_begin
     ui_header '系统管理' '运行、维护与基础配置'
+    # 「sing-box 版本管理」只在 sing-box 机器上出现。mihomo 没有正式版／测试版
+    # 通道这回事，留一个永远点不动的菜单项比少一项更让人困惑（公开 Issue #157 的 2f）。
+    # 底层的守卫不撤：菜单是给人看的，守卫防的是别的调用点。
     ui_menu_items \
       deploy '部署与卸载' update '检测更新' \
       status '查看服务状态' diagnostics '检查与故障报告' \
-      backup '数据备份与恢复' sni '默认连接域名（SNI）' \
-      channel 'sing-box 版本管理'
+      backup '数据备份与恢复' sni '默认连接域名（SNI）'
+    [[ "$PROXY_KERNEL" != singbox ]] || ui_menu_items channel 'sing-box 版本管理'
     ui_back_item '返回主菜单'
     ui_menu_select || return 0
     case "$UI_MENU_ACTION" in
