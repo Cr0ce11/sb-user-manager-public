@@ -2459,8 +2459,13 @@ switch_kernel_to_mihomo() {
   cat <<'EOF'
 
 切换之后不能用「切回 sing-box」退回来：分流的规则集只能从 sing-box 的格式转成
-mihomo 的，反过来转不了。真出问题时的退路是从切换前的完整环境快照整体恢复。
+mihomo 的，反过来转不了。事后要退回 sing-box，走的是重装一台 sing-box 机器、
+再从切换前的 .sbm 加密迁移备份恢复——备份里的分流仍然是 sing-box 的规则集地址。
+
+切换前会创建一份完整环境快照，但它只在这次切换中途失败时由脚本自动还原，
+菜单里没有事后手工恢复它的入口（ADR 0032）。
 EOF
+  print_offsite_recovery_status
   local answer
   read -r -p '确认现在切换到 mihomo？[y/N]：' answer || { rm -rf -- "$staged"; release_operation_lock; return 1; }
   [[ "$answer" =~ ^[Yy]$ ]] || {
@@ -2625,8 +2630,10 @@ cleanup_singbox_leftovers() {
   done <<<"$(singbox_leftover_paths)"
   [[ "$found" == true ]] || { echo '  没有找到 sing-box 的残留文件，无需清理。'; return 0; }
   printf '\n管理器自己的数据目录（%s）不会被动，用户资料、内部备份与证书都在里面。\n' "$MANAGER_DATA_DIR"
-  printf '删除之后**再也无法回到 sing-box**：换内核的退路本来就是从切换前的环境快照恢复，\n'
-  printf '而那份快照仍然有效——这里删掉的只是当前这台机器上的残留。\n'
+  printf '删除之后**再也无法回到 sing-box**：这台机器上 sing-box 的可执行文件与运行配置\n'
+  printf '都会消失。退回 sing-box 的路是重装一台机器、再从切换前的 .sbm 加密迁移备份恢复，\n'
+  printf '与这里删不删残留无关；机器上的完整环境快照只在本次清理失败时由脚本自动还原。\n'
+  print_offsite_recovery_status
   read -r -p '确认删除？[y/N]：' answer || return 1
   [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消。'; return 0; }
   if ! acquire_operation_lock; then
