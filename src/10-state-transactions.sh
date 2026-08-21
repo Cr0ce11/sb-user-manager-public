@@ -493,6 +493,30 @@ write_global_sni_config() {
   ANYTLS_SNI="$anytls_sni"
 }
 
+# geo 数据源的两个地址（公开 Issue #219）。与全局 SNI 那一处同一个写法：
+# 只重写自己那两行，其余原样保留；留空表示用 mihomo 自带的源，此时**不写这一行**
+# ——写一行 GEOSITE_URL="" 与不写是同一个意思，但少写一行能让配置文件如实反映
+# 「这台机器没有自定义过下载源」。
+write_geo_source_config() {
+  local geosite_url="$1" geoip_url="$2" reason="${3:-update}" tmp backup
+  backup="$BACKUP_DIR/sb-user-manager.conf.pre-geo-${reason}-$(date '+%Y%m%d-%H%M%S-%N')"
+  cp -a -- "$CONF_FILE" "$backup" || return 1
+  tmp="$(mktemp "$(dirname "$CONF_FILE")/.sb-user-manager.conf.XXXXXX")" || return 1
+  register_temp_path "$tmp" || return 1
+  if ! awk '!/^(GEOSITE_URL|GEOIP_URL)=/' "$CONF_FILE" > "$tmp" ||
+     ! { [[ -z "$geosite_url" ]] || printf 'GEOSITE_URL="%s"\n' "$geosite_url" >> "$tmp"; } ||
+     ! { [[ -z "$geoip_url" ]] || printf 'GEOIP_URL="%s"\n' "$geoip_url" >> "$tmp"; } ||
+     ! chmod 600 "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  chown root:root "$tmp" 2>/dev/null || true
+  mv -- "$tmp" "$CONF_FILE" || return 1
+  sync_transaction_path "$CONF_FILE" || return 1
+  GEOSITE_URL="$geosite_url"
+  GEOIP_URL="$geoip_url"
+}
+
 ensure_global_sni_config() {
   validate_shadowtls_sni "$SS2022_SHADOWTLS_SNI"
   validate_shadowtls_sni "$ANYTLS_SNI"

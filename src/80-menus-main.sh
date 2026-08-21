@@ -68,6 +68,77 @@ global_sni_menu() {
   done
 }
 
+# 「geo 数据源」（公开 Issue #219）。留空表示用 mihomo 自带的源；这里如实显示
+# 「默认（mihomo 自带）」而不是把 mihomo 的默认地址抄一份出来——抄一份就等于
+# 替上游承诺那个地址永远不变，而抄错了没有任何地方会说。
+show_geo_source_settings() {
+  local geo_splits
+  prepare_core
+  geo_splits="$(jq '[.splits[]? | select(((.rule_geo // []) | length) > 0)] | length' "$STATE_FILE")" || return 1
+  printf '\nGeoSite 数据源：%s\n' "${GEOSITE_URL:-默认（mihomo 自带）}"
+  printf 'GeoIP 数据源：%s\n' "${GEOIP_URL:-默认（mihomo 自带）}"
+  printf '\n用到 GeoSite／GeoIP 类别的分流：%s 条\n' "$geo_splits"
+  if ((geo_splits == 0)); then
+    printf '这两个地址现在还用不上：没有 geo 分流时 %s 里不会有 GeoSite.dat 或 GeoIP.dat。\n' \
+      "$MIHOMO_WORK_DIR"
+    echo '添加第一条 geo 分流时才会按这里的设置去下载。'
+  else
+    printf '数据库放在 %s，由 mihomo 每 %s 小时自己检查更新。\n' \
+      "$MIHOMO_WORK_DIR" "$GEO_UPDATE_INTERVAL_HOURS"
+  fi
+  # 工作目录里还会有一个 ASN.mmdb，它与这两个地址无关：实测确认，只要配置里有
+  # 任何一条规则集条目（本机文件或网址都一样），mihomo 启动时就会自己去下它。
+  # 这不是本项目加进来的行为，在这里说一句是为了让人看到那个文件时不必猜。
+  if [[ -f "$MIHOMO_WORK_DIR/ASN.mmdb" ]]; then
+    echo
+    echo '工作目录里的 ASN.mmdb 由 mihomo 自己下载与维护，与这里的设置无关；'
+    echo '只要有规则集分流它就会存在，删掉也会被重新下载。'
+  fi
+}
+
+prompt_geo_source_change() {
+  local kind="$1" label="$2" current new_url answer
+  prepare_core
+  if [[ "$kind" == geosite ]]; then current="$GEOSITE_URL"; else current="$GEOIP_URL"; fi
+  printf '\n%s当前：%s\n' "$label" "${current:-默认（mihomo 自带）}"
+  echo '输入新的下载地址（HTTPS）；直接回车改回 mihomo 自带的源；输入 0 取消。'
+  read -r -p '新地址：' new_url || return 0
+  [[ "$new_url" != 0 ]] || { echo '已取消修改。'; return 0; }
+  if [[ -z "$new_url" ]]; then
+    if [[ -z "$current" ]]; then echo '当前就是默认源，没有变化。'; return 0; fi
+    printf '将改回 mihomo 自带的源。\n'
+  else
+    printf '将改为：%s\n' "$new_url"
+    echo '保存前会先连一次这个地址确认它取得到东西；取不到就当场拒绝，原值保持不变。'
+  fi
+  echo '这台机器上若已经有 geo 分流，保存时会重启内核让新源生效，现有连接中断几秒。'
+  read -r -p '确认修改？[y/N]：' answer
+  [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消修改。'; return 0; }
+  cmd_set_geo_source "$kind" "$new_url" || return 0
+}
+
+geo_source_menu() {
+  ensure_management_environment_ready || return 0
+  while true; do
+    prepare_menu_screen
+    ui_menu_begin
+    ui_header 'geo 数据源' 'GeoSite／GeoIP 数据库的下载地址'
+    ui_section '查看与修改'
+    ui_menu_items \
+      show '查看当前数据源' \
+      geosite '修改 GeoSite 数据源' \
+      geoip '修改 GeoIP 数据源'
+    ui_back_item '返回上一级'
+    ui_menu_select || return 0
+    case "$UI_MENU_ACTION" in
+      show) show_geo_source_settings; pause_menu;;
+      geosite) prompt_geo_source_change geosite 'GeoSite 数据源'; pause_menu;;
+      geoip) prompt_geo_source_change geoip 'GeoIP 数据源'; pause_menu;;
+      back) return 0;;
+    esac
+  done
+}
+
 ensure_management_environment_ready() {
   if [[ -e "$CONF_FILE" || -L "$CONF_FILE" ]]; then return 0; fi
   echo
@@ -162,6 +233,9 @@ system_management_menu() {
       deploy '部署与卸载' update '检测更新' \
       status '查看服务状态' diagnostics '检查与故障报告' \
       backup '数据备份与恢复' sni '默认连接域名（SNI）'
+    # 「geo 数据源」只在 mihomo 上出现：sing-box 部署里没有 GeoSite／GeoIP
+    # 这回事，留一个永远点不动的菜单项比少一项更让人困惑（公开 Issue #219）。
+    [[ "$PROXY_KERNEL" != mihomo ]] || ui_menu_items geo 'geo 数据源'
     [[ "$PROXY_KERNEL" != singbox ]] || ui_menu_items channel 'sing-box 版本管理'
     ui_back_item '返回主菜单'
     ui_menu_select || return 0
@@ -172,6 +246,7 @@ system_management_menu() {
       diagnostics) diagnostic_report_menu;;
       backup) migration_backup_menu;;
       sni) global_sni_menu;;
+      geo) geo_source_menu;;
       channel) singbox_channel_menu;;
       back) return 0;;
     esac

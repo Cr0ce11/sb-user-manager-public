@@ -135,6 +135,360 @@ mihomo_rule_file_mismatch() {
   ' "$file"
 }
 
+# ============================================================
+# 远程规则集（公开 Issue #218）
+# ============================================================
+# mihomo 原生支持 `type:http` 的规则集：启动时自己下载、按 interval 自己更新，
+# 不用管理器造更新机制。实测（v1.19.30）确认了这三件事：会下载并写到 path、
+# 到点会自己重新拉、取不到但本地有缓存时会用旧的。
+#
+# **但取不到且没有缓存时它只留一行警告，服务照常起来，那条分流静静地完全不生效。**
+# 这与本机文件被删掉是同一类失效（公开 Issue #186）。内核不报，只能管理器来报——
+# 因此保存那一刻由管理器自己先下载一次、校验一遍，并把内容落成初始缓存。
+REMOTE_RULE_SET_UPDATE_INTERVAL=86400
+
+# 远程规则集在本机的文件名：**原样取地址里的那个文件名**，不做改写。
+# 项目所有者的要求是「保持原有命名以方便识别」，因此这里宁可拒绝也不悄悄改名。
+remote_rule_set_file_name() {
+  local url="$1" name
+  name="${url##*/}"
+  name="${name%%\?*}"
+  name="${name%%#*}"
+  printf '%s' "$name"
+}
+
+# 远程规则集地址的写法校验。只看写法，不下载。
+# 只接受 yaml：mihomo 还认 text 与 mrs 两种格式，本片不做——与 sing-box 侧只接受
+# .srs／.json 是同一个思路，多一种格式就多一套校验与一种说不清的失败。
+validate_remote_rule_set_url() {
+  local url="$1" name
+  [[ "$url" == https://* ]] || die "规则集地址必须使用 HTTPS：$url"
+  [[ "$url" =~ \.(yaml|yml)$ ]] ||
+    die "规则集地址必须指向 .yaml 或 .yml 文件（本项目只支持 yaml 格式的远程规则集）：$url"
+  name="$(remote_rule_set_file_name "$url")"
+  [[ -n "$name" ]] || die "从地址里看不出文件名：$url"
+  validate_mihomo_rule_file_name "$name"
+}
+
+# 下载远程规则集并校验内容，成功后写到 $2。
+# 五件要挡住的事在这里挡掉四件（地址写法在上面那个函数）：指向内网、取不到、
+# 内容不是规则集、写法与所选 behavior 对不上。失败时**不写出文件**。
+#
+# 失败一律用返回码表达，不用 die：这个函数也给「立即更新规则集」用，那条路上
+# 一条地址取不到不该把整轮更新连同管理器一起结束——其余几条还要继续更新，
+# 而且旧缓存必须原样留着。调用点因此必须自己检查返回值。
+download_remote_rule_set() {
+  local url="$1" output="$2" behavior="$3" tmp mismatch
+  if ! validate_public_rule_set_url "$url"; then
+    printf '错误：规则集地址必须解析到公网，不能指向本机或内网：%s\n' "$url" >&2
+    return 1
+  fi
+  tmp="$(mktemp /tmp/sb-remote-rule.XXXXXX)" || return 1
+  register_temp_path "$tmp" || { rm -f -- "$tmp"; return 1; }
+  # 不跟随跳转、限时限量：规则集是使用者贴进来的地址，按不可信输入对待。
+  if ! curl --proto '=https' --proto-redir '=https' --fail --max-redirs 0 \
+    --silent --show-error --connect-timeout 10 --max-time 60 \
+    --max-filesize 10485760 --output "$tmp" "$url"; then
+    rm -f -- "$tmp"
+    unregister_temp_path "$tmp" || true
+    printf '错误：取不到规则集：%s\n' "$url" >&2
+    return 1
+  fi
+  mismatch="$(mihomo_rule_file_mismatch "$tmp" "$behavior")" || {
+    rm -f -- "$tmp"
+    unregister_temp_path "$tmp" || true
+    return 1
+  }
+  if [[ -n "$mismatch" ]]; then
+    rm -f -- "$tmp"
+    unregister_temp_path "$tmp" || true
+    printf '错误：规则集的内容与所选写法对不上：%s\n' "$mismatch" >&2
+    printf '选错写法时 mihomo 不会报错，规则会静静地不生效，因此这里必须拒绝。\n' >&2
+    return 1
+  fi
+  install -m 644 "$tmp" "$output" || {
+    rm -f -- "$tmp"
+    unregister_temp_path "$tmp" || true
+    return 1
+  }
+  rm -f -- "$tmp"
+  unregister_temp_path "$tmp" || true
+}
+
+# 这个文件名有没有被**另一个地址**占用。同一个地址被多条分流共用不算冲突。
+remote_rule_set_name_conflict() {
+  local name="$1" url="$2"
+  jq -r --arg name "$name" --arg url "$url" '
+    [(.splits[]?, .rule_presets[]?) |
+      select((.rule_file // "") == $name and (.rule_url // "") != $url) |
+      (.name // "")] | first // empty' "$STATE_FILE"
+}
+
+# 一条分流／预置的远程地址；本机文件来源时为空。
+split_rule_url_from_json() {
+  jq -r '(.rule_url // "")' <<<"$1"
+}
+
+# 当前用到的远程规则集清单：地址、落地文件名、写法。分流与预置放在一起去重，
+# 因为它们共用同一个文件——同一个地址被多条分流引用时只该下载一次。
+remote_rule_set_rows() {
+  jq -r '[(.splits[]?, .rule_presets[]?) |
+      select((.rule_url // "") != "" and (.rule_file // "") != "") |
+      {url:.rule_url, file:.rule_file, behavior:(.rule_behavior // "")}] |
+    unique | .[] | [.url, .file, .behavior] | @tsv' "$STATE_FILE"
+}
+
+# 运行配置里现在还有没有 geo 规则。判断依据与 sbm_apply_geo_settings 完全一致，
+# 用的是同一段 jq——两处各写一遍迟早会对不上。
+mihomo_runtime_uses_geo() {
+  local config
+  config="$(singbox_config_for_comparison)" || return 1
+  jq -e "$MIHOMO_GEO_SETTINGS_PROGRAM"'
+    (sbm_apply_geo_settings | has("geodata-mode"))' --argjson geox '{}' <<<"$config" >/dev/null
+}
+
+# 把当前的 geo 设置写进运行配置。留空的那一项会让 geox-url 里少一个键，
+# 两个都留空就整个删掉这个键，回到 mihomo 自带的源。
+apply_mihomo_geo_settings() {
+  rewrite_kernel_config "$MIHOMO_GEO_SETTINGS_PROGRAM"'
+    sbm_apply_geo_settings
+  ' --argjson geox "$(mihomo_geox_url_json)"
+}
+
+# 「geo 数据源」设置项（公开 Issue #219）。$1 是 geosite 或 geoip，$2 是新地址，
+# 留空表示改回 mihomo 自带的源。
+#
+# 校验放在改动任何东西之前：项目所有者的要求是「改成死地址时当场拒绝并保持原值」。
+# 这条校验只证明这个地址现在取得到东西，不证明取到的是一份能用的 geo 数据库
+# ——后者要等真的用到 geo 分流时由 mihomo 说，而它在那一步是当场失败、不是静默失效。
+cmd_set_geo_source() {
+  local kind="$1" new_url="${2:-}" label geosite_url geoip_url uses_geo=false
+  [[ "$PROXY_KERNEL" == mihomo ]] ||
+    die "只有 mihomo 部署会用到 GeoSite／GeoIP 数据；sing-box 部署没有这一项"
+  geosite_url="$GEOSITE_URL"
+  geoip_url="$GEOIP_URL"
+  case "$kind" in
+    geosite) label='GeoSite 数据源'; geosite_url="$new_url" ;;
+    geoip) label='GeoIP 数据源'; geoip_url="$new_url" ;;
+    *) die "未知的 geo 数据源：$kind" ;;
+  esac
+  if [[ "$geosite_url" == "$GEOSITE_URL" && "$geoip_url" == "$GEOIP_URL" ]]; then
+    log "${label}没有变化，未做修改"
+    return 0
+  fi
+  [[ -z "$new_url" ]] || validate_geo_source_url "$new_url" "$label"
+  if mihomo_runtime_uses_geo; then uses_geo=true; fi
+  if [[ "$uses_geo" == true ]]; then
+    ensure_safe_ssh_for_kernel_restart || return 0
+  fi
+  start_managed_operation "set-geo-source:$kind" || return 1
+  run_managed_step write_geo_source_config "$geosite_url" "$geoip_url" update || return 1
+  run_managed_step apply_mihomo_geo_settings || return 1
+  if [[ "$uses_geo" == true ]]; then
+    run_managed_step check_singbox_and_restart || return 1
+  fi
+  finish_managed_operation || return 1
+  if [[ -n "$new_url" ]]; then
+    log "${label}已改为：${new_url}"
+  else
+    log "${label}已改回 mihomo 自带的源"
+  fi
+  if [[ "$uses_geo" != true ]]; then
+    echo '这台机器目前没有用到 geo 规则，新的数据源会在第一次添加 geo 分流时生效。'
+  fi
+}
+
+# 「立即更新规则集」（公开 Issue #218）。
+#
+# mihomo 自己每天更新一次，这个动作是给「现在就要用上新规则」准备的。
+# 新内容要立刻生效必须重启内核：不重启的话它要等下一个 interval 才重新读文件，
+# 那可能是一天以后。重启会断几秒，因此有三条硬要求：
+#
+#   一、**远端挂掉时保留旧缓存**。先下载到临时文件、校验通过才覆盖；一条失败
+#       不影响其余几条，也绝不会把那条分流变成空规则。
+#   二、**内容没变就不重启**。没有变化的重启是白白断几秒。
+#   三、**重启失败时把旧文件放回去再起一次**。规则集的内容是使用者从社区拿来的，
+#       保存时那套校验只保证「是个规则集、写法与 behavior 对得上」，不保证
+#       mihomo 认得里面每一条规则。
+cmd_remote_rule_sets_update() {
+  local rows url file behavior path staged workdir restart_rc
+  local total=0 changed=0 failed=0 unchanged=0
+  [[ "$PROXY_KERNEL" == mihomo ]] ||
+    die "只有 mihomo 部署支持远程规则集；sing-box 的规则集由 sing-box 自己下载"
+  rows="$(remote_rule_set_rows)" || return 1
+  if [[ -z "$rows" ]]; then
+    echo '当前没有使用网址来源的规则集，没有可更新的内容。'
+    return 0
+  fi
+  # SSH 护栏放在下载之前。它给出的说明是「服务器数据尚未修改」，先写文件再问
+  # 会让那句话变成假话，而且会留下「文件已经换了、内核还没读」的半吊子状态。
+  ensure_safe_ssh_for_kernel_restart || return 0
+  workdir="$(mktemp -d /tmp/sb-rule-update.XXXXXX)" || return 1
+  register_temp_path "$workdir" || { rm -rf -- "$workdir"; return 1; }
+  printf '\n开始更新规则集：\n'
+  while IFS=$'\t' read -r url file behavior; do
+    [[ -n "$url" && -n "$file" ]] || continue
+    total=$((total + 1))
+    path="$(mihomo_rule_file_path "$file")"
+    staged="$workdir/new.$file"
+    if ! download_remote_rule_set "$url" "$staged" "$behavior"; then
+      printf '  [失败] %s：这一条仍然沿用上一次的内容\n' "$file"
+      failed=$((failed + 1))
+      continue
+    fi
+    if [[ -f "$path" ]] && cmp -s "$staged" "$path"; then
+      printf '  [没有变化] %s\n' "$file"
+      unchanged=$((unchanged + 1))
+      continue
+    fi
+    if [[ -f "$path" ]] && ! cp -p -- "$path" "$workdir/old.$file"; then
+      printf '  [失败] %s：无法备份现有内容，这一条没有更新\n' "$file"
+      failed=$((failed + 1))
+      continue
+    fi
+    if ! install -m 644 "$staged" "$path"; then
+      printf '  [失败] %s：无法写入 %s，这一条没有更新\n' "$file" "$path"
+      failed=$((failed + 1))
+      continue
+    fi
+    printf '  [已更新] %s\n' "$file"
+    changed=$((changed + 1))
+  done <<<"$rows"
+  printf '\n共 %s 条：更新 %s 条，内容没有变化 %s 条，失败 %s 条。\n' \
+    "$total" "$changed" "$unchanged" "$failed"
+  if ((changed == 0)); then
+    echo '没有内容发生变化，不需要重启，连接不受影响。'
+    ((failed == 0)) || return 1
+    return 0
+  fi
+  printf '正在重启 %s 让新规则立刻生效，现有连接会中断几秒。\n' "$(kernel_display_name)"
+  restart_rc=0
+  if check_singbox_and_restart; then
+    :
+  else
+    restart_rc=$?
+  fi
+  if ((restart_rc == 0)); then
+    log "规则集已更新并生效：${changed} 条"
+    ((failed == 0)) || return 1
+    return 0
+  fi
+  # 起不来就把旧内容放回去再起一次。这里的失败多半来自新规则集的内容——
+  # 保存时那套校验管不到 mihomo 认不认得里面每一条规则。
+  printf '错误：重启失败，正在把规则集恢复成更新之前的内容。\n' >&2
+  restore_remote_rule_set_backups "$workdir" || true
+  if check_singbox_and_restart; then
+    printf '已恢复到更新之前的规则集，服务正常。请检查这几个规则集的内容。\n' >&2
+  else
+    printf '错误：恢复之后仍未能启动服务，请用「检查与故障报告」进一步排查。\n' >&2
+  fi
+  return "$restart_rc"
+}
+
+# 把 cmd_remote_rule_sets_update 备份下来的旧规则集放回原处。
+restore_remote_rule_set_backups() {
+  local workdir="$1" backup name rc=0
+  for backup in "$workdir"/old.*; do
+    [[ -f "$backup" ]] || continue
+    name="${backup##*/old.}"
+    install -m 644 "$backup" "$(mihomo_rule_file_path "$name")" || rc=1
+  done
+  return "$rc"
+}
+
+# ============================================================
+# GeoSite／GeoIP 类别（公开 Issue #219）
+# ============================================================
+# 第三种规则来源，与前两种最要紧的差别是**它不会静默失效**：数据库缺了、类别名
+# 写错，mihomo 当场拒绝加载配置（实测；换成正确的类别名就通过，对照成立）。
+# 远程规则集正相反——取不到只留一行警告、服务照常起来，那条分流静静地不生效。
+# 代价换到了另一头：/var/lib/mihomo 下的数据库丢了且当时下不到，服务起不来。
+GEO_UPDATE_INTERVAL_HOURS=24
+
+# 「geo 数据源」设置项的当前取值，渲染成 mihomo 的 geox-url 对象。
+# 两个地址各自独立：只改一个时，另一个仍用 mihomo 自带的源。
+# 键名 geosite／geoip 取自二进制里的结构体标签，不是猜的。
+mihomo_geox_url_json() {
+  jq -cn --arg geosite "${GEOSITE_URL:-}" --arg geoip "${GEOIP_URL:-}" '
+    {} | (if $geosite == "" then . else .geosite = $geosite end)
+       | (if $geoip == "" then . else .geoip = $geoip end)'
+}
+
+# 一条 geo 类别的写法。类别名对不对不在这里判——那要看 mihomo 自己的数据库，
+# 由保存时那次 `mihomo -t` 当场认。这里只保证它不会把一条规则拼成另一条：
+# 类别名里混进逗号或括号时，mihomo 只会说「规则类型不支持」，看不出是从哪来的。
+validate_geo_category() {
+  [[ "$1" =~ ^(GEOSITE|GEOIP),[A-Za-z0-9_.:@-]+$ ]] ||
+    die "geo 类别只能写成 GEOSITE,<类别> 或 GEOIP,<类别>，类别名里不能有逗号、括号或空格：$1"
+}
+
+# 状态里的 geo 类别清单（JSON 数组）；不是 geo 来源时是空数组。
+split_rule_geo_from_json() {
+  jq -c '(.rule_geo // [])' <<<"$1"
+}
+
+validate_geo_categories_json() {
+  local geo="$1" category
+  jq -e 'type == "array" and length > 0' <<<"$geo" >/dev/null ||
+    die "至少要填一个 GeoSite／GeoIP 类别"
+  while IFS= read -r category; do
+    [[ -n "$category" ]] || continue
+    validate_geo_category "$category"
+  done < <(jq -r '.[]' <<<"$geo")
+  [[ "$(jq 'length' <<<"$geo")" == "$(jq 'unique | length' <<<"$geo")" ]] ||
+    die "同一条分流里不能重复填同一个 geo 类别"
+}
+
+# 用 mihomo 自己校验类别名。类别名写错时 `mihomo -t` 当场失败，写对就通过
+# ——这条判断有对照，因此拒绝不是恒真。
+#
+# 副作用要如实告知：**第一次会触发下载**。mihomo 发现工作目录里没有 GeoSite.dat
+# 就自己去下（4 MB 左右；用到 GeoIP 再加 17 MB），网络慢时要等一会。
+# 探针配置里每个类别单独写一行，为的是失败时 mihomo 的报错能指名道姓说出
+# 是哪一个类别不认识——写成一条 OR 的话只能看出「这一整条不行」。
+validate_geo_categories_with_kernel() {
+  local geo="$1" probe binary rc=0
+  [[ "$PROXY_KERNEL" == mihomo ]] || die "GeoSite／GeoIP 类别分流只支持 mihomo 部署"
+  binary="$(kernel_binary_path)" || return 1
+  probe="$(mktemp /tmp/sb-geo-probe.XXXXXX)" || return 1
+  register_temp_path "$probe" || { rm -f -- "$probe"; return 1; }
+  if ! jq -n --argjson geo "$geo" --argjson geox "$(mihomo_geox_url_json)" \
+      --argjson interval "$GEO_UPDATE_INTERVAL_HOURS" '
+      {"log-level":"warning",mode:"rule","geodata-mode":true,"geo-auto-update":true,
+       "geo-update-interval":$interval,listeners:[],proxies:[],"proxy-groups":[],
+       rules:([$geo[] | . + ",DIRECT"] + ["MATCH,DIRECT"])}
+      | (if ($geox | length) == 0 then . else .["geox-url"] = $geox end)' > "$probe"; then
+    rm -f -- "$probe"
+    unregister_temp_path "$probe" || true
+    return 1
+  fi
+  kernel_check_config_with "$binary" "$probe" || rc=1
+  rm -f -- "$probe"
+  unregister_temp_path "$probe" || true
+  return "$rc"
+}
+
+# geo 数据源地址的校验（公开 Issue #219）。「改成死地址时当场拒绝并保持原值」。
+#
+# 只取头 1 KB：这两个文件一个 4 MB、一个 17 MB，为了确认地址还活着而整份拉下来
+# 不划算。**要说清这条校验证明了什么**——它证明这个地址现在取得到东西，
+# 不证明取到的是一份能用的 geo 数据库。后者要等真的用到 geo 分流时由 mihomo
+# 自己说，而它在那一步是当场失败、不是静默失效。
+validate_geo_source_url() {
+  local url="$1" label="$2" code
+  [[ "$url" == https://* ]] || die "${label}的地址必须使用 HTTPS：$url"
+  validate_public_rule_set_url "$url" ||
+    die "${label}的地址必须解析到公网，不能指向本机或内网：$url"
+  code="$(curl --proto '=https' --proto-redir '=https' --silent --show-error \
+    --max-redirs 0 --connect-timeout 10 --max-time 60 --max-filesize 67108864 \
+    --range 0-1023 --output /dev/null --write-out '%{http_code}' "$url" 2>/dev/null)" || code=''
+  case "$code" in
+    200|206) return 0 ;;
+    '') die "${label}的地址取不到内容，原值保持不变：$url" ;;
+    *) die "${label}的地址返回了 HTTP ${code}，原值保持不变：$url" ;;
+  esac
+}
+
 # mihomo 部署下的规则集来源：使用者自己放在规则目录里的一个块状 yaml 文件。
 # 管理器只读它，永远不改它的内容（公开 Issue #157 的决定）。
 validate_mihomo_rule_set() {
@@ -306,7 +660,30 @@ validate_split_rule_source_format() {
 # sing-box 是公网 HTTPS 上的 .srs / .json，由 sing-box 自己下载并检查；
 # mihomo 是本机上一个块状 yaml 文件，由管理器检查存在性与写法。
 validate_split_rule_source() {
-  local source="$1" behavior="${2:-}"
+  local source="$1" behavior="${2:-}" rule_url="${3:-}" rule_geo="${4:-[]}" conflict
+  # geo 来源（公开 Issue #219）：没有规则集文件，也没有 behavior 可言，
+  # 状态里只有一份类别清单。写法自己查，类别名交给 mihomo 当场认。
+  if [[ "$(jq 'length' <<<"$rule_geo")" != 0 ]]; then
+    [[ "$PROXY_KERNEL" == mihomo ]] || die "GeoSite／GeoIP 类别分流只支持 mihomo 部署"
+    [[ -z "$rule_url" ]] || die "geo 类别来源不能同时带规则集网址"
+    validate_geo_categories_json "$rule_geo"
+    validate_geo_categories_with_kernel "$rule_geo" || return 1
+    return 0
+  fi
+  # 远程来源（公开 Issue #218）：先看写法与重名，再**真的下载一次**并核对内容。
+  # mihomo 取不到远程规则集时只留一行警告、服务照常起来，那条分流静静地不生效；
+  # 因此这一关必须在保存之前由管理器自己过一遍，并把这次下载的内容落成初始缓存。
+  if [[ -n "$rule_url" ]]; then
+    [[ "$PROXY_KERNEL" == mihomo ]] || die "远程规则集只支持 mihomo 部署"
+    validate_remote_rule_set_url "$rule_url"
+    [[ "$source" == "$(remote_rule_set_file_name "$rule_url")" ]] ||
+      die "规则文件名必须与地址里的文件名一致：$source"
+    conflict="$(remote_rule_set_name_conflict "$source" "$rule_url")" || return 1
+    [[ -z "$conflict" ]] ||
+      die "规则文件名 ${source} 已经被「${conflict}」用在另一个地址上；请换一个来源，或先处理那一条"
+    download_remote_rule_set "$rule_url" "$(mihomo_rule_file_path "$source")" "$behavior" || return 1
+    return 0
+  fi
   case "$PROXY_KERNEL" in
     singbox)
       validate_public_rule_set_url "$source" ||
@@ -449,8 +826,17 @@ stored_split_rule_tag() {
   jq -r --arg name "$name" '.splits[] | select(.name == $name) | (.rule_set_tag // ("managed-split-" + .name))' "$STATE_FILE"
 }
 
+# 一条分流在 mihomo 规则行里的匹配条件（公开 Issue #219）。生成、删除与审计
+# 必须用同一份定义，因此这里直接调用适配层那段 jq，不在别处再写一遍。
+mihomo_split_match_condition() {
+  local rule_tag="$1" rule_geo="${2:-[]}"
+  jq -rn --arg rule "$rule_tag" --argjson geo "$rule_geo" \
+    "$MIHOMO_SPLIT_RULE_DEFS"' sbm_match_cond($rule; $geo)'
+}
+
 remove_split_config() {
   local name="$1" split tag out_tag transport_tag stored_tag stored_out stored_transport
+  local rule_geo cond stored_cond
   split="$(jq -ec --arg name "$name" '.splits[] | select(.name == $name)' "$STATE_FILE")" || return 1
   tag="$(split_runtime_rule_tag_from_json "$split")" || return 1
   out_tag="$(split_runtime_out_tag_from_json "$split")" || return 1
@@ -458,6 +844,9 @@ remove_split_config() {
   stored_tag="$(stored_split_rule_tag "$name")" || return 1
   stored_out="$(stored_split_out_tag "$name")" || return 1
   stored_transport="$(split_transport_tag "$name")"
+  rule_geo="$(split_rule_geo_from_json "$split")" || return 1
+  cond="$(mihomo_split_match_condition "$tag" "$rule_geo")" || return 1
+  stored_cond="$(mihomo_split_match_condition "$stored_tag" "$rule_geo")" || return 1
   case "$PROXY_KERNEL" in
     singbox)
       rewrite_kernel_config '
@@ -473,10 +862,12 @@ remove_split_config() {
       # 以及 sub-rules 里那一块规则。顶层 rules 里只有一条派发，
       # 它与具体某条分流无关，因此这里不动——使用者自己写在 rules 里的东西同理。
       #
-      # sub-rules 里按规则集标签认自己的行。行的形状只有两种，都由
+      # sub-rules 里按**匹配条件**认自己的行。行的形状只有两种，都由
       # kernel_render_split_plan 生成：
-      #   RULE-SET,<规则集>,<出口>
-      #   AND,((RULE-SET,<规则集>),(IN-NAME,...)),<出口>
+      #   <匹配条件>,<出口>
+      #   AND,((<匹配条件>),(IN-NAME,...)),<出口>
+      # 规则集来源的条件是 RULE-SET,<规则集标签>，geo 来源的条件是类别本身
+      # （公开 Issue #219）——后者没有标签可认，因此这里统一按条件认。
       # 与 sing-box 那一支同样按标签删，因此「多条分流共用同一个预置规则时
       # 一起被删掉」这个语义两个内核一致，随后的整体重建会把该留的补回来。
       rewrite_kernel_config "$MIHOMO_SPLIT_RULE_DEFS"'
@@ -486,10 +877,11 @@ remove_split_config() {
           with_entries(select(.key != $tag and .key != $stored_tag))) |
         (if (.["sub-rules"] // {}) | has($sub_rule) then
            .["sub-rules"][$sub_rule] = [(.["sub-rules"][$sub_rule] // [])[] |
-             select(sbm_line_owned_by(.; [$tag, $stored_tag]) | not)]
+             select(sbm_line_owned_by(.; [$cond, $stored_cond]) | not)]
          else . end)
       ' --arg tag "$tag" --arg stored_tag "$stored_tag" --arg out_tag "$out_tag" --arg transport_tag "$transport_tag" \
         --arg stored_out "$stored_out" --arg stored_transport "$stored_transport" \
+        --arg cond "$cond" --arg stored_cond "$stored_cond" \
         --arg sub_rule "$MIHOMO_MANAGED_SUB_RULE"
       ;;
     *) kernel_unknown ;;
@@ -751,14 +1143,20 @@ split_user_inbound_tags() {
 # 出口条目与规则集条目本身已经是内核形状（由适配层生成），计划只负责摆放；
 # 最后一步的渲染同样在适配层——sing-box 的路由是对象数组，mihomo 是字符串数组。
 build_split_runtime_plan() {
-  local split_rows split plan name source behavior scope user user_status upstream out_tag rule_tag transport_tag outbounds rule_set inbounds conflict rule_file_path
+  local split_rows split plan name source behavior scope user user_status upstream out_tag rule_tag transport_tag outbounds rule_set inbounds conflict rule_file_path rule_url rule_geo match_key
   split_rows="$(jq -c '.splits[] | select(.status == "active")' "$STATE_FILE")" || return 1
   plan='{"outbound_groups":[],"rule_sets":[],"routes":[]}'
   while IFS= read -r split; do
     [[ -n "$split" ]] || continue
     name="$(jq -er '.name | select(type == "string" and length > 0)' <<<"$split")" || return 1
-    source="$(jq -er '(.url // .rule_file) | select(type == "string" and length > 0)' <<<"$split")" || return 1
+    rule_geo="$(split_rule_geo_from_json "$split")" || return 1
+    if [[ "$(jq 'length' <<<"$rule_geo")" == 0 ]]; then
+      source="$(jq -er '(.url // .rule_file) | select(type == "string" and length > 0)' <<<"$split")" || return 1
+    else
+      source=''
+    fi
     behavior="$(split_rule_behavior_from_json "$split")" || return 1
+    rule_url="$(split_rule_url_from_json "$split")" || return 1
     scope="$(jq -er '.scope | select(. == "all" or . == "user")' <<<"$split")" || return 1
     user="$(jq -er '.user // ""' <<<"$split")" || return 1
     if [[ "$scope" == user ]]; then
@@ -779,7 +1177,9 @@ build_split_runtime_plan() {
     # 起得来，只在启动日志里留一行 error，而那条分流从此静静地不生效
     # ——本该走上游的流量会改走直连。因此每次重建都真的看一眼。
     # 计划在任何配置改动之前完整生成，这里失败不会留下改了一半的运行配置。
-    if [[ "$PROXY_KERNEL" == mihomo ]]; then
+    # 远程来源不查这一条：本地那个文件是 mihomo 自己的缓存，删了它会重新下载。
+    # 该挡的是「地址取不到」，那在保存与「立即更新」时由管理器自己下载来挡。
+    if [[ "$PROXY_KERNEL" == mihomo && -z "$rule_url" && -n "$source" ]]; then
       rule_file_path="$(mihomo_rule_file_path "$source")"
       if [[ ! -f "$rule_file_path" || -L "$rule_file_path" ]]; then
         printf '错误：分流 %s 的规则文件不存在或不是普通文件：%s\n' "$name" "$rule_file_path" >&2
@@ -787,7 +1187,17 @@ build_split_runtime_plan() {
         return 1
       fi
     fi
-    rule_set="$(kernel_split_rule_set_entry "$rule_tag" "$source" "$behavior")" || return 1
+    # geo 来源没有规则集条目可写：类别直接写进匹配条件，不经过 rule-providers。
+    # 路由的身份因此也不能再用规则集标签——两条 geo 预置的类别清单一模一样时，
+    # 渲染出来的行逐字相同，按标签分组会得到两条重复的行，其中第二条永远不生效，
+    # 而「同一条件同时走两个出口」这种真冲突也会漏掉。所以身份统一改成**匹配条件**。
+    if [[ "$(jq 'length' <<<"$rule_geo")" == 0 ]]; then
+      match_key="rule:$rule_tag"
+      rule_set="$(kernel_split_rule_set_entry "$rule_tag" "$source" "$behavior" "$rule_url")" || return 1
+    else
+      match_key="geo:$(jq -r 'join(",")' <<<"$rule_geo")"
+      rule_set=''
+    fi
     if jq -e --arg tag "$out_tag" 'any(.outbound_groups[]; .tag == $tag)' <<<"$plan" >/dev/null; then
       if ! SB_JQ_OUTBOUNDS="$outbounds" jq -e --arg tag "$out_tag" \
         '($ENV.SB_JQ_OUTBOUNDS | fromjson) as $objects | any(.outbound_groups[]; .tag == $tag and .objects == $objects)' <<<"$plan" >/dev/null; then
@@ -797,29 +1207,32 @@ build_split_runtime_plan() {
     else
       plan="$(SB_JQ_OUTBOUNDS="$outbounds" jq -c --arg tag "$out_tag" '($ENV.SB_JQ_OUTBOUNDS | fromjson) as $objects | .outbound_groups += [{tag:$tag,objects:$objects}]' <<<"$plan")" || return 1
     fi
-    if jq -e --arg tag "$rule_tag" 'any(.rule_sets[]; .tag == $tag)' <<<"$plan" >/dev/null; then
-      jq -e --arg tag "$rule_tag" --argjson item "$rule_set" 'any(.rule_sets[]; .tag == $tag and . == $item)' <<<"$plan" >/dev/null || {
-        echo "错误：多个分流使用了同一条预置规则名称，但规则来源不同；请重新选择预置规则。" >&2
-        return 1
-      }
-    else
-      plan="$(jq -c --argjson item "$rule_set" '.rule_sets += [$item]' <<<"$plan")" || return 1
+    if [[ -n "$rule_set" ]]; then
+      if jq -e --arg tag "$rule_tag" 'any(.rule_sets[]; .tag == $tag)' <<<"$plan" >/dev/null; then
+        jq -e --arg tag "$rule_tag" --argjson item "$rule_set" 'any(.rule_sets[]; .tag == $tag and . == $item)' <<<"$plan" >/dev/null || {
+          echo "错误：多个分流使用了同一条预置规则名称，但规则来源不同；请重新选择预置规则。" >&2
+          return 1
+        }
+      else
+        plan="$(jq -c --argjson item "$rule_set" '.rule_sets += [$item]' <<<"$plan")" || return 1
+      fi
     fi
     if [[ "$scope" == all ]]; then inbounds='[]'; else inbounds="$(split_user_inbound_tags "$user")" || return 1; fi
-    conflict="$(jq -r --arg rule "$rule_tag" --arg out "$out_tag" --arg scope "$scope" --arg user "$user" '
+    conflict="$(jq -r --arg match "$match_key" --arg out "$out_tag" --arg scope "$scope" --arg user "$user" '
       first(.routes[] | select(
-        .rule_set == $rule and .outbound != $out and
+        .match == $match and .outbound != $out and
         ($scope == "all" or .scope_all or (.users | index($user) != null))
       ) | "yes") // ""
     ' <<<"$plan")" || return 1
     if [[ -n "$conflict" ]]; then
-      echo "错误：同一用户不能让同一条预置规则同时使用两个不同出口。" >&2
+      echo "错误：同一用户不能让同一条匹配规则同时使用两个不同出口。" >&2
+      echo "两条分流的规则来源相同（同一条预置规则，或同一组 GeoSite／GeoIP 类别），请让它们走同一个出口，或者换一组类别。" >&2
       return 1
     fi
-    if jq -e --arg rule "$rule_tag" --arg out "$out_tag" 'any(.routes[]; .rule_set == $rule and .outbound == $out)' <<<"$plan" >/dev/null; then
-      plan="$(jq -c --arg rule "$rule_tag" --arg out "$out_tag" --arg scope "$scope" --arg user "$user" --argjson inbound "$inbounds" '
+    if jq -e --arg match "$match_key" --arg out "$out_tag" 'any(.routes[]; .match == $match and .outbound == $out)' <<<"$plan" >/dev/null; then
+      plan="$(jq -c --arg match "$match_key" --arg out "$out_tag" --arg scope "$scope" --arg user "$user" --argjson inbound "$inbounds" '
         .routes |= map(
-          if .rule_set == $rule and .outbound == $out then
+          if .match == $match and .outbound == $out then
             if $scope == "all" then .scope_all = true | .users = [] | .inbound = []
             elif .scope_all then .
             else .users = ((.users + [$user]) | unique) | .inbound = ((.inbound + $inbound) | unique)
@@ -827,8 +1240,8 @@ build_split_runtime_plan() {
           else . end)
       ' <<<"$plan")" || return 1
     else
-      plan="$(jq -c --arg rule "$rule_tag" --arg out "$out_tag" --arg scope "$scope" --arg user "$user" --argjson inbound "$inbounds" '
-        .routes += [{rule_set:$rule,outbound:$out,scope_all:($scope == "all"),users:(if $scope == "all" then [] else [$user] end),inbound:$inbound}]
+      plan="$(jq -c --arg match "$match_key" --arg rule "$rule_tag" --arg out "$out_tag" --arg scope "$scope" --arg user "$user" --argjson inbound "$inbounds" --argjson geo "$rule_geo" '
+        .routes += [{match:$match,rule_set:$rule,geo:$geo,outbound:$out,scope_all:($scope == "all"),users:(if $scope == "all" then [] else [$user] end),inbound:$inbound}]
       ' <<<"$plan")" || return 1
     fi
   done <<<"$split_rows"
@@ -893,7 +1306,7 @@ rebuild_all_split_configs() {
       # 拿掉——那个名字是管理器保留的，不该被拿去当出口名。
       #
       # mihomo 部署没有旧版分流的历史包袱：托管分流在 mihomo 上从本片才开始存在。
-      SB_JQ_PLAN="$plan" rewrite_kernel_config '
+      SB_JQ_PLAN="$plan" rewrite_kernel_config "$MIHOMO_GEO_SETTINGS_PROGRAM"'
         ($ENV.SB_JQ_PLAN | fromjson) as $plan |
         .proxies = [(.proxies // [])[] | . as $item |
           select((($tags.out_tags + $tags.transport_tags) | index($item.name)) == null)] |
@@ -908,9 +1321,13 @@ rebuild_all_split_configs() {
            .rules = [$dispatch] + .rules
          else . end) |
         (if (.["sub-rules"] | length) == 0 then del(.["sub-rules"]) else . end) |
-        (if (.["rule-providers"] | length) == 0 then del(.["rule-providers"]) else . end)
+        (if (.["rule-providers"] | length) == 0 then del(.["rule-providers"]) else . end) |
+        # geo 设置放在最后：它要看的是**这一轮写完之后**配置里还有没有 geo 规则，
+        # 放在前面看到的是上一轮的样子（公开 Issue #219）。
+        sbm_apply_geo_settings
       ' --argjson tags "$tags" --arg sub_rule "$MIHOMO_MANAGED_SUB_RULE" \
-        --arg dispatch "$MIHOMO_SPLIT_DISPATCH_RULE"
+        --arg dispatch "$MIHOMO_SPLIT_DISPATCH_RULE" \
+        --argjson geox "$(mihomo_geox_url_json)"
       ;;
     *) kernel_unknown ;;
   esac
@@ -1084,14 +1501,17 @@ state_add_split() {
     .splits += [{name:$name,scope:$scope,user:(if $scope == "user" then $user else null end),upstream:$upstream,outbound_tag:$out_tag,rule_set_tag:$rule_tag,
       runtime_rule_tag:$runtime_rule_tag,runtime_outbound_tag:$runtime_outbound_tag,runtime_transport_tag:$runtime_transport_tag,
       rule_preset:$rule_preset,outbound_preset:$outbound_preset,status:"active",created_at:$created_at}
-      | .[$source_key] = $source
+      | (if $source == "" then . else .[$source_key] = $source end)
       | (if $behavior == "" then . else .rule_behavior = $behavior end)
+      | (if $rule_url == "" then . else .rule_url = $rule_url end)
+      | (if ($rule_geo | length) == 0 then . else .rule_geo = $rule_geo end)
       | (if $rule_preset == "" then del(.rule_preset) else . end)
       | (if $outbound_preset == "" then del(.outbound_preset) else . end)]
   ' --arg name "$1" --arg source "$2" --arg scope "$3" --arg user "$4" \
     --arg out_tag "$6" --arg rule_tag "$7" --arg rule_preset "$8" --arg outbound_preset "$9" \
     --arg runtime_rule_tag "${10}" --arg runtime_outbound_tag "${11}" --arg runtime_transport_tag "${12}" \
-    --arg behavior "${13:-}" --arg source_key "$source_key" \
+    --arg behavior "${13:-}" --arg rule_url "${14:-}" --argjson rule_geo "${15:-[]}" \
+    --arg source_key "$source_key" \
     --arg created_at "$(date -Iseconds)"
 }
 
@@ -1110,14 +1530,17 @@ state_replace_split() {
       (. + {scope:$scope,user:(if $scope == "user" then $user else null end),upstream:$upstream,outbound_tag:$out_tag,
         runtime_rule_tag:$runtime_rule_tag,runtime_outbound_tag:$runtime_outbound_tag,runtime_transport_tag:$runtime_transport_tag,
         updated_at:$updated_at}
-       | .[$source_key] = $source
-       | (if $behavior == "" then . else .rule_behavior = $behavior end)
+       | (if $source == "" then del(.[$source_key]) else .[$source_key] = $source end)
+       | (if $behavior == "" then del(.rule_behavior) else .rule_behavior = $behavior end)
+       | (if $rule_url == "" then del(.rule_url) else .rule_url = $rule_url end)
+       | (if ($rule_geo | length) == 0 then del(.rule_geo) else .rule_geo = $rule_geo end)
        | (if $rule_preset == "" then del(.rule_preset) else .rule_preset = $rule_preset end)
        | (if $outbound_preset == "" then del(.outbound_preset) else .outbound_preset = $outbound_preset end))
   ' --arg name "$1" --arg source "$2" --arg scope "$3" --arg user "$4" \
     --arg out_tag "$6" --arg rule_preset "$7" --arg outbound_preset "$8" \
     --arg runtime_rule_tag "$9" --arg runtime_outbound_tag "${10}" --arg runtime_transport_tag "${11}" \
-    --arg behavior "${12:-}" --arg source_key "$source_key" \
+    --arg behavior "${12:-}" --arg rule_url "${13:-}" --argjson rule_geo "${14:-[]}" \
+    --arg source_key "$source_key" \
     --arg updated_at "$(date -Iseconds)"
 }
 
@@ -1228,9 +1651,12 @@ state_add_rule_preset() {
   source_key="$(kernel_rule_source_key)" || return 1
   atomic_state_update '
     .rule_presets += [{name:$name,created_at:$created_at}
-      | .[$source_key] = $source
-      | (if $behavior == "" then . else .rule_behavior = $behavior end)]
-  ' --arg name "$1" --arg source "$2" --arg behavior "${3:-}" \
+      | (if $source == "" then . else .[$source_key] = $source end)
+      | (if $behavior == "" then . else .rule_behavior = $behavior end)
+      | (if $rule_url == "" then . else .rule_url = $rule_url end)
+      | (if ($rule_geo | length) == 0 then . else .rule_geo = $rule_geo end)]
+  ' --arg name "$1" --arg source "$2" --arg behavior "${3:-}" --arg rule_url "${4:-}" \
+    --argjson rule_geo "${5:-[]}" \
     --arg source_key "$source_key" --arg created_at "$(date -Iseconds)"
 }
 
@@ -1238,15 +1664,19 @@ state_replace_rule_preset() {
   local source_key
   source_key="$(kernel_rule_source_key)" || return 1
   atomic_state_update '
-    def apply_source: .[$source_key] = $source |
-      (if $behavior == "" then . else .rule_behavior = $behavior end);
+    def apply_source:
+      (if $source == "" then del(.[$source_key]) else .[$source_key] = $source end) |
+      (if $behavior == "" then del(.rule_behavior) else .rule_behavior = $behavior end) |
+      (if $rule_url == "" then del(.rule_url) else .rule_url = $rule_url end) |
+      (if ($rule_geo | length) == 0 then del(.rule_geo) else .rule_geo = $rule_geo end);
     (.rule_presets[] | select(.name == $name)) |= ((. + {updated_at:$updated_at}) | apply_source) |
     .splits |= map(
       if (.rule_preset // "") == $name then
         ((. + {updated_at:$updated_at}) | apply_source)
       else . end
     )
-  ' --arg name "$1" --arg source "$2" --arg behavior "${3:-}" \
+  ' --arg name "$1" --arg source "$2" --arg behavior "${3:-}" --arg rule_url "${4:-}" \
+    --argjson rule_geo "${5:-[]}" \
     --arg source_key "$source_key" --arg updated_at "$(date -Iseconds)"
 }
 
@@ -1322,28 +1752,40 @@ cmd_outbound_preset_remove() {
   log "预置出口已删除：${name}；关联分流已转为独立配置，现有连接参数没有变化"
 }
 
+# 来源写法的预检只对「有文件名的来源」有意义：远程来源的文件名由地址算出、
+# 在 validate_remote_rule_set_url 里查，geo 来源根本没有文件名。
+rule_source_needs_format_check() {
+  local rule_url="$1" rule_geo="${2:-[]}"
+  [[ -z "$rule_url" ]] || return 1
+  [[ "$(jq 'length' <<<"$rule_geo")" == 0 ]] || return 1
+}
+
 cmd_rule_preset_add() {
-  local name="$1" source="$2" behavior="${3:-}"
+  local name="$1" source="$2" behavior="${3:-}" rule_url="${4:-}" rule_geo="${5:-[]}"
   validate_preset_name "$name"
   rule_preset_exists "$name" && die "同名预置规则已经存在"
-  validate_split_rule_source_format "$source"
-  validate_split_rule_source "$source" "$behavior"
-  state_add_rule_preset "$name" "$source" "$behavior" || return 1
+  if rule_source_needs_format_check "$rule_url" "$rule_geo"; then
+    validate_split_rule_source_format "$source"
+  fi
+  validate_split_rule_source "$source" "$behavior" "$rule_url" "$rule_geo" || return 1
+  state_add_rule_preset "$name" "$source" "$behavior" "$rule_url" "$rule_geo" || return 1
   log "预置规则已保存：${name}；它不会改变当前分流"
 }
 
 cmd_rule_preset_edit() {
-  local name="$1" source="$2" behavior="${3:-}" active
+  local name="$1" source="$2" behavior="${3:-}" rule_url="${4:-}" rule_geo="${5:-[]}" active
   rule_preset_exists "$name" || die "预置规则不存在：$name"
-  validate_split_rule_source_format "$source"
-  validate_split_rule_source "$source" "$behavior"
+  if rule_source_needs_format_check "$rule_url" "$rule_geo"; then
+    validate_split_rule_source_format "$source"
+  fi
+  validate_split_rule_source "$source" "$behavior" "$rule_url" "$rule_geo" || return 1
   active="$(jq --arg name "$name" '[.splits[] | select((.rule_preset // "") == $name and .status == "active")] | length' "$STATE_FILE")" || return 1
   if ((active == 0)); then
-    state_replace_rule_preset "$name" "$source" "$behavior" || return 1
+    state_replace_rule_preset "$name" "$source" "$behavior" "$rule_url" "$rule_geo" || return 1
   else
     ensure_safe_ssh_for_kernel_restart || return 0
     start_managed_operation "edit-rule-preset:$name" || return 1
-    run_managed_step state_replace_rule_preset "$name" "$source" "$behavior" || return 1
+    run_managed_step state_replace_rule_preset "$name" "$source" "$behavior" "$rule_url" "$rule_geo" || return 1
     rebuild_and_finish_split_operation || return 1
   fi
   log "预置规则已更新：${name}；关联分流已经同步"
@@ -1391,10 +1833,15 @@ runtime_config_has_outbound() {
 # $config 是已规范化的运行配置；$lines 是 mihomo 托管 sub-rule 里的那一块
 # （sing-box 上恒为空数组，不使用）。mihomo 那几支用的规则行判断来自适配层，
 # 与生成它们的渲染函数放在一起。
+#
+# $rule 是规则集标签，$cond 是这条分流在 mihomo 规则行里的**匹配条件**
+# （公开 Issue #219）。两者对规则集来源是同一件事的两种写法，对 geo 来源
+# 就不是了——geo 分流根本没有规则集标签。sing-box 那几支仍然只用规则集标签：
+# 它没有 geo 这种来源，保存那一刻就已经挡住了。
 
 # 这条分流的规则集、出口与路由是不是都在。
 split_audit_runtime_complete() {
-  local config="$1" lines="$2" rule="$3" out="$4"
+  local config="$1" lines="$2" rule="$3" out="$4" cond="${5:-}"
   case "$PROXY_KERNEL" in
     singbox)
       jq -e --arg tag "$rule" '.route.rule_set[]? | select(.tag == $tag)' <<<"$config" >/dev/null &&
@@ -1403,10 +1850,13 @@ split_audit_runtime_complete() {
         '.route.rules[]? | select(.rule_set == $rule and .outbound == $out)' <<<"$config" >/dev/null
       ;;
     mihomo)
-      jq -e --arg rule "$rule" --arg out "$out" --argjson lines "$lines" "$MIHOMO_SPLIT_RULE_DEFS"'
-        ((.["rule-providers"] // {}) | has($rule)) and
+      # geo 来源没有 rule-providers 条目可查，这一问对它不适用：那一条要是
+      # 恒假，每台有 geo 分流的机器都会被审计说成「配置不完整」。
+      [[ -n "$cond" ]] || cond="$(mihomo_split_match_condition "$rule")" || return 1
+      jq -e --arg rule "$rule" --arg out "$out" --arg cond "$cond" --argjson lines "$lines" "$MIHOMO_SPLIT_RULE_DEFS"'
+        (if sbm_cond_is_rule_set($cond) then ((.["rule-providers"] // {}) | has($rule)) else true end) and
         any(.proxies[]?; .name == $out) and
-        any($lines[]; sbm_line_routes(.; $rule; $out))' <<<"$config" >/dev/null
+        any($lines[]; sbm_line_routes(.; $cond; $out))' <<<"$config" >/dev/null
       ;;
     *) kernel_unknown ;;
   esac
@@ -1416,7 +1866,7 @@ split_audit_runtime_complete() {
 # mode=all 要求覆盖该用户的全部入口（回答「有没有覆盖用户的全部连接」），
 # mode=any 只要沾上任意一个入口就算（回答「已停用之后规则是不是还在生效」）。
 split_audit_user_rule_present() {
-  local config="$1" lines="$2" rule="$3" out="$4" tags="$5" mode="$6"
+  local config="$1" lines="$2" rule="$3" out="$4" tags="$5" mode="$6" cond="${7:-}"
   case "$PROXY_KERNEL" in
     singbox)
       if [[ "$mode" == all ]]; then
@@ -1430,23 +1880,50 @@ split_audit_user_rule_present() {
       fi
       ;;
     mihomo)
+      [[ -n "$cond" ]] || cond="$(mihomo_split_match_condition "$rule")" || return 1
       if [[ "$mode" == all ]]; then
-        jq -e --arg rule "$rule" --arg out "$out" --argjson expected "$tags" --argjson lines "$lines" \
+        jq -e --arg cond "$cond" --arg out "$out" --argjson expected "$tags" --argjson lines "$lines" \
           "$MIHOMO_SPLIT_RULE_DEFS"'
-          any($lines[]; sbm_line_routes(.; $rule; $out) and sbm_line_covers(.; $expected))' <<<"$config" >/dev/null
+          any($lines[]; sbm_line_routes(.; $cond; $out) and sbm_line_covers(.; $expected))' <<<"$config" >/dev/null
       else
-        jq -e --arg rule "$rule" --arg out "$out" --argjson expected "$tags" --argjson lines "$lines" \
+        jq -e --arg cond "$cond" --arg out "$out" --argjson expected "$tags" --argjson lines "$lines" \
           "$MIHOMO_SPLIT_RULE_DEFS"'
-          any($lines[]; sbm_line_routes(.; $rule; $out) and sbm_line_touches(.; $rule; $expected))' <<<"$config" >/dev/null
+          any($lines[]; sbm_line_routes(.; $cond; $out) and sbm_line_touches(.; $cond; $expected))' <<<"$config" >/dev/null
       fi
       ;;
     *) kernel_unknown ;;
   esac
 }
 
+# 运行配置里那条规则集条目与状态里保存的来源对不对得上（公开 Issue #218）。
+# 这是 mihomo 独有的一条：sing-box 的规则集本来就只有「一个公网地址」一种来源，
+# 没有「本机文件」与「远程下载」两种形状可以漂移。
+#
+# 两个方向都要查：状态说远程、配置写成了 type:file，那条分流从此不再自动更新，
+# 只会一直用本机那份旧缓存；状态说本机文件、配置写成了 type:http，mihomo 会去
+# 网上下载并**覆盖**使用者自己维护的那个文件。两种都是内核一个字都不说的失效。
+#
+# 输出第一条对不上的说明；一致时无输出。规则集条目整个不在不在这里说——
+# 那由 split_audit_runtime_complete 报，两处都报会让同一件事出现两行。
+mihomo_rule_set_source_drift() {
+  local config="$1" rule="$2" rule_url="$3" file="$4"
+  jq -r --arg rule "$rule" --arg url "$rule_url" \
+    --arg path "$(mihomo_rule_file_path "$file")" \
+    --argjson interval "$REMOTE_RULE_SET_UPDATE_INTERVAL" '
+    ((.["rule-providers"] // {})[$rule] // null) as $entry |
+    if $entry == null then empty
+    elif $url == "" then
+      (if ($entry.type // "") != "file" then "保存的来源是本机文件，配置里却写成了自动下载" else empty end)
+    elif ($entry.type // "") != "http" then "保存的来源是网址，配置里却没有写成自动下载，规则不会再更新"
+    elif ($entry.url // "") != $url then "配置里的规则集网址与保存的不一致"
+    elif ($entry.path // "") != $path then "配置里的规则集文件位置与保存的不一致"
+    elif ($entry.interval // 0) != $interval then "配置里的规则集更新周期与保存的不一致"
+    else empty end' <<<"$config"
+}
+
 # 不限入口的那一条路由在不在。已停用的「全部用户」分流不该还留着它。
 split_audit_scope_all_rule_present() {
-  local config="$1" lines="$2" rule="$3" out="$4"
+  local config="$1" lines="$2" rule="$3" out="$4" cond="${5:-}"
   case "$PROXY_KERNEL" in
     singbox)
       jq -e --arg rule "$rule" --arg out "$out" '
@@ -1454,8 +1931,9 @@ split_audit_scope_all_rule_present() {
           ((.inbound // []) | length == 0))' <<<"$config" >/dev/null
       ;;
     mihomo)
-      jq -e --arg rule "$rule" --arg out "$out" --argjson lines "$lines" "$MIHOMO_SPLIT_RULE_DEFS"'
-        any($lines[]; sbm_line_scope_all(.; $rule; $out))' <<<"$config" >/dev/null
+      [[ -n "$cond" ]] || cond="$(mihomo_split_match_condition "$rule")" || return 1
+      jq -e --arg cond "$cond" --arg out "$out" --argjson lines "$lines" "$MIHOMO_SPLIT_RULE_DEFS"'
+        any($lines[]; sbm_line_scope_all(.; $cond; $out))' <<<"$config" >/dev/null
       ;;
     *) kernel_unknown ;;
   esac
@@ -1526,7 +2004,7 @@ runtime_outbound_tag_owned_by_state() {
 }
 
 cmd_split_add() {
-  local name="$1" source="$2" scope="$3" user="$4" upstream="$5" out_tag="$6" rule_preset="${7:-}" outbound_preset="${8:-}" behavior="${9:-}" rule_tag="$1"
+  local name="$1" source="$2" scope="$3" user="$4" upstream="$5" out_tag="$6" rule_preset="${7:-}" outbound_preset="${8:-}" behavior="${9:-}" rule_url="${10:-}" rule_geo="${11:-[]}" rule_tag="$1"
   local runtime_rule_tag runtime_outbound_tag runtime_transport_tag kernel_name
   kernel_name="$(kernel_display_name)" || return 1
   validate_split_name "$name"; split_exists "$name" && die "分流规则已存在：$name"
@@ -1536,7 +2014,9 @@ cmd_split_add() {
   runtime_rule_tag="$(stable_managed_tag rule "$rule_preset")" || return 1
   runtime_outbound_tag="$(stable_managed_tag outbound "$outbound_preset")" || return 1
   runtime_transport_tag="$(stable_managed_tag transport "$outbound_preset")" || return 1
-  validate_split_rule_source_format "$source"
+  if rule_source_needs_format_check "$rule_url" "$rule_geo"; then
+    validate_split_rule_source_format "$source"
+  fi
   if [[ "$scope" == user ]]; then validate_name "$user"; user_exists "$user" || die "用户不存在：$user"; fi
   runtime_config_has_rule_set "$rule_tag" && die "${kernel_name} 已存在同名规则集标签"
   jq -e --arg out "$out_tag" '.splits[]? | select((.outbound_tag // ("managed-out-" + .name)) == $out)' "$STATE_FILE" >/dev/null && die "出口名称已被其他分流使用，请换一个名称"
@@ -1552,11 +2032,11 @@ cmd_split_add() {
     die "这个预置出口与现有 ${kernel_name} 配置重名，请更换预置名称"
   fi
   validate_split_relationships "$name" "$runtime_rule_tag" "$runtime_outbound_tag" "$scope" "$user" false || return 1
-  validate_split_rule_source "$source" "$behavior"
+  validate_split_rule_source "$source" "$behavior" "$rule_url" "$rule_geo" || return 1
   ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "add-split:$name" || return 1
   run_managed_step state_add_split "$name" "$source" "$scope" "$user" "$upstream" "$out_tag" "$rule_tag" "$rule_preset" "$outbound_preset" \
-    "$runtime_rule_tag" "$runtime_outbound_tag" "$runtime_transport_tag" "$behavior" || return 1
+    "$runtime_rule_tag" "$runtime_outbound_tag" "$runtime_transport_tag" "$behavior" "$rule_url" "$rule_geo" || return 1
   rebuild_and_finish_split_operation || return 1
   log "分流增加成功：$name"
 }
@@ -1606,7 +2086,7 @@ cmd_split_remove() {
 }
 
 cmd_split_edit() {
-  local name="$1" source="$2" scope="$3" user="$4" upstream="$5" out_tag="$6" rule_preset="${7:-}" outbound_preset="${8:-}" behavior="${9:-}" split old_out
+  local name="$1" source="$2" scope="$3" user="$4" upstream="$5" out_tag="$6" rule_preset="${7:-}" outbound_preset="${8:-}" behavior="${9:-}" rule_url="${10:-}" rule_geo="${11:-[]}" split old_out
   local runtime_rule_tag runtime_outbound_tag runtime_transport_tag
   split_exists "$name" || die "分流不存在：$name"
   [[ -z "$rule_preset" ]] || rule_preset_exists "$rule_preset" || die "预置规则不存在：$rule_preset"
@@ -1624,7 +2104,9 @@ cmd_split_edit() {
     runtime_transport_tag="$(split_runtime_transport_tag_from_json "$split")" || return 1
   fi
   validate_outbound_tag "$out_tag"
-  validate_split_rule_source_format "$source"
+  if rule_source_needs_format_check "$rule_url" "$rule_geo"; then
+    validate_split_rule_source_format "$source"
+  fi
   if [[ "$scope" == user ]]; then validate_name "$user"; user_exists "$user" || die "用户不存在：$user"; fi
   jq -e --arg name "$name" --arg out "$out_tag" '.splits[]? | select(.name != $name and (.outbound_tag // ("managed-out-" + .name)) == $out)' "$STATE_FILE" >/dev/null && die "出口名称已被其他分流使用，请换一个名称"
   [[ "$out_tag" != "$(split_transport_tag "$name")" ]] || die "出口名称与系统内部名称冲突，请换一个名称"
@@ -1633,12 +2115,12 @@ cmd_split_edit() {
     runtime_config_has_outbound "$out_tag" && die "$(kernel_display_name) 已存在同名出站"
   fi
   validate_split_relationships "$name" "$runtime_rule_tag" "$runtime_outbound_tag" "$scope" "$user" false || return 1
-  validate_split_rule_source "$source" "$behavior"
+  validate_split_rule_source "$source" "$behavior" "$rule_url" "$rule_geo" || return 1
   ensure_safe_ssh_for_kernel_restart || return 0
   start_managed_operation "edit-split:$name" || return 1
   run_managed_step remove_split_config "$name" || return 1
   run_managed_step state_replace_split "$name" "$source" "$scope" "$user" "$upstream" "$out_tag" "$rule_preset" "$outbound_preset" \
-    "$runtime_rule_tag" "$runtime_outbound_tag" "$runtime_transport_tag" "$behavior" || return 1
+    "$runtime_rule_tag" "$runtime_outbound_tag" "$runtime_transport_tag" "$behavior" "$rule_url" "$rule_geo" || return 1
   rebuild_and_finish_split_operation || return 1
   log "分流修改成功：$name"
 }
@@ -1705,8 +2187,14 @@ cmd_split_show() {
     "作用范围：\(if $s.scope == "all" then "全部用户" else "用户:" + $s.user end)",
     "规则来源：\($s.rule_preset // "独立配置")",
     (if $kernel == "mihomo" then
-       "规则文件：\($rules_dir)/\($s.rule_file // "?")",
-       "规则写法：\(if $s.rule_behavior == "classical" then "完整规则行" elif $s.rule_behavior == "domain" then "域名列表" elif $s.rule_behavior == "ipcidr" then "IP 段列表" else "未知写法" end)"
+       (if (($s.rule_geo // []) | length) > 0 then
+          "规则类别：\(($s.rule_geo // []) | join("  "))",
+          "说明：命中其中任意一个类别就走这条分流；数据库由 mihomo 自己下载与更新"
+        else
+          "规则文件：\($rules_dir)/\($s.rule_file // "?")",
+          "规则来源：\(if ($s.rule_url // "") != "" then "网址 " + $s.rule_url + "（每天自动更新）" else "本机文件（自己维护）" end)",
+          "规则写法：\(if $s.rule_behavior == "classical" then "完整规则行" elif $s.rule_behavior == "domain" then "域名列表" elif $s.rule_behavior == "ipcidr" then "IP 段列表" else "未知写法" end)"
+        end)
      else "规则集地址：\($s.url)" end),
     "出口来源：\($s.outbound_preset // "独立配置")",
     "出口协议：\(if $s.upstream.protocol == "anytls" then "AnyTLS" elif $s.upstream.protocol == "shadowsocks" then "Shadowsocks" elif $s.upstream.protocol == "ss_shadowtls" then "SS2022 + ShadowTLS" else "旧版未配置" end)",

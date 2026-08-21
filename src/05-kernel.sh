@@ -471,7 +471,7 @@ kernel_rule_source_key() {
 # mihomo 放在 rule-providers{} 里，是以名字为键的对象成员。
 # 因此这里统一返回 {tag: ..., entry: {...}}，由各自的渲染函数决定怎么摆。
 kernel_split_rule_set_entry() {
-  local tag="$1" source="$2" behavior="$3" format
+  local tag="$1" source="$2" behavior="$3" rule_url="${4:-}" format
   case "$PROXY_KERNEL" in
     singbox)
       format="$(split_rule_format "$source")" || return 1
@@ -486,8 +486,18 @@ kernel_split_rule_set_entry() {
       # 写绝对路径。状态里存的是文件名，而 mihomo 会把相对路径按**工作目录**
       # 解析，那是 /var/lib/mihomo，不是规则目录——写相对路径会指到一个
       # 根本不存在的文件上，而且服务照样起得来，只在日志里留一行 error。
-      jq -cn --arg tag "$tag" --arg path "$(mihomo_rule_file_path "$source")" --arg behavior "$behavior" \
-        '{tag:$tag,entry:{type:"file",behavior:$behavior,format:"yaml",path:$path}}'
+      # 远程来源写 type:http，mihomo 自己下载并按 interval 更新（公开 Issue #218）；
+      # path 仍然是规则目录里那个文件，它既是缓存也是取不到时的兜底。
+      # 本机来源保持原样。两种都写绝对路径，理由同上。
+      if [[ -n "$rule_url" ]]; then
+        jq -cn --arg tag "$tag" --arg path "$(mihomo_rule_file_path "$source")" \
+          --arg behavior "$behavior" --arg url "$rule_url" \
+          --argjson interval "$REMOTE_RULE_SET_UPDATE_INTERVAL" \
+          '{tag:$tag,entry:{type:"http",behavior:$behavior,format:"yaml",url:$url,path:$path,interval:$interval}}'
+      else
+        jq -cn --arg tag "$tag" --arg path "$(mihomo_rule_file_path "$source")" --arg behavior "$behavior" \
+          '{tag:$tag,entry:{type:"file",behavior:$behavior,format:"yaml",path:$path}}'
+      fi
       ;;
     *) kernel_unknown ;;
   esac
@@ -628,32 +638,86 @@ kernel_skeleton_skips_empty_containers() {
 
 # 判断托管 sub-rule 里的一行是什么。行的形状只有两种，都由
 # kernel_render_split_plan 生成：
-#   RULE-SET,<规则集>,<出口>
-#   AND,((RULE-SET,<规则集>),(IN-NAME,...)),<出口>
+#   <匹配条件>,<出口>
+#   AND,((<匹配条件>),(IN-NAME,...)),<出口>
 # 生成与识别必须一起改，因此这几段判断与渲染函数放在同一个模块里，
 # 由分流模块与审计以变量展开的方式注入自己的 jq 程序。
 # tests/test-static.sh 据此禁止其它模块自己拼这套规则语法。
 #
-# 四个判断各自回答一个问题：这一行属不属于某条规则集（删除时用）、
-# 是不是「某规则集 → 某出口」（审计「配置完不完整」用）、是不是不限入口的
+# **匹配条件**有两种来源（公开 Issue #219 把第二种加了进来）：
+#   规则集    RULE-SET,<规则集标签>
+#   geo 类别  GEOSITE,openai            单个类别
+#             OR,((GEOSITE,a),(GEOIP,us))  多个类别
+# 认行的办法对两者是同一套：条件要么整个摆在行首、后面跟一个逗号，要么整个摆在
+# AND 的第一个括号里。因此这里统一按「条件字符串」判断，而不是按规则集标签；
+# geo 来源根本没有规则集标签可用，按标签判断就没法认出它的行。
+#
+# **两处都必须连着分隔符一起比，不能只用 contains。** 只判「行里出现过这个条件」
+# 时，一条 OR,((GEOSITE,a),(GEOIP,us)) 的行会被条件 GEOSITE,a 认领——那条行属于
+# 另一条分流。后果是删一条分流会顺手删掉别人的行（重建能补回来），以及审计把
+# 「已停用的分流仍在生效」报成恒真（那一条自动修复也修不掉，只会一直刷红）。
+# 顺带也挡住了标签的前缀重名：条件 RULE-SET,r 不会认领 RULE-SET,rr 的行。
+#
+# 四个判断各自回答一个问题：这一行属不属于某条分流（删除时用）、
+# 是不是「某条件 → 某出口」（审计「配置完不完整」用）、是不是不限入口的
 # 那一种（审计已停用的全局分流用）、有没有覆盖到某几个入口名（审计
 # 「有没有覆盖用户的全部连接」与「已停用用户是否仍在生效」用）。
 MIHOMO_SPLIT_RULE_DEFS='
-  def sbm_line_owned_by($line; $tags):
+  def sbm_match_cond($rule_set; $geo):
+    if ($geo | length) > 0 then
+      (if ($geo | length) == 1 then $geo[0]
+       else "OR,(" + ([$geo[] | "(" + . + ")"] | join(",")) + ")" end)
+    else "RULE-SET," + $rule_set end;
+  def sbm_cond_is_rule_set($cond): ($cond | startswith("RULE-SET,"));
+  def sbm_line_owned_by($line; $conds):
     ($line | type) == "string" and
-    any($tags[]; . as $tag |
-      ($line | startswith("RULE-SET," + $tag + ",")) or
-      ($line | contains("(RULE-SET," + $tag + ")")));
-  def sbm_line_routes($line; $rule; $out):
-    sbm_line_owned_by($line; [$rule]) and ($line | endswith("," + $out));
-  def sbm_line_scope_all($line; $rule; $out):
-    ($line | type) == "string" and $line == ("RULE-SET," + $rule + "," + $out);
+    any($conds[]; . as $cond | ($cond | length) > 0 and
+      (($line | startswith($cond + ",")) or
+       ($line | startswith("AND,((" + $cond + "),("))));
+  def sbm_line_routes($line; $cond; $out):
+    sbm_line_owned_by($line; [$cond]) and ($line | endswith("," + $out));
+  def sbm_line_scope_all($line; $cond; $out):
+    ($line | type) == "string" and $line == ($cond + "," + $out);
   def sbm_line_covers($line; $names):
     ($line | type) == "string" and
     all($names[]; . as $entry | $line | contains("(IN-NAME," + $entry + ")"));
-  def sbm_line_touches($line; $rule; $names):
-    sbm_line_owned_by($line; [$rule]) and
+  def sbm_line_touches($line; $cond; $names):
+    sbm_line_owned_by($line; [$cond]) and
     any($names[]; . as $entry | $line | contains("(IN-NAME," + $entry + ")"));'
+
+# mihomo 的 geo 设置（公开 Issue #219）。分流用到 GeoSite／GeoIP 类别时，这四个键
+# 决定用哪份数据、更不更新、从哪里下载。三个取值都**不是重申默认值**：mihomo 默认
+# geodata-mode 是假（GeoIP 用 metadb 而不是 v2ray 的 GeoIP.dat）、默认不自动更新。
+#
+# **只在这台机器真的有 geo 规则时才写。** 实测（v1.19.30）：三个键写上去而配置里
+# 一条 geo 规则都没有时，不会下载任何数据库——但每次启动都会留下一行 error 级日志
+# 「[GEO] Get GEO database update time error: stat .../GeoSite.dat: no such file or
+# directory」。一台从来不用 geo 的机器不该在日志里天天报一条假错。对照也做了：
+# 不写这几个键时，同一份配置连这行日志都没有。
+#
+# 判断依据是**配置里有没有 geo 规则**，而不是「管理器有没有 geo 分流」：使用者
+# 自己写在顶层 rules 里的 GEOSITE 规则同样需要这几个键，按前者判断才不会把
+# 他的设置删掉。反过来，一条 geo 规则都不剩时这四个键由管理器删掉——它们是
+# 管理器放进去的，留着只剩那行假错。
+#
+# geox-url 由「geo 数据源」设置项决定：留空就删掉这个键，用 mihomo 自带的源。
+# 写成 def 而不是一整段过滤器，是为了让调用点按既有写法拼：变量在前、单引号常量
+# 在后（tests/check-shell-call-targets.py 的分词器只认这一种，见公开 Issue #102）。
+# 需要 --argjson geox。
+MIHOMO_GEO_SETTINGS_PROGRAM='
+  def sbm_apply_geo_settings:
+    def sbm_uses_geo:
+      [(.rules // [])[], ((.["sub-rules"] // {}) | .[] | .[]?)] |
+      any(.[]?; (type == "string") and test("(^|[(,])GEO(SITE|IP),"));
+    if sbm_uses_geo then
+      (if has("geodata-mode") then . else .["geodata-mode"] = true end) |
+      (if has("geo-auto-update") then . else .["geo-auto-update"] = true end) |
+      (if has("geo-update-interval") then . else .["geo-update-interval"] = 24 end) |
+      (if ($geox | length) == 0 then del(.["geox-url"]) else .["geox-url"] = $geox end)
+    else
+      del(.["geodata-mode"]) | del(.["geo-auto-update"]) |
+      del(.["geo-update-interval"]) | del(.["geox-url"])
+    end;'
 
 # 派发条目。条件写成覆盖整个端口空间的 DST-PORT，语义是「所有连接」：
 # MATCH 不能当逻辑规则的条件（mihomo 明确拒绝 SUB-RULE,(MATCH),名字），
@@ -671,14 +735,21 @@ MIHOMO_SPLIT_DISPATCH_RULE="SUB-RULE,(DST-PORT,0-65535),${MIHOMO_MANAGED_SUB_RUL
 # 因此计划的构造留在分流模块里只写一遍，形状差异集中在这里。
 #
 # 输入：{outbound_groups:[{tag,objects}],rule_sets:[{tag,entry}],
-#        routes:[{rule_set,outbound,scope_all,users,inbound}]}
+#        routes:[{rule_set,geo,outbound,scope_all,users,inbound}]}
 # 输出（sing-box）：{outbounds:[...],rule_sets:[...],rules:[...]}
 # 输出（mihomo）：  {proxies:[...],rule_providers:{...},sub_rules:[...]}
 kernel_render_split_plan() {
   local plan="$1"
   case "$PROXY_KERNEL" in
     singbox)
-      jq -c '{
+      # geo 类别只做 mihomo 侧（公开 Issue #219）。这里明确报错而不是把它当成
+      # 空条件渲染出去：静静少一个条件的路由会把**全部流量**送进上游出口。
+      # 保存那一刻就已经挡住了 sing-box 上的 geo 来源，这条是第二道。
+      jq -c '
+        if any(.routes[]?; ((.geo // []) | length) > 0) then
+          error("sing-box 不支持 GeoSite／GeoIP 类别分流")
+        else . end |
+        {
         outbounds:[.outbound_groups[].objects[]],
         rule_sets:[.rule_sets[].entry],
         rules:[.routes[] | ({rule_set:.rule_set,action:"route",outbound:.outbound} +
@@ -692,22 +763,31 @@ kernel_render_split_plan() {
       # 这些字符，这条断言是为了将来改名字格式时当场变红而不是悄悄拼错。
       # 入口为空的用户专属条目直接丢掉：它谁都作用不到，
       # 而 OR,(()) 这种空集合写法 mihomo 不接受。
-      jq -c '
+      jq -c "$MIHOMO_SPLIT_RULE_DEFS"'
         def guard($text): if ($text | test("[,()]")) then
             error("名字里不能出现逗号或括号，否则会拼坏 mihomo 规则：" + $text)
           else $text end;
         def in_name($names):
           if ($names | length) == 1 then "(IN-NAME," + guard($names[0]) + ")"
           else "(OR,(" + ([$names[] | "(IN-NAME," + guard(.) + ")"] | join(",")) + "))" end;
+        # geo 类别本身就带一个逗号（GEOSITE,openai），过不了上面那道 guard，
+        # 也不该过——它要挡的是名字里混进分隔符。这里换成按整体写法卡死：
+        # 只允许 GEOSITE／GEOIP 加一个不含逗号括号的类别名，多一个逗号
+        # （例如 no-resolve 后缀）或任何括号都当场报错，而不是拼出一条
+        # mihomo 只会说「规则类型不支持」的规则。
+        def guard_geo($text):
+          if ($text | test("^(GEOSITE|GEOIP),[A-Za-z0-9_.:@-]+$")) then $text
+          else error("geo 类别只能写成 GEOSITE,<类别> 或 GEOIP,<类别>：" + $text) end;
         {
           proxies:[.outbound_groups[].objects[]],
           rule_providers:([.rule_sets[] | {key:guard(.tag),value:.entry}] | from_entries),
           sub_rules:[.routes[] |
+            sbm_match_cond(guard(.rule_set // ""); [(.geo // [])[] | guard_geo(.)]) as $cond |
             if .scope_all then
-              "RULE-SET," + guard(.rule_set) + "," + guard(.outbound)
+              $cond + "," + guard(.outbound)
             elif ((.inbound // []) | length) == 0 then empty
             else
-              "AND,((RULE-SET," + guard(.rule_set) + ")," + in_name(.inbound) + ")," + guard(.outbound)
+              "AND,((" + $cond + ")," + in_name(.inbound) + ")," + guard(.outbound)
             end]
         }' <<<"$plan"
       ;;

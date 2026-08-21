@@ -838,6 +838,7 @@ collect_user_consistency_issue_rows() {
 
 audit_consistency() {
   local config_json nfuse_json skeleton_missing_rows skeleton_path user_issue_rows issue_repairable issue_message expiry_rows split_rows split name split_status rule_tag out_tag scope scope_user scope_user_status scope_tags expires
+  local split_rule_url split_rule_file rule_source_drift split_rule_geo split_cond
   local preset_link_rows preset_kind preset_reason managed_tags legacy_cleanup legacy_count
   local normalise_program skeleton_program skeleton_filter sub_rule_name managed_lines
   local unit_drift_rows unit_path unit_drift_rc=0 handshake_host
@@ -907,8 +908,10 @@ audit_consistency() {
     (if (($split.rule_preset // "") != "") then
        (first($rules[] | select(.name == $split.rule_preset)) // null) as $preset |
        if $preset == null then [$split.name,"规则","预置已不存在"]
-       elif ($split.url // $split.rule_file) != ($preset.url // $preset.rule_file) or
-            ($split.rule_behavior // "") != ($preset.rule_behavior // "") then [$split.name,"规则","保存内容未同步"] else empty end
+       elif ($split.url // $split.rule_file // "") != ($preset.url // $preset.rule_file // "") or
+            ($split.rule_behavior // "") != ($preset.rule_behavior // "") or
+            ($split.rule_url // "") != ($preset.rule_url // "") or
+            ($split.rule_geo // []) != ($preset.rule_geo // []) then [$split.name,"规则","保存内容未同步"] else empty end
      else empty end) | @tsv
   ' "$STATE_FILE")" || return 1
   while IFS=$'\t' read -r name preset_kind preset_reason; do
@@ -933,6 +936,10 @@ audit_consistency() {
     scope_user="$(jq -r 'if .scope == "user" then (.user // "") else "" end' <<<"$split")" || return 1
     rule_tag="$(split_runtime_rule_tag_from_json "$split")" || return 1
     out_tag="$(split_runtime_out_tag_from_json "$split")" || return 1
+    # 这条分流在 mihomo 规则行里的匹配条件。geo 来源没有规则集标签，
+    # 认行只能靠条件（公开 Issue #219）；sing-box 那几支不看这个值。
+    split_rule_geo="$(split_rule_geo_from_json "$split")" || return 1
+    split_cond="$(mihomo_split_match_condition "$rule_tag" "$split_rule_geo")" || return 1
     scope_user_status=""
     if [[ -n "$scope_user" ]]; then
       scope_user_status="$(jq -r --arg name "$scope_user" 'first(.users[]? | select(.name == $name) | .status) // ""' "$STATE_FILE")" || return 1
@@ -940,34 +947,47 @@ audit_consistency() {
     if [[ "$split_status" == active && "$scope_user_status" == disabled ]]; then
       # 用户已停用时这条专属分流不会写入运行配置，只需确认没有残留规则
       scope_tags="$(split_user_inbound_tags "$scope_user")" || return 1
-      if split_audit_user_rule_present "$config_json" "$managed_lines" "$rule_tag" "$out_tag" "$scope_tags" any; then
+      if split_audit_user_rule_present "$config_json" "$managed_lines" "$rule_tag" "$out_tag" "$scope_tags" any "$split_cond"; then
         printf '  [可自动修复] 分流 %s 指定的用户 %s 已停用，但连接规则仍在生效\n' "$name" "$scope_user"
         ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
       fi
     elif [[ "$split_status" == active ]]; then
-      if ! split_audit_runtime_complete "$config_json" "$managed_lines" "$rule_tag" "$out_tag"; then
+      if ! split_audit_runtime_complete "$config_json" "$managed_lines" "$rule_tag" "$out_tag" "$split_cond"; then
         printf '  [可自动修复] 分流 %s 的规则或出口配置不完整\n' "$name"
         ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
+      fi
+      # 规则集的来源有没有漂（公开 Issue #218）。mihomo 独有：只有它才有
+      # 「本机文件」与「网址自动下载」两种形状，而两者互换时内核一个字都不说。
+      if [[ "$PROXY_KERNEL" == mihomo ]]; then
+        split_rule_url="$(split_rule_url_from_json "$split")" || return 1
+        split_rule_file="$(jq -r '(.rule_file // "")' <<<"$split")" || return 1
+        if [[ -n "$split_rule_file" ]]; then
+          rule_source_drift="$(mihomo_rule_set_source_drift "$config_json" "$rule_tag" "$split_rule_url" "$split_rule_file")" || return 1
+          if [[ -n "$rule_source_drift" ]]; then
+            printf '  [可自动修复] 分流 %s 的规则集来源与保存的不一致（%s）\n' "$name" "$rule_source_drift"
+            ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
+          fi
+        fi
       fi
       if [[ -n "$scope_user" ]] && ! user_exists "$scope_user"; then
         printf '  [需要处理] 分流 %s 指定的用户 %s 已不存在\n' "$name" "$scope_user"
         ((AUDIT_ISSUES+=1))
       elif [[ -n "$scope_user" ]]; then
         scope_tags="$(split_user_inbound_tags "$scope_user")" || return 1
-        if ! split_audit_user_rule_present "$config_json" "$managed_lines" "$rule_tag" "$out_tag" "$scope_tags" all; then
+        if ! split_audit_user_rule_present "$config_json" "$managed_lines" "$rule_tag" "$out_tag" "$scope_tags" all "$split_cond"; then
           printf '  [可自动修复] 分流 %s 尚未覆盖用户 %s 的全部连接\n' "$name" "$scope_user"
           ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
         fi
       fi
     else
       if [[ "$scope" == all ]]; then
-        if split_audit_scope_all_rule_present "$config_json" "$managed_lines" "$rule_tag" "$out_tag"; then
+        if split_audit_scope_all_rule_present "$config_json" "$managed_lines" "$rule_tag" "$out_tag" "$split_cond"; then
           printf '  [可自动修复] 已停用分流 %s 仍有连接规则生效\n' "$name"
           ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
         fi
       elif [[ -n "$scope_user" ]]; then
         scope_tags="$(split_user_inbound_tags "$scope_user")" || return 1
-        if split_audit_user_rule_present "$config_json" "$managed_lines" "$rule_tag" "$out_tag" "$scope_tags" any; then
+        if split_audit_user_rule_present "$config_json" "$managed_lines" "$rule_tag" "$out_tag" "$scope_tags" any "$split_cond"; then
           printf '  [可自动修复] 已停用分流 %s 仍有连接规则生效\n' "$name"
           ((AUDIT_ISSUES+=1)); ((AUDIT_REPAIRABLE+=1))
         fi

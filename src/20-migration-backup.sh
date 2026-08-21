@@ -582,10 +582,17 @@ validate_migration_payload_structure() {
     # mihomo 是使用者自己那个本地块状 yaml 文件的文件名。
     # 迁移包不带那个文件，所以这里只校验写法——文件在不在由恢复之后的分流重建报。
     # 文件名限制成不含斜杠、不含 ..，迁移包里的内容因此不可能指到目录之外。
+    # 第三种来源是 GeoSite／GeoIP 类别（公开 Issue #219）：既没有地址也没有文件，
+    # 状态里只有一份类别清单。写法卡死到「前缀 + 不含逗号括号的类别名」，
+    # 迁移包里的内容因此不可能把一条规则拼成另一条；类别名认不认得由恢复之后
+    # 那次 mihomo 配置校验说——它在这件事上是当场失败，不是静默失效。
     def valid_rule_source:
       ((.url | type == "string" and test("^https://") and test("\\.(srs|json)([?#].*)?$")) or
        ((.rule_file | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
-        (.rule_behavior == "classical" or .rule_behavior == "domain" or .rule_behavior == "ipcidr")));
+        (.rule_behavior == "classical" or .rule_behavior == "domain" or .rule_behavior == "ipcidr") and
+        ((.rule_url // "") == "" or (.rule_url | type == "string" and test("^https://") and test("\\.(yaml|yml)$")))) or
+       ((.rule_geo | type == "array" and length > 0 and
+         all(.[]; type == "string" and test("^(GEOSITE|GEOIP),[A-Za-z0-9_.:@-]+$")))));
 
     def valid_upstream:
       (type == "object") and

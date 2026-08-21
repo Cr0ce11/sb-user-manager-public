@@ -16,6 +16,7 @@ cat > "$work/expected-direct-functions" <<'EOF'
 activate_managed_services
 append_inbounds
 append_inbounds_from_new_user_snapshot
+apply_mihomo_geo_settings
 apply_rule_set_migration
 atomic_install_file
 begin_environment_transaction
@@ -65,6 +66,7 @@ verify_managed_uninstall_paths_removed
 verify_singbox_cleanup
 write_base_config
 write_deployed_versions
+write_geo_source_config
 write_global_sni_config
 write_manager_config
 write_singbox_channel_state
