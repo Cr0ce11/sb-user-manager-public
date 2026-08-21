@@ -21,14 +21,14 @@ jobs:
           shellcheck --version
       - name: Bash syntax
         run: |
-          for script in sb-user-manager.sh tests/acceptance.sh tests/check-managed-step-errexit.sh tests/test-acceptance.sh tests/test-standalone-startup.sh tests/test-manager-handoff.sh tools/build-manager.sh tools/audit-public-readiness.sh tools/export-public-snapshot.sh tools/check-immutable-release-setting.sh tests/test-build.sh tests/test-public.sh tests/test-public-readiness.sh tests/test-public-snapshot.sh tests/test-release-workflow.sh; do
+          for script in sb-user-manager.sh tests/acceptance.sh tests/require-strict-errexit.sh tests/check-managed-step-errexit.sh tests/test-acceptance.sh tests/test-standalone-startup.sh tests/test-manager-handoff.sh tools/build-manager.sh tools/audit-public-readiness.sh tools/export-public-snapshot.sh tools/check-immutable-release-setting.sh tests/test-build.sh tests/test-public.sh tests/test-public-readiness.sh tests/test-public-snapshot.sh tests/test-release-workflow.sh; do
             bash -n "$script"
           done
       - name: Verify generated manager
         run: bash tools/build-manager.sh --check
       - name: ShellCheck
         run: |
-          shellcheck -x -e SC1090,SC1091 sb-user-manager.sh tests/acceptance.sh tests/check-managed-step-errexit.sh tests/test-acceptance.sh tests/test-standalone-startup.sh tools/build-manager.sh tools/audit-public-readiness.sh tools/export-public-snapshot.sh tools/check-immutable-release-setting.sh tests/test-build.sh tests/test-public-readiness.sh tests/test-public-snapshot.sh tests/test-release-workflow.sh
+          shellcheck -x -e SC1090,SC1091 sb-user-manager.sh tests/acceptance.sh tests/require-strict-errexit.sh tests/check-managed-step-errexit.sh tests/test-acceptance.sh tests/test-standalone-startup.sh tools/build-manager.sh tools/audit-public-readiness.sh tools/export-public-snapshot.sh tools/check-immutable-release-setting.sh tests/test-build.sh tests/test-public-readiness.sh tests/test-public-snapshot.sh tests/test-release-workflow.sh
           # 测试桩由动态 source 的函数间接调用，ShellCheck 无法静态追踪。
           shellcheck -x -e SC1090,SC1091,SC2034,SC2317 tests/test-public.sh tests/test-manager-handoff.sh
       - name: Static release checks

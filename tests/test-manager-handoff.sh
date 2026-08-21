@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+# shellcheck source=./require-strict-errexit.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/require-strict-errexit.sh"
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/sb-manager-handoff-test.XXXXXX")"
