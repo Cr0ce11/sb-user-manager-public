@@ -1254,8 +1254,11 @@ kernel_render_split_plan() {
         # 只允许 GEOSITE／GEOIP 加一个不含逗号括号的类别名，多一个逗号
         # （例如 no-resolve 后缀）或任何括号都当场报错，而不是拼出一条
         # mihomo 只会说「规则类型不支持」的规则。
+        # 字符集里的 `!` 是必需的：GeoSite 用 `!cn` 后缀表示「排除中国大陆」，
+        # 例如 category-ai-!cn、geolocation-!cn。实测 1546 个类别名里出现过的
+        # 非字母数字字符只有 `-`（317 次）与 `!`（11 次）。
         def guard_geo($text):
-          if ($text | test("^(GEOSITE|GEOIP),[A-Za-z0-9_.:@-]+$")) then $text
+          if ($text | test("^(GEOSITE|GEOIP),[A-Za-z0-9_.:@!-]+$")) then $text
           else error("geo 类别只能写成 GEOSITE,<类别> 或 GEOIP,<类别>：" + $text) end;
         {
           proxies:[.outbound_groups[].objects[]],
@@ -3279,7 +3282,7 @@ validate_migration_payload_structure() {
         (.rule_behavior == "classical" or .rule_behavior == "domain" or .rule_behavior == "ipcidr") and
         ((.rule_url // "") == "" or (.rule_url | type == "string" and test("^https://") and test("\\.(yaml|yml)$")))) or
        ((.rule_geo | type == "array" and length > 0 and
-         all(.[]; type == "string" and test("^(GEOSITE|GEOIP),[A-Za-z0-9_.:@-]+$")))));
+         all(.[]; type == "string" and test("^(GEOSITE|GEOIP),[A-Za-z0-9_.:@!-]+$")))));
 
     def valid_upstream:
       (type == "object") and
@@ -7012,8 +7015,8 @@ mihomo_geox_url_json() {
 # 由保存时那次 `mihomo -t` 当场认。这里只保证它不会把一条规则拼成另一条：
 # 类别名里混进逗号或括号时，mihomo 只会说「规则类型不支持」，看不出是从哪来的。
 validate_geo_category() {
-  [[ "$1" =~ ^(GEOSITE|GEOIP),[A-Za-z0-9_.:@-]+$ ]] ||
-    die "geo 类别只能写成 GEOSITE,<类别> 或 GEOIP,<类别>，类别名里不能有逗号、括号或空格：$1"
+  [[ "$1" =~ ^(GEOSITE|GEOIP),[A-Za-z0-9_.:@!-]+$ ]] ||
+    die "geo 类别只能写成 GEOSITE,<类别> 或 GEOIP,<类别>；类别名只能用字母、数字与 _ . : @ ! -（\`!\` 用于 category-ai-!cn 这类「排除」写法），不能有第二个逗号、括号或空格：$1"
 }
 
 # 状态里的 geo 类别清单（JSON 数组）；不是 geo 来源时是空数组。
@@ -14360,6 +14363,8 @@ prompt_mihomo_geo_categories() {
   SELECTED_RULE_GEO='[]'
   echo
   echo 'GeoSite 按域名分类（GEOSITE,openai），GeoIP 按 IP 归属的国家或地区（GEOIP,us）。'
+  echo '类别名末尾的 !cn 表示「排除中国大陆」，例如 GEOSITE,category-ai-!cn；这类往往比'
+  echo '单个服务的类别覆盖得全（category-ai-!cn 有 180 条，openai 只有 23 条）。'
   echo '可以填多个，命中其中任意一个就走这条分流。一行填一个，填完直接回车结束。'
   echo '类别名要与数据库里的一致；保存时会用 mihomo 当场校验，写错会指名道姓地告诉你。'
   while true; do

@@ -394,6 +394,8 @@ prompt_mihomo_geo_categories() {
   SELECTED_RULE_GEO='[]'
   echo
   echo 'GeoSite 按域名分类（GEOSITE,openai），GeoIP 按 IP 归属的国家或地区（GEOIP,us）。'
+  echo '类别名末尾的 !cn 表示「排除中国大陆」，例如 GEOSITE,category-ai-!cn；这类往往比'
+  echo '单个服务的类别覆盖得全（category-ai-!cn 有 180 条，openai 只有 23 条）。'
   echo '可以填多个，命中其中任意一个就走这条分流。一行填一个，填完直接回车结束。'
   echo '类别名要与数据库里的一致；保存时会用 mihomo 当场校验，写错会指名道姓地告诉你。'
   while true; do

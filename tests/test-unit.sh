@@ -10133,8 +10133,45 @@ https://example.com/b.json'
   refuse '类别名里有括号' validate_geo_category 'GEOSITE,(a)'
   refuse '类别名里有空格' validate_geo_category 'GEOSITE,open ai'
   refuse '类别名为空' validate_geo_category 'GEOSITE,'
+  refuse '类别名里有 no-resolve 后缀' validate_geo_category 'GEOIP,cn,no-resolve'
   validate_geo_category 'GEOSITE,openai' || { echo 'GEOSITE 合法写法必须通过（对照）' >&2; exit 1; }
   validate_geo_category 'GEOIP,us' || { echo 'GEOIP 合法写法必须通过（对照）' >&2; exit 1; }
+  # `!cn` 后缀表示「排除中国大陆」，是 GeoSite 里最常用的一种写法。这几个类别名
+  # 都在真实的 GeoSite.dat 里，并经 `mihomo -t` 实测能加载（公开 Issue #233）。
+  # 字符集当初漏了 `!`，把它们全部挡在门外。
+  validate_geo_category 'GEOSITE,category-ai-!cn' || { echo '排除写法的类别名必须通过' >&2; exit 1; }
+  validate_geo_category 'GEOSITE,geolocation-!cn' || { echo '排除写法的类别名必须通过' >&2; exit 1; }
+  validate_geo_category 'GEOSITE,category-games-!cn' || { echo '排除写法的类别名必须通过' >&2; exit 1; }
+
+  # 同一份字符集在迁移包校验里也写了一遍。这条路径单独验：机器上一旦存在一条
+  # `!cn` 分流，而迁移包校验还用着旧字符集，`.sbm` 备份会整个校验不过——那是
+  # 「备份永久失效」那一类静默故障（公开 Issue #77、#233）。
+  (
+    geo_state="$work/geo-negation-state.json"
+    geo_payload="$work/geo-negation-payload.json"
+    geo_split_program='{name:"geo-neg",rule_geo:[$cat],scope:"all",user:null,
+      upstream:{protocol:"shadowsocks",server:"up.example.com",server_port:8388,
+                method:"2022-blake3-aes-128-gcm",password:"pw"},
+      outbound_tag:"geo-neg-out",rule_set_tag:"geo-neg-rule",status:"active"}'
+    build_geo_payload() {
+      local split
+      split="$(jq -cn --arg cat "$1" "$geo_split_program")" || return 1
+      jq -n --argjson split "$split" \
+        '{schema_version:7,users:[],splits:[$split],outbound_presets:[],rule_presets:[]}' \
+        > "$geo_state" || return 1
+      jq -n --slurpfile state "$geo_state" \
+        '{format_version:1,created_at:"2026-08-22T00:00:00+08:00",script_version:"4.25.26",
+          source_hostname:"test",state:$state[0],nfuse_usage:[]}' > "$geo_payload"
+    }
+    build_geo_payload 'GEOSITE,category-ai-!cn'
+    validate_migration_payload_structure "$geo_payload" ||
+      { echo '带 !cn 类别的分流必须能通过迁移包校验，否则这台机器的 .sbm 备份永久失效' >&2; exit 1; }
+    # 对照：括号仍然要被挡住，证明放宽的是字符集，不是把整条校验拆了。
+    build_geo_payload 'GEOSITE,(bad)'
+    if validate_migration_payload_structure "$geo_payload" 2>/dev/null; then
+      echo '类别名里的括号仍然必须被迁移包校验挡住' >&2; exit 1
+    fi
+  )
 
   refuse '空清单' validate_geo_categories_json '[]'
   refuse '重复的类别' validate_geo_categories_json '["GEOSITE,a","GEOSITE,a"]'
@@ -10285,7 +10322,7 @@ https://example.com/b.json'
        "upstream":{"protocol":"shadowsocks","server":"up.example.com","server_port":8388,
                    "method":"2022-blake3-aes-128-gcm","password":"pw"},
        "outbound_tag":"geo-out","rule_set_tag":"geo-rule","status":"active"},
-      {"name":"geo-user","rule_geo":["GEOSITE,github"],"scope":"user","user":"alice",
+      {"name":"geo-user","rule_geo":["GEOSITE,category-ai-!cn"],"scope":"user","user":"alice",
        "upstream":{"protocol":"shadowsocks","server":"up2.example.com","server_port":8389,
                    "method":"2022-blake3-aes-128-gcm","password":"pw2"},
        "outbound_tag":"geo-user-out","rule_set_tag":"geo-user-rule","status":"active"},
@@ -10320,7 +10357,7 @@ https://example.com/b.json'
   expect '全部用户的 geo 行' 'true' \
     "$(jq '.["sub-rules"]["managed-splits"] | index("OR,((GEOSITE,openai),(GEOIP,us)),geo-out") != null' "$MIHOMO_CONFIG")"
   expect '限定用户的 geo 行' 'true' \
-    "$(jq '.["sub-rules"]["managed-splits"] | index("AND,((GEOSITE,github),(IN-NAME,ss-alice)),geo-user-out") != null' "$MIHOMO_CONFIG")"
+    "$(jq '.["sub-rules"]["managed-splits"] | index("AND,((GEOSITE,category-ai-!cn),(IN-NAME,ss-alice)),geo-user-out") != null' "$MIHOMO_CONFIG")"
   # 有 geo 分流的机器要写上那三个键；没有的机器一个都不写，那条对照在下面。
   expect '有 geo 分流时写 geodata-mode' 'true' "$(jq '.["geodata-mode"]' "$MIHOMO_CONFIG")"
   expect '有 geo 分流时开自动更新' 'true' "$(jq '.["geo-auto-update"]' "$MIHOMO_CONFIG")"
@@ -10367,7 +10404,7 @@ https://example.com/b.json'
     '.["sub-rules"]["managed-splits"] = [.["sub-rules"]["managed-splits"][] | select(startswith("OR,((GEOSITE,openai)") | not)]' \
     '[可自动修复] 分流 geo-all 的规则或出口配置不完整'
   break_and_expect '删掉限定用户那条 geo 规则行' \
-    '.["sub-rules"]["managed-splits"] = [.["sub-rules"]["managed-splits"][] | select(contains("GEOSITE,github") | not)]' \
+    '.["sub-rules"]["managed-splits"] = [.["sub-rules"]["managed-splits"][] | select(contains("GEOSITE,category-ai-!cn") | not)]' \
     '[可自动修复] 分流 geo-user 的规则或出口配置不完整' 2
   break_and_expect '删掉 geo 分流的出口' \
     '.proxies = [.proxies[] | select(.name != "geo-out")]' \

@@ -1057,6 +1057,17 @@ if grep -Fq '换内核的退路本来就是从切换前的环境快照恢复' sb
   echo 'leftover cleanup prompt must not promise recovery from the environment snapshot (ADR 0032)' >&2
   exit 1
 fi
+# geo 类别名的合法字符集在三处各写了一遍：输入校验（validate_geo_category）、
+# 生成配置时的 guard_geo、迁移包校验。只改其中一处的后果是分裂的：输入放行而生成
+# 时报错，或者机器上已有的分流让 .sbm 备份整个校验不过（那类静默失效见公开 Issue
+# #77）。这里把三处绑在一起，改一处必须三处一起改。
+# 字符集里的 `!` 不能去掉：GeoSite 用 `!cn` 后缀表示「排除中国大陆」。
+geo_category_pattern='^(GEOSITE|GEOIP),[A-Za-z0-9_.:@!-]+$'
+geo_category_pattern_count="$(grep -Fc "$geo_category_pattern" sb-user-manager.sh || true)"
+if [[ "$geo_category_pattern_count" != 3 ]]; then
+  echo "expected the geo category pattern in 3 places (input check, config guard, migration check), found $geo_category_pattern_count" >&2
+  exit 1
+fi
 grep -Fq 'MIGRATION_FORMAT_VERSION=1' sb-user-manager.sh
 grep -Fq 'MIGRATION_BUNDLE_VERSION=1' sb-user-manager.sh
 if perl -ne '$found=1 if /\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]/; END { exit($found ? 0 : 1) }' sb-user-manager.sh; then
