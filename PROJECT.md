@@ -30,6 +30,7 @@
 | 安装、更新、验收操作和故障回退步骤 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) |
 | 发布门禁、发布授权和发布后检查 | [`docs/RELEASE.md`](docs/RELEASE.md) |
 | 长期产品与技术决定 | [`docs/DECISIONS/`](docs/DECISIONS/) |
+| 跨会话交接的当前快照 | [`HANDOFF.md`](HANDOFF.md) |
 
 其他文件可以提供摘要和链接，但不重复维护同一套操作步骤或门禁清单。
 
