@@ -1935,6 +1935,12 @@ set +e
 (
   environment_is_deployed() { return 0; }
   load_runtime_config() { :; }
+  # 这些用例模拟的是**已部署的 sing-box 机器**：管理配置存在，resolve_deployment_kernel
+  # 因此走「以管理配置为准」那一支（这里的 load_runtime_config 是空打桩）。不给配置
+  # 文件的话，从 2f 起它会被当成干净机器按 mihomo 处理，这些用例的场景就不成立了。
+  CONF_FILE="$work/deployed-singbox-${RANDOM}.conf"
+  : > "$CONF_FILE"
+  PROXY_KERNEL=singbox
   need_cmd() { :; }
   LOCK_FILE="$work/update-failure.lock"
   flock() { return 0; }
@@ -2018,6 +2024,12 @@ done
   update_side_effect="$work/update-after-operation-lock"
   environment_is_deployed() { return 0; }
   load_runtime_config() { :; }
+  # 这些用例模拟的是**已部署的 sing-box 机器**：管理配置存在，resolve_deployment_kernel
+  # 因此走「以管理配置为准」那一支（这里的 load_runtime_config 是空打桩）。不给配置
+  # 文件的话，从 2f 起它会被当成干净机器按 mihomo 处理，这些用例的场景就不成立了。
+  CONF_FILE="$work/deployed-singbox-${RANDOM}.conf"
+  : > "$CONF_FILE"
+  PROXY_KERNEL=singbox
   need_cmd() { :; }
   acquire_operation_lock() {
     OPERATION_LOCK_ERROR='另一个管理操作正在进行，请等待完成后再试'
@@ -2142,6 +2154,12 @@ grep -Fq '另一个管理操作正在进行，请等待完成后再试' "$work/u
 (
   environment_is_deployed() { return 0; }
   load_runtime_config() { :; }
+  # 这些用例模拟的是**已部署的 sing-box 机器**：管理配置存在，resolve_deployment_kernel
+  # 因此走「以管理配置为准」那一支（这里的 load_runtime_config 是空打桩）。不给配置
+  # 文件的话，从 2f 起它会被当成干净机器按 mihomo 处理，这些用例的场景就不成立了。
+  CONF_FILE="$work/deployed-singbox-${RANDOM}.conf"
+  : > "$CONF_FILE"
+  PROXY_KERNEL=singbox
   need_cmd() { :; }
   LOCK_FILE="$work/update-fetch-failure.lock"
   flock() { return 0; }
@@ -2159,6 +2177,12 @@ grep -Fq '另一个管理操作正在进行，请等待完成后再试' "$work/u
 (
   environment_is_deployed() { return 0; }
   load_runtime_config() { :; }
+  # 这些用例模拟的是**已部署的 sing-box 机器**：管理配置存在，resolve_deployment_kernel
+  # 因此走「以管理配置为准」那一支（这里的 load_runtime_config 是空打桩）。不给配置
+  # 文件的话，从 2f 起它会被当成干净机器按 mihomo 处理，这些用例的场景就不成立了。
+  CONF_FILE="$work/deployed-singbox-${RANDOM}.conf"
+  : > "$CONF_FILE"
+  PROXY_KERNEL=singbox
   need_cmd() { :; }
   LOCK_FILE="$work/preview-update.lock"
   flock() { return 0; }
@@ -2248,6 +2272,11 @@ if ! (
   environment_is_deployed() { return 0; }
   load_runtime_config() { SINGBOX_CONFIG="$roundtrip_config"; STATE_FILE="$empty_channel_state"; }
   need_cmd() { :; }
+  # 通道兼容性检查按定义只对 sing-box 机器有意义；给一个存在的管理配置，
+  # 让内核解析走「以管理配置为准」那一支（从 2f 起没有配置就按 mihomo 算）。
+  CONF_FILE="$work/channel-roundtrip.conf"
+  : > "$CONF_FILE"
+  PROXY_KERNEL=singbox
   fetch_singbox_channel_releases() {
     LATEST_STABLE_SINGBOX_VERSION=1.13.14
     LATEST_STABLE_SINGBOX_ASSET=stable.tar.gz
@@ -8377,8 +8406,10 @@ ANYTLS_SNI="b.example.com"'
   }
   rm -f -- "$data_conf"
 )
-# 两份管理配置都不写 MANAGER_DATA_DIR：写进去等于把当前默认值固化在每台机器上，
-# 将来改默认值反而要逐台改配置。同时确认展开后的取值与历史版本逐字相同。
+# sing-box 的管理配置**不写** MANAGER_DATA_DIR：写进去等于把当前默认值固化在每台
+# 老机器上，将来改默认值反而要逐台改配置。mihomo 那一份从 2f 起必须写出来——
+# 新装机器用的是中立目录，不写的话下次载入时文件级默认值会赢（公开 Issue #172）。
+# 这一组同时确认：数据目录仍是默认值时，展开后的取值与历史版本逐字相同。
 (
   conf_check="$work/manager-config-data-dir.conf"
   chown() { :; }
@@ -8387,8 +8418,13 @@ ANYTLS_SNI="b.example.com"'
       echo "${data_dir_kernel} 管理配置写入失败" >&2
       exit 1
     }
-    if grep -Fq 'MANAGER_DATA_DIR' "$conf_check"; then
-      echo "${data_dir_kernel} 部署写出的管理配置不得包含 MANAGER_DATA_DIR" >&2
+    if [[ "$data_dir_kernel" == singbox ]]; then
+      if grep -Fq 'MANAGER_DATA_DIR' "$conf_check"; then
+        echo 'sing-box 部署写出的管理配置不得包含 MANAGER_DATA_DIR' >&2
+        exit 1
+      fi
+    elif ! grep -Fxq 'MANAGER_DATA_DIR="/etc/sing-box"' "$conf_check"; then
+      echo 'mihomo 部署写出的管理配置必须写出当前的 MANAGER_DATA_DIR' >&2
       exit 1
     fi
     if ! grep -Fxq 'STATE_FILE="/etc/sing-box/managed-users.json"' "$conf_check"; then
@@ -9789,6 +9825,160 @@ https://example.com/b.json'
   fi
   rm -f "$sw/leftover-a"
   verify_singbox_cleanup || { echo '残留清干净之后复检应当通过' >&2; exit 1; }
+)
+
+# ============================================================
+# 2f：全新安装只装 mihomo，并且用中立的数据目录（公开 Issue #157、#172）
+# ============================================================
+# 这一组最要紧的不是「新机器装 mihomo」，而是**存量机器一个字都不能变**：
+# 内核仍是 sing-box、管理器数据仍在 /etc/sing-box。第二条断言就是那道回归护栏。
+(
+  fresh_work="$work/fresh-install"
+  mkdir -p "$fresh_work"
+  fresh_conf="$fresh_work/manager.conf"
+
+  # 一、尚未部署的机器：内核是 mihomo，数据目录是中立路径，派生路径跟着走。
+  read -r fresh_kernel fresh_dir fresh_state fresh_backup fresh_cert < <(
+    CONF_FILE="$fresh_work/does-not-exist.conf"
+    PROXY_KERNEL=singbox
+    MANAGER_DATA_DIR=/etc/sing-box
+    resolve_manager_data_paths
+    # 这几个变量在真实运行里由文件级初始化给出；整份测试跑到这里时它们已经
+    # 被前面的用例改过，因此显式摆回默认值，否则断言看到的是别人留下的值。
+    STATE_FILE="$MANAGER_DATA_DIR/managed-users.json"
+    BACKUP_DIR="$MANAGER_DATA_DIR/backups"
+    resolve_deployment_kernel >/dev/null 2>&1
+    printf '%s %s %s %s %s\n' "$PROXY_KERNEL" "$MANAGER_DATA_DIR" "$STATE_FILE" "$BACKUP_DIR" "$CERT_DIR")
+  [[ "$fresh_kernel" == mihomo ]] || { printf '全新安装应当装 mihomo，得到：%s\n' "$fresh_kernel" >&2; exit 1; }
+  [[ "$fresh_dir" == /etc/sb-user-manager ]] || { printf '全新安装的数据目录应当是中立路径，得到：%s\n' "$fresh_dir" >&2; exit 1; }
+  [[ "$fresh_state" == /etc/sb-user-manager/managed-users.json ]] || { printf '用户资料路径没跟着走：%s\n' "$fresh_state" >&2; exit 1; }
+  [[ "$fresh_backup" == /etc/sb-user-manager/backups ]] || { printf '内部备份路径没跟着走：%s\n' "$fresh_backup" >&2; exit 1; }
+  [[ "$fresh_cert" == /etc/sb-user-manager/cert ]] || { printf '证书目录没跟着走：%s\n' "$fresh_cert" >&2; exit 1; }
+
+  # 二、**回归护栏**：已部署的 sing-box 机器（配置里没有 PROXY_KERNEL，也没有
+  # MANAGER_DATA_DIR）必须原样不变——内核仍是 sing-box，数据仍在 /etc/sing-box。
+  printf 'HANDSHAKE_PORT=443\nSHADOWTLS_STRICT_MODE=true\nSS2022_SHADOWTLS_SNI="a.example.com"\nANYTLS_SNI="b.example.com"\n' > "$fresh_conf"
+  chmod 600 "$fresh_conf"
+  read -r old_kernel old_dir old_state < <(
+    CONF_FILE="$fresh_conf"
+    PROXY_KERNEL=singbox
+    MANAGER_DATA_DIR=/etc/sing-box
+    resolve_manager_data_paths
+    # 这几个变量在真实运行里由文件级初始化给出；整份测试跑到这里时它们已经
+    # 被前面的用例改过，因此显式摆回默认值，否则断言看到的是别人留下的值。
+    STATE_FILE="$MANAGER_DATA_DIR/managed-users.json"
+    BACKUP_DIR="$MANAGER_DATA_DIR/backups"
+    resolve_deployment_kernel >/dev/null 2>&1
+    printf '%s %s %s\n' "$PROXY_KERNEL" "$MANAGER_DATA_DIR" "$STATE_FILE")
+  [[ "$old_kernel" == singbox ]] || { printf '存量机器的内核不得改变，得到：%s\n' "$old_kernel" >&2; exit 1; }
+  [[ "$old_dir" == /etc/sing-box ]] || { printf '存量机器的数据目录不得改变，得到：%s\n' "$old_dir" >&2; exit 1; }
+  [[ "$old_state" == /etc/sing-box/managed-users.json ]] || { printf '存量机器的用户资料路径不得改变：%s\n' "$old_state" >&2; exit 1; }
+
+  # 三、**第二道回归护栏**：管理配置丢了、但机器上还有 sing-box 痕迹时，必须仍按
+  # sing-box 处理——「安装或修复环境」的修复分支走的正是这条路，认成 mihomo 就会
+  # 把一台 sing-box 机器修成另一个内核。
+  mkdir -p "$fresh_work/root/usr/local/bin"
+  : > "$fresh_work/root/usr/local/bin/sing-box"
+  read -r damaged_kernel damaged_dir < <(
+    CONF_FILE="$fresh_work/does-not-exist.conf"
+    SB_SYSTEM_ROOT="$fresh_work/root"
+    PROXY_KERNEL=mihomo
+    MANAGER_DATA_DIR=/etc/sing-box
+    resolve_manager_data_paths
+    # 这几个变量在真实运行里由文件级初始化给出；整份测试跑到这里时它们已经
+    # 被前面的用例改过，因此显式摆回默认值，否则断言看到的是别人留下的值。
+    STATE_FILE="$MANAGER_DATA_DIR/managed-users.json"
+    BACKUP_DIR="$MANAGER_DATA_DIR/backups"
+    resolve_deployment_kernel >/dev/null 2>&1
+    printf '%s %s\n' "$PROXY_KERNEL" "$MANAGER_DATA_DIR")
+  [[ "$damaged_kernel" == singbox ]] || { printf '配置丢失的 sing-box 机器必须仍按 sing-box 修，得到：%s\n' "$damaged_kernel" >&2; exit 1; }
+  [[ "$damaged_dir" == /etc/sing-box ]] || { printf '配置丢失的 sing-box 机器的数据目录不得改变，得到：%s\n' "$damaged_dir" >&2; exit 1; }
+  # 对照：同一条路径，机器上什么都没有时才装 mihomo。
+  mkdir -p "$fresh_work/empty-root"
+  read -r empty_kernel < <(
+    CONF_FILE="$fresh_work/does-not-exist.conf"
+    SB_SYSTEM_ROOT="$fresh_work/empty-root"
+    PROXY_KERNEL=singbox
+    resolve_deployment_kernel >/dev/null 2>&1
+    printf '%s\n' "$PROXY_KERNEL")
+  [[ "$empty_kernel" == mihomo ]] || { printf '干净机器应当装 mihomo，得到：%s\n' "$empty_kernel" >&2; exit 1; }
+
+  # 四、逃生口仍在，且用它装 sing-box 时保持老目录。
+  read -r hatch_kernel hatch_dir < <(
+    CONF_FILE="$fresh_work/does-not-exist.conf"
+    PROXY_KERNEL=mihomo
+    MANAGER_DATA_DIR=/etc/sing-box
+    resolve_manager_data_paths
+    # 这几个变量在真实运行里由文件级初始化给出；整份测试跑到这里时它们已经
+    # 被前面的用例改过，因此显式摆回默认值，否则断言看到的是别人留下的值。
+    STATE_FILE="$MANAGER_DATA_DIR/managed-users.json"
+    BACKUP_DIR="$MANAGER_DATA_DIR/backups"
+    SB_DEPLOY_PROXY_KERNEL=singbox resolve_deployment_kernel >/dev/null 2>&1
+    printf '%s %s\n' "$PROXY_KERNEL" "$MANAGER_DATA_DIR")
+  [[ "$hatch_kernel" == singbox ]] || { printf '逃生口应当还能装 sing-box，得到：%s\n' "$hatch_kernel" >&2; exit 1; }
+  [[ "$hatch_dir" == /etc/sing-box ]] || { printf '用逃生口装 sing-box 时目录应当保持老样子，得到：%s\n' "$hatch_dir" >&2; exit 1; }
+
+  # 五、新装机器的管理配置必须**写出** MANAGER_DATA_DIR：不写的话下一次载入
+  # 配置时文件级默认值会赢，机器会去一个空目录里找用户资料。
+  # chown 打桩：测试以普通用户运行，而写管理配置的最后一步是 chown root:root。
+  ( CONF_FILE="$fresh_work/written.conf"
+    PROXY_KERNEL=mihomo
+    chown() { return 0; }
+    apply_fresh_install_manager_data_dir
+    write_manager_config ) || { echo '写管理配置失败' >&2; exit 1; }
+  grep -Fxq 'MANAGER_DATA_DIR="/etc/sb-user-manager"' "$fresh_work/written.conf" || {
+    echo '新装 mihomo 机器的管理配置必须写出 MANAGER_DATA_DIR' >&2
+    cat "$fresh_work/written.conf" >&2
+    exit 1
+  }
+  grep -Fxq 'STATE_FILE="/etc/sb-user-manager/managed-users.json"' "$fresh_work/written.conf" || {
+    echo '写出的用户资料路径应当在中立目录下' >&2; exit 1; }
+  # 往返：把刚写出的配置载入回来，取值必须还是中立路径。
+  read -r round_dir round_state < <(
+    CONF_FILE="$fresh_work/written.conf"
+    MANAGER_DATA_DIR=/etc/sing-box
+    resolve_manager_data_paths
+    # 这几个变量在真实运行里由文件级初始化给出；整份测试跑到这里时它们已经
+    # 被前面的用例改过，因此显式摆回默认值，否则断言看到的是别人留下的值。
+    STATE_FILE="$MANAGER_DATA_DIR/managed-users.json"
+    BACKUP_DIR="$MANAGER_DATA_DIR/backups"
+    load_runtime_config >/dev/null 2>&1
+    printf '%s %s\n' "$MANAGER_DATA_DIR" "$STATE_FILE")
+  [[ "$round_dir" == /etc/sb-user-manager ]] || { printf '载入回来的数据目录不对：%s\n' "$round_dir" >&2; exit 1; }
+  [[ "$round_state" == /etc/sb-user-manager/managed-users.json ]] || { printf '载入回来的用户资料路径不对：%s\n' "$round_state" >&2; exit 1; }
+  # 对照：sing-box 那一份仍然不写 MANAGER_DATA_DIR——写进去等于把当前默认值
+  # 固化在每台老机器上。
+  ( CONF_FILE="$fresh_work/singbox.conf"; PROXY_KERNEL=singbox; MANAGER_DATA_DIR=/etc/sing-box
+    chown() { return 0; }
+    resolve_manager_data_paths; write_manager_config ) || { echo '写 sing-box 配置失败' >&2; exit 1; }
+  if grep -q '^MANAGER_DATA_DIR=' "$fresh_work/singbox.conf"; then
+    echo 'sing-box 的管理配置不该写 MANAGER_DATA_DIR' >&2
+    exit 1
+  fi
+
+  # 六、菜单：mihomo 机器上不出现「sing-box 版本管理」，sing-box 机器上照旧出现。
+  singbox_menu="$( PROXY_KERNEL=singbox; UI_MENU_COUNT=0; UI_MENU_ACTIONS=()
+    NO_COLOR=1 COLUMNS=60 ui_menu_items \
+      deploy '部署与卸载' update '检测更新' \
+      status '查看服务状态' diagnostics '检查与故障报告' \
+      backup '数据备份与恢复' sni '默认连接域名（SNI）'
+    [[ "$PROXY_KERNEL" != singbox ]] || NO_COLOR=1 COLUMNS=60 ui_menu_items channel 'sing-box 版本管理' )"
+  mihomo_menu="$( PROXY_KERNEL=mihomo; UI_MENU_COUNT=0; UI_MENU_ACTIONS=()
+    NO_COLOR=1 COLUMNS=60 ui_menu_items \
+      deploy '部署与卸载' update '检测更新' \
+      status '查看服务状态' diagnostics '检查与故障报告' \
+      backup '数据备份与恢复' sni '默认连接域名（SNI）'
+    [[ "$PROXY_KERNEL" != singbox ]] || NO_COLOR=1 COLUMNS=60 ui_menu_items channel 'sing-box 版本管理' )"
+  grep -Fq 'sing-box 版本管理' <<<"$singbox_menu" || { echo 'sing-box 机器上应当仍有版本管理这一项' >&2; exit 1; }
+  if grep -Fq 'sing-box 版本管理' <<<"$mihomo_menu"; then
+    echo 'mihomo 机器上不该出现 sing-box 版本管理' >&2
+    exit 1
+  fi
+  # 这一段是照抄菜单里的写法；照抄会漂移，因此顺带断言真实菜单里确实是这个条件。
+  grep -Fq '[[ "$PROXY_KERNEL" != singbox ]] || ui_menu_items channel' sb-user-manager.sh || {
+    echo '真实菜单里的条件与这一组测试不同步了' >&2
+    exit 1
+  }
 )
 
 echo 'unit checks passed'

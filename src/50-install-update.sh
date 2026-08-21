@@ -1,4 +1,20 @@
 
+# 全新安装时管理器自己的数据目录。**只对新机器生效**：存量机器的目录名写在它们
+# 自己的管理配置里（或者由文件级默认值 /etc/sing-box 给出），升级不会动它。
+# 新机器上没有存量数据，改名的代价在这一刻是零，越往后越贵——这是公开 Issue #172
+# 三步走的第二步，搭 2f 的车做掉。
+FRESH_INSTALL_MANAGER_DATA_DIR="/etc/sb-user-manager"
+
+# 把管理器数据目录切到新装机器用的那个，并重新派生由它算出来的四条路径。
+# 必须在部署开始之前调用：deploy_environment 建目录、写单元里的 SAFE_PATHS
+# 都发生在管理配置写出之前。
+apply_fresh_install_manager_data_dir() {
+  MANAGER_DATA_DIR="$FRESH_INSTALL_MANAGER_DATA_DIR"
+  resolve_manager_data_paths
+  STATE_FILE="$MANAGER_DATA_DIR/managed-users.json"
+  BACKUP_DIR="$MANAGER_DATA_DIR/backups"
+}
+
 # sing-box 部署的管理配置。内容与历史版本一字不变，**不写 PROXY_KERNEL**：
 # 管理配置的解析对未知键直接报错退出，写进去会让回退到旧脚本时启动不了。
 # 详见公开 Issue #158。
@@ -23,10 +39,11 @@ EOF
 
 # mihomo 部署的管理配置。这类机器本来就退不回不支持 mihomo 的脚本，
 # 因此写 PROXY_KERNEL 不构成新的回退障碍。
-# 管理器自身的数据（用户资料、内部备份、AnyTLS 证书）目前仍在 /etc/sing-box 下，
-# 由 MANAGER_DATA_DIR 的默认值给出。两份配置都刻意不写 MANAGER_DATA_DIR：
-# 写进去等于把当前默认值固化在每台机器的配置文件里，将来改默认值反而要逐台改。
-# 新装机器改用中立路径是公开 Issue #172 三步走的第二步，在 2f 开放安装选择时做。
+# **MANAGER_DATA_DIR 必须写出来**：从 2f 起新装的 mihomo 机器用中立路径
+# /etc/sb-user-manager，而文件级默认值仍是 /etc/sing-box（存量机器靠它）。
+# 不写进配置的话，下一次载入配置时默认值会赢，机器会去一个空目录里找用户资料。
+# sing-box 那一份仍然不写：它的目录名就是默认值，写进去反而把默认值固化在
+# 每台老机器上。
 write_mihomo_manager_config() {
   cat > "$CONF_FILE" <<EOF || return 1
 HANDSHAKE_PORT=443
@@ -34,6 +51,7 @@ SHADOWTLS_STRICT_MODE=true
 SS2022_SHADOWTLS_SNI="$DEFAULT_SS2022_SHADOWTLS_SNI"
 ANYTLS_SNI="$DEFAULT_ANYTLS_SNI"
 PROXY_KERNEL="mihomo"
+MANAGER_DATA_DIR="$MANAGER_DATA_DIR"
 MIHOMO_BIN="/usr/local/bin/mihomo"
 MIHOMO_CONFIG="/etc/mihomo/config.json"
 MIHOMO_SERVICE="mihomo"
@@ -2789,12 +2807,34 @@ apply_test_only_kernel_selection() {
 # load_runtime_config 发生在子进程里，父进程拿不到结果，而写单元文件、
 # 校验配置、挑选下载资产都发生在父进程。真机上验到的后果是——
 # 一台 mihomo 机器执行「自动修复缺失内容」会去下载并部署 sing-box。
+# 机器上还有没有 sing-box 的部署痕迹。只在管理配置缺失时用来判断这台机器原本是
+# 什么：判据取 sing-box 的三样核心文件，其中任何一样还在就算数。
+singbox_deployment_present() {
+  local path
+  for path in /usr/local/bin/sing-box /etc/sing-box/config.json /etc/systemd/system/sing-box.service; do
+    [[ ! -e "$(system_path "$path")" ]] || return 0
+  done
+  return 1
+}
+
 resolve_deployment_kernel() {
   if [[ -r "$CONF_FILE" ]]; then
     load_runtime_config
     return 0
   fi
+  # 没有管理配置时先看机器上已经有什么。**管理配置丢了的 sing-box 机器要能被修回
+  # 去**，而不是被当成新机器换成另一个内核——「安装或修复环境」的修复分支走的正是
+  # 这条路。真正干净的机器才按 2f 的规则装 mihomo（公开 Issue #157），不给选择。
+  # 已部署且配置还在的机器一律以管理配置为准，内核与目录名都不会因为升级而改变。
+  if singbox_deployment_present; then
+    PROXY_KERNEL=singbox
+  else
+    PROXY_KERNEL=mihomo
+  fi
   apply_test_only_kernel_selection || return 1
+  # 中立数据目录只给新装的 mihomo 机器。用逃生口装 sing-box 时保持老目录，
+  # 那条路本来就是为了「装出一台与存量机器一样的机器」。
+  [[ "$PROXY_KERNEL" != mihomo ]] || apply_fresh_install_manager_data_dir
 }
 
 install_environment() {
@@ -2807,6 +2847,7 @@ install_environment() {
       return 0
       ;;
     fresh)
+      printf '\n全新部署会安装 %s 作为代理内核。\n' "$(kernel_display_name)"
       read -r -p '确认开始全新部署？[y/N]：' answer
       [[ "$answer" =~ ^[Yy]$ ]] || { echo "已取消部署。"; return 0; }
       install_prerequisites || return 1
