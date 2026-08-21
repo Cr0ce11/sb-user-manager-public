@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+# shellcheck source=./require-strict-errexit.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/require-strict-errexit.sh"
 
 cd "$(dirname "$0")/.."
 
@@ -581,6 +583,20 @@ if bash tests/check-bare-negation.sh "$negation_fixture" >/dev/null 2>&1; then
   echo 'bare negation check must reject a standalone `! cmd` assertion' >&2
   exit 1
 fi
+
+# 门禁脚本必须在开头自检运行环境。裸 `[[ ]]` 断言只在会因它求值为假而中止的
+# Bash 上才有效：Bash 5 会中止，开发机的 Bash 3.2 不会，那里所有这类断言都空转
+# 而门禁照常打印通过（公开 Issue #167）。新写的门禁脚本漏掉这一行时，它在开发机上
+# 会跑出一个不可信的绿，这里当场拦住。
+# tests/acceptance.sh 不在此列：它在 Debian 测试机上运行、可能被单独复制过去，
+# 不应依赖同目录下的另一个文件；它运行的环境本来就只有 Bash 5。
+gate_guard_line='source "$(dirname -- "${BASH_SOURCE[0]}")/require-strict-errexit.sh"'
+for gate_script in tests/test-*.sh; do
+  if ! grep -Fqx "$gate_guard_line" "$gate_script"; then
+    echo "$gate_script must source tests/require-strict-errexit.sh right after 'set -Eeuo pipefail'" >&2
+    exit 1
+  fi
+done
 printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' \
   "if ! grep -Fq 'x' /dev/null; then" '  exit 1' 'fi' \
   "while ! grep -Fq 'y' /dev/null; do" '  break' 'done' \
