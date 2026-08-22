@@ -254,8 +254,6 @@ deployment_management_menu() {
     ui_menu_begin
     ui_header '部署与卸载' '安装、修复或移除运行环境'
     ui_menu_items install '安装或修复环境'
-    # 一次性入口，跑完即撤（公开 Issue #276）。
-    ui_menu_items migrate '搬迁管理器数据目录'
     printf '\n'
     ui_section '危险操作'
     printf '%s' "$UI_RED"
@@ -265,7 +263,6 @@ deployment_management_menu() {
     ui_menu_select || return 0
     case "$UI_MENU_ACTION" in
       install) install_environment; pause_menu;;
-      migrate) migrate_manager_data_directory; pause_menu;;
       uninstall)
         MENU_RETURNED=false
         uninstall_environment

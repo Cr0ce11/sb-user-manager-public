@@ -937,23 +937,21 @@ grep -Fq 'complete_environment_change()' sb-user-manager.sh
 # 有人又抄了一遍实现；改动调用点时同步改这里的期望值，并想清楚新增的那一处
 # 为什么必须存在。
 # 这些数字在 2f 撤除「接管既有 sing-box 安装」之后整体降了一档（公开 Issue #157），
-# 又在 sing-box 线归档撤除换内核与清理残留之后再降一档（公开 Issue #256）。
-# **下面这一档里有四个数字是临时的**：搬迁管理器数据目录（公开 Issue #276）是
-# 一次性工具，正式机器执行完之后整段撤除，届时这四个数字要各减一档回到括号里
-# 写的那个值——default_network_interface 4→3、activate_managed_services 3→2、
-# restore_failed_environment_change 2→1、complete_environment_change 2→1。
-# default_network_interface 的四处：全新部署、服务单元漂移的检查与修复（公开
-# Issue #190）——这两处必须现场识别接口，不能读旧单元里的那个，那正是可能不对的
-# 东西——以及搬迁管理器数据目录时重写单元。曾经的另一处是换内核。
-# activate_managed_services 的三处：部署、重写单元之后的重新激活（不
-# daemon-reload 就等于「修了但没生效」），以及搬迁之后重启服务。曾经的另一处是
-# 换内核之后启用新内核的服务。
-# restore_failed_environment_change 与 complete_environment_change 各是部署与搬迁
-# 两处；卸载走的是自己那套。这几个降到 1 之后断言只剩「别再抄一份实现」这一层
-# 意思，仍然值得留着。
-for shared_helper in default_network_interface:4 ensure_anytls_certificate:1 install_manager_binary:1 \
-  write_deployed_versions:1 activate_managed_services:3 restore_failed_environment_change:2 \
-  complete_environment_change:2; do
+# 又在 sing-box 线归档撤除换内核与清理残留之后再降一档（公开 Issue #256），
+# 现在随「搬迁管理器数据目录」这个一次性入口撤除再降一档（公开 Issue #283）——
+# 那四个数字当初就是按「跑完即撤」记在账上的，这一版按账回退。
+# default_network_interface 的三处：全新部署、服务单元漂移的检查与修复（公开
+# Issue #190）——后两处必须现场识别接口，不能读旧单元里的那个，那正是可能不对的
+# 东西。曾经的另两处是换内核与搬迁管理器数据目录。
+# activate_managed_services 的两处：部署、重写单元之后的重新激活（不
+# daemon-reload 就等于「修了但没生效」）。曾经的另两处是换内核之后启用新内核的
+# 服务、搬迁之后重启服务。
+# restore_failed_environment_change 与 complete_environment_change 现在各只剩部署
+# 一处；卸载走的是自己那套。降到 1 之后断言只剩「别再抄一份实现」这一层意思，
+# 仍然值得留着。
+for shared_helper in default_network_interface:3 ensure_anytls_certificate:1 install_manager_binary:1 \
+  write_deployed_versions:1 activate_managed_services:2 restore_failed_environment_change:1 \
+  complete_environment_change:1; do
   expected_calls="${shared_helper##*:}"
   shared_helper="${shared_helper%%:*}"
   shared_helper_calls="$(awk -v helper="$shared_helper" 'index($0, helper) && !index($0, helper "()") {count++} END {print count+0}' sb-user-manager.sh)"
@@ -976,7 +974,7 @@ grep -Fq 'acquire_operation_lock()' sb-user-manager.sh
 # 不取锁就会与别的写入撞车。第四处是一次性的（公开 Issue #276），撤除时这个数字
 # 回到 3。接管既有安装曾经也是一处（公开 Issue #157 的 2f 撤除），换内核与清理
 # sing-box 残留曾经是另外两处（公开 Issue #256 撤除）。
-[[ "$(grep -Fc 'if ! acquire_operation_lock; then' sb-user-manager.sh)" == 4 ]]
+[[ "$(grep -Fc 'if ! acquire_operation_lock; then' sb-user-manager.sh)" == 3 ]]
 for serialized_recovery in recover_environment_transaction acquire_manager_handoff_lock; do
   if ! awk -v function_name="$serialized_recovery" '
       $0 == function_name "() {" {inside=1}
@@ -1065,6 +1063,28 @@ if grep -Fq 'rollback_channel_switch' sb-user-manager.sh; then
   exit 1
 fi
 
+# 「搬迁管理器数据目录」是一次性入口：公开 Issue #276 做、公开 Issue #283 撤。
+# 存量机器的管理器数据搬到中立目录之后它就没有对象了，而项目所有者要求一次性的
+# 东西跑完即撤，不在项目里留不必要的历史遗留。**整段删除而不是把入口藏起来**——
+# 与 2f 撤接管流程、#256 撤换内核时的处理一致。这里把实现、回滚标签与那几个只
+# 服务于它的助手一起钉住，光删菜单项不算数。
+for retired_migration_token in migrate_manager_data_directory rollback_migrate_manager_data \
+  migrate_manager_data_preflight preview_manager_data_migration manager_data_migration_items \
+  manager_data_tree_fingerprint copy_manager_data_to_target rewrite_manager_config_data_dir \
+  verify_manager_data_migration verify_no_stale_cert_references remove_legacy_manager_data \
+  MANAGER_DATA_MIGRATION_TARGET; do
+  if grep -Fq "$retired_migration_token" sb-user-manager.sh; then
+    echo "manager data migration entry should be gone; found $retired_migration_token" >&2
+    exit 1
+  fi
+done
+# 对照。上面整组断言都是「找不到就通过」，把脚本换成一个空文件也照样全绿，所以
+# 必须另外证明它们不是恒真：同一条 grep 对着一份确实含有该字样的样本必须命中。
+if ! printf 'migrate_manager_data_directory() {\n' | grep -Fq 'migrate_manager_data_directory'; then
+  echo 'the retired-migration assertions are vacuous: the same grep matches nothing at all' >&2
+  exit 1
+fi
+
 # 文件级默认值不许再是一个「像真的」的取值（公开 Issue #262）。
 # 钉住的不变量：**载入管理配置之前读到这两个变量的代码，必须拿到一个用不了的值**，
 # 而不是一个看起来完全正常、实际可能完全错误的答案（#251 就是这么坏的）。
@@ -1133,30 +1153,25 @@ clear_rollback_count="$(grep -Ec '^[[:space:]]+clear_signal_rollback$' sb-user-m
 # 也是一处（公开 Issue #157 的 2f 撤除），换内核与清理 sing-box 残留曾经是另外
 # 两处（公开 Issue #256 撤除）。收到 INT/TERM 时没登记回滚的那条路，会把机器停在
 # 改了一半的状态上。
-if [[ "$signal_rollback_count" != 6 ]]; then
-  echo "expected 6 signal rollback registrations, found $signal_rollback_count" >&2
+if [[ "$signal_rollback_count" != 5 ]]; then
+  echo "expected 5 signal rollback registrations, found $signal_rollback_count" >&2
   exit 1
 fi
-if [[ "$clear_rollback_count" != 11 ]]; then
-  echo "expected 11 signal rollback clears, found $clear_rollback_count" >&2
+if [[ "$clear_rollback_count" != 10 ]]; then
+  echo "expected 10 signal rollback clears, found $clear_rollback_count" >&2
   exit 1
 fi
 grep -Fq 'set_signal_rollback rollback_manager_handoff' sb-user-manager.sh
-# print_offsite_recovery_status 曾随它仅有的两个调用点（换内核、清理 sing-box
-# 残留）一并删除（公开 Issue #256），当时钉的是「不得作为死代码留下」。
-# 搬迁管理器数据目录（公开 Issue #276）是新添的不可逆操作——它在校验通过后删掉
-# 老位置的用户资料、备份与证书——因此按 ADR 0032「后续」一节的要求把它写了回来，
-# 断言随之从「不得存在」改成「必须正好有一个调用点」：这两种失败方式（死代码、
-# 有函数却没人调）正是这条历史要防的两头。
-# **搬迁入口是一次性的**，撤除那一版里这个函数会再次变成孤儿，届时把这条断言
-# 改回「不得存在」。
-if ! grep -Fq 'print_offsite_recovery_status() {' sb-user-manager.sh; then
-  echo 'offsite recovery notice must exist while an irreversible operation needs it' >&2
-  exit 1
-fi
-offsite_notice_calls="$(awk 'index($0, "print_offsite_recovery_status") && !index($0, "print_offsite_recovery_status()") {count++} END {print count+0}' sb-user-manager.sh)"
-if [[ "$offsite_notice_calls" != 1 ]]; then
-  echo "expected offsite recovery notice to have 1 caller, found $offsite_notice_calls" >&2
+# print_offsite_recovery_status 已经随它仅有的调用点一并删除过两次：第一次是换内核
+# 与清理 sing-box 残留被撤除时（公开 Issue #256），第二次是搬迁管理器数据目录这个
+# 一次性入口被撤除时（公开 Issue #283）。两次的形状一样——这个函数只服务于不可逆
+# 操作的确认提示，入口没了它就是死代码，而留着一段谁都调不到的代码，迟早有人以为
+# 它还在起作用。
+# ADR 0032 的「后续」一节写明：**再添一个不可逆操作时必须把它写回来，并同时接上
+# 调用点**，不能默认它还在。下一个是改名迁移（公开 Issue #281 第 3 步）；届时这条
+# 断言改成「必须正好有一个调用点」。
+if grep -Fq 'print_offsite_recovery_status' sb-user-manager.sh; then
+  echo 'offsite recovery notice must not linger as dead code (ADR 0032)' >&2
   exit 1
 fi
 # 这两句旧文案承诺了一条并不存在的路，不得复活。
