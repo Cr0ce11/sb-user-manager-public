@@ -12,7 +12,7 @@ PROGRAM="sb-user-manager"
 CONF_FILE="${SB_USER_CONF:-/etc/sb-user-manager.conf}"
 SELF_SOURCE_PATH="${BASH_SOURCE[0]}"
 SELF_PATH="$(readlink -f -- "$SELF_SOURCE_PATH")"
-SCRIPT_VERSION="4.25.28"
+SCRIPT_VERSION="4.25.29"
 SCRIPT_EDITION_LABEL="公开版"
 STATE_SCHEMA_VERSION=7
 # 「尚未解析」的哨兵，不是一个能用的取值（公开 Issue #262）。
