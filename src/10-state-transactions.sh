@@ -1210,14 +1210,22 @@ rollback_active_operation() {
 }
 
 run_step_or_rollback() {
-  local rollback="$1" rc
+  local rollback="$1" rc step
   declare -F "$rollback" >/dev/null || die "操作回滚函数不存在：$rollback"
   shift
+  step="$1"
+  # 失败码必须写在 else 里：`if ... fi` 没有 else 分支时整条语句的退出码恒为 0，
+  # 在 fi 之后读 $? 只会读到 0。静态门禁看守这条约定，本次改动正是被它抓住的。
   if "$@"; then
     return 0
   else
     rc=$?
   fi
+  # 说出是哪一步失败的。以前只有一句「操作失败，正在自动撤销本次修改」，
+  # 一次真实的生产故障因此只能靠逐行读源码定位（公开 Issue #265）。
+  # **只记函数名，绝不记参数**：参数里有用户密码（例如 append_inbounds 收到的
+  # 整段入站片段），记进日志等于把凭据扩散到日志和随后被贴出来的终端输出里。
+  log "步骤失败：${step}（退出码 ${rc}）"
   "$rollback" "$rc" || true
   return "$rc"
 }

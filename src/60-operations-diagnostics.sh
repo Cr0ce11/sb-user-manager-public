@@ -1111,6 +1111,7 @@ repair_consistency() {
        (if $metered then (.limit_gib|tostring) else "" end),
        (if $metered then (.billing_anchor|tostring) else "" end)] | @tsv
     ' <<<"$user")"; then
+      log "无法自动修复：用户「$(jq -r '.name // "(无名)"' <<<"$user")」的记录不完整，请先在「用户管理」中检查这一条"
       rollback_active_operation 1 || true
       return 1
     fi
@@ -1140,21 +1141,30 @@ repair_consistency() {
       fi
     done < <(jq -r 'if (.endpoints | type) == "array" then .endpoints[].port else .port end' <<<"$user")
   done <<<"$user_rows"
+  # 分流记录的三选一来源：网址、本机规则文件、GeoSite／GeoIP 类别（公开 Issue #219）。
+  # **geo 类别那种既没有网址也没有规则文件**，状态里只有一份类别清单；这里漏掉它的
+  # 后果不是报错，而是整条自动修复失败并回滚，使用者看不到任何原因——正式服务器
+  # Air 上就是这么坏的（公开 Issue #265）。判据与迁移包校验、重建分流配置保持一致。
   while IFS= read -r split; do
     [[ -n "$split" ]] || continue
     if ! jq -e '
       select((.name|type)=="string" and (.name|length)>0) |
       select(.status=="active" or .status=="disabled") |
       select(.scope=="all" or .scope=="user") |
-      select(((.url // .rule_file)|type)=="string" and ((.url // .rule_file)|length)>0) |
+      select(
+        (((.url // .rule_file)|type)=="string" and ((.url // .rule_file)|length)>0) or
+        ((.rule_geo|type)=="array" and (.rule_geo|length)>0)
+      ) |
       select((.upstream|type)=="object")
     ' <<<"$split" >/dev/null; then
+      log "无法自动修复：分流「$(jq -r '.name // "(无名)"' <<<"$split")」的记录不完整，请先在「分流管理」中检查这一条"
       rollback_active_operation 1 || true
       return 1
     fi
     scope="$(jq -er '.scope' <<<"$split")" || { rollback_active_operation 1 || true; return 1; }
     scope_user="$(jq -er '.user // ""' <<<"$split")" || { rollback_active_operation 1 || true; return 1; }
     if [[ "$scope" == user ]] && ! user_exists "$scope_user"; then
+      log "无法自动修复：分流「$(jq -r '.name // "(无名)"' <<<"$split")」指向一个不存在的用户，请先在「分流管理」中处理这一条"
       rollback_active_operation 1 || true
       return 1
     fi
