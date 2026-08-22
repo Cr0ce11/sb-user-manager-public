@@ -40,7 +40,17 @@ TRANSACTION_FORMAT_VERSION=1
 OPERATION_BACKUP_RETENTION="${SB_OPERATION_BACKUP_RETENTION:-10}"
 ENVIRONMENT_BACKUP_RETENTION="${SB_ENVIRONMENT_BACKUP_RETENTION:-5}"
 MIGRATION_REPORT_RETENTION="${SB_MIGRATION_REPORT_RETENTION:-20}"
-ENVIRONMENT_TRANSACTION_JOURNAL="${SB_ENVIRONMENT_TRANSACTION_JOURNAL:-/var/lib/sb-user-manager.recovery.json}"
+# 环境事务的恢复记录。**必须放在管理器自己的目录之内**，不能直接摆在 /var/lib 下：
+# begin_environment_transaction 会创建它的父目录，而 `install -d -m` 点到一个已经
+# 存在的目录时会直接 chmod 它。这个默认值曾经是 /var/lib/sb-user-manager.recovery.json，
+# 取出来的父目录就是 /var/lib 本身，于是每次环境操作都把 /var/lib 改成 700——
+# apt 的下载沙箱与所有以非 root 身份读 /var/lib/<服务名> 的服务都会因此失效
+# （公开 Issue #246）。tests/test-static.sh 有一条断言钉住这个位置。
+ENVIRONMENT_TRANSACTION_JOURNAL="${SB_ENVIRONMENT_TRANSACTION_JOURNAL:-/var/lib/sb-user-manager/recovery.json}"
+# 换位置之前的旧路径。**必须继续认得它**：更新流程在事务中途替换管理脚本，
+# 若恰好在替换之后、清除记录之前中断，下一次运行的就是新脚本、而记录还留在
+# 旧路径上。认不出它，等于把一台半截机器当成干净机器放行。
+LEGACY_ENVIRONMENT_TRANSACTION_JOURNAL="${SB_LEGACY_ENVIRONMENT_TRANSACTION_JOURNAL:-/var/lib/sb-user-manager.recovery.json}"
 ENVIRONMENT_LOCK_FILE="${SB_ENVIRONMENT_LOCK_FILE:-/run/lock/sb-user-manager-environment.lock}"
 MANAGER_HANDOFF_DIRECTORY="${SB_MANAGER_HANDOFF_DIRECTORY:-/var/lib/sb-user-manager/manager-handoff}"
 MANAGER_HANDOFF_JOURNAL="${SB_MANAGER_HANDOFF_JOURNAL:-$MANAGER_HANDOFF_DIRECTORY/active.json}"
@@ -82,6 +92,17 @@ resolve_manager_data_paths() {
   ANYTLS_KEY_FILE="$CERT_DIR/anytls.key"
 }
 resolve_manager_data_paths
+
+# 恢复记录换过位置（公开 Issue #246）。新位置不存在、旧位置却留着一份时，
+# 本次运行整体以旧路径为准——认得它的每一处（开工前的拦截、开机自检的恢复、
+# 诊断报告、清除记录）因此自动一致，不必逐个调用点各判一次。
+# 只在这一处解析：漏掉任何一处的后果都是把一台半截机器当成干净机器放行。
+resolve_environment_transaction_journal() {
+  [[ ! -e "$ENVIRONMENT_TRANSACTION_JOURNAL" && ! -L "$ENVIRONMENT_TRANSACTION_JOURNAL" ]] || return 0
+  [[ -e "$LEGACY_ENVIRONMENT_TRANSACTION_JOURNAL" || -L "$LEGACY_ENVIRONMENT_TRANSACTION_JOURNAL" ]] || return 0
+  ENVIRONMENT_TRANSACTION_JOURNAL="$LEGACY_ENVIRONMENT_TRANSACTION_JOURNAL"
+}
+resolve_environment_transaction_journal
 
 # mihomo 部署下，使用者自己的分流规则文件放在这里。管理器建这个目录、
 # 读里面的文件，但**永远不写它们**——那是使用者从社区抄来的片段。
@@ -2445,15 +2466,27 @@ release_environment_lock() {
   { exec 8>&-; } 2>/dev/null || true
 }
 
+# 建一个属于管理器的目录。**已经存在时只检查类型，绝不改动权限。**
+# `install -d -m` 一旦点到一个已经存在的目录，就会直接 chmod 它——把这一条
+# 用在系统目录上，后果是静静改掉整台机器的权限：环境事务的恢复记录曾经放在
+# /var/lib 正下方，取父目录建出来的正是 /var/lib，于是每次环境操作都把它改成
+# 700，apt 的下载沙箱与所有以非 root 身份读 /var/lib/<服务名> 的服务随之失效
+# （公开 Issue #246）。
+# 顺带拒绝符号链接：跟随它会把权限改到别处去。
+# 锁目录一直是这么做的，这里把同一份防护收敛成唯一入口，供两处共用。
+ensure_manager_directory() {
+  local directory="$1" mode="${2:-700}"
+  if [[ -e "$directory" || -L "$directory" ]]; then
+    [[ -d "$directory" && ! -L "$directory" ]] || return 1
+    return 0
+  fi
+  install -d -m "$mode" -- "$directory" || return 1
+}
+
 ensure_environment_lock_directory() {
   local lock_directory
   lock_directory="$(dirname "$ENVIRONMENT_LOCK_FILE")" || return 1
-  if [[ -e "$lock_directory" || -L "$lock_directory" ]]; then
-    # 目录已存在时只做类型检查，不改动既有权限
-    [[ -d "$lock_directory" && ! -L "$lock_directory" ]] || return 1
-    return 0
-  fi
-  install -d -m 755 -- "$lock_directory"
+  ensure_manager_directory "$lock_directory" 755
 }
 
 begin_environment_transaction() {
@@ -2474,7 +2507,7 @@ begin_environment_transaction() {
   fi
   verify_environment_backup "$snapshot" || { release_environment_lock; return 1; }
   for path in "$@"; do is_environment_recovery_path "$path" || { release_environment_lock; return 1; }; done
-  install -d -m 700 "$(dirname "$ENVIRONMENT_TRANSACTION_JOURNAL")" || { release_environment_lock; return 1; }
+  ensure_manager_directory "$(dirname "$ENVIRONMENT_TRANSACTION_JOURNAL")" || { release_environment_lock; return 1; }
   tmp="$(mktemp "$(dirname "$ENVIRONMENT_TRANSACTION_JOURNAL")/.transaction.XXXXXX")" || { release_environment_lock; return 1; }
   register_temp_path "$tmp" || { release_environment_lock; return 1; }
   if ! jq -n --argjson format "$TRANSACTION_FORMAT_VERSION" --arg operation "$operation" \
@@ -10380,7 +10413,9 @@ install_manager_shortcut() {
   shortcut="$(system_path /usr/local/bin/sbm)" || return 1
   validate_manager_shortcut_path || return 1
   [[ -L "$shortcut" ]] && return 0
-  install -d -m 755 -- "$(dirname "$shortcut")" || return 1
+  # /usr/local/bin 是系统共享目录：缺失时才建，已经存在就不动它的权限
+  # （同 Issue #246；某些发行版上它带 setgid 与组写位，按 755 覆盖会抹掉）。
+  ensure_manager_directory "$(dirname "$shortcut")" 755 || return 1
   ln -s -- "$target" "$shortcut" || return 1
 }
 
@@ -11012,10 +11047,32 @@ purge_fresh_deploy_paths() {
   rm -rf /var/lib/sb-user-manager
 }
 
+# 旧版本把两个系统共享目录按 700 建了出来（公开 Issue #246）：
+#   /var/lib        —— 恢复记录曾经放在它正下方，创建父目录时连它一起改了；
+#                      后果是 apt 的下载沙箱失效，以非 root 身份读
+#                      /var/lib/<服务名> 的服务也够不到自己的数据。
+#   /usr/local/sbin —— 与管理器自己的四个目录写在同一条 install 里，一起收到 700。
+# 缺陷本身已经修掉，但**被改坏的机器不会自己好**——凡是装过旧版本的机器，
+# 这两个目录到今天都还是 700。这里在部署、修复与更新三条路径上一次性修回来。
+# **只在恰好等于 700 时动手**：那正是本脚本留下的指纹。管理员自己设成别的值
+# 是他的决定，不要覆盖。修不动也不当失败——一次权限修复不该拖垮一次部署。
+repair_system_directory_modes() {
+  local path target mode
+  for path in /var/lib /usr/local/sbin; do
+    target="$(system_path "$path")" || continue
+    [[ -d "$target" && ! -L "$target" ]] || continue
+    mode="$(manager_file_mode "$target")" || continue
+    [[ "$mode" == 700 ]] || continue
+    chmod 755 -- "$target" || continue
+    log "已把 $path 的权限从 700 修回 755（旧版本缺陷，公开 Issue #246）"
+  done
+}
+
 deploy_environment() {
   local fresh="$1" update_manager="${2:-false}" iface work backup path deployed_state_file
   local -a deploy_created=()
   local deploy_created_count=0
+  repair_system_directory_modes
   # 再确认一次内核，使这个函数不依赖调用点是否记得先确定。
   resolve_deployment_kernel || return 1
   if ! acquire_operation_lock; then
@@ -11064,8 +11121,14 @@ deploy_environment() {
   trap rollback_deploy ERR
   set_signal_rollback rollback_deploy
   run_step_or_rollback rollback_deploy download_binaries "$work" || return 1
+  # 这四个都是本项目自己的目录，里面装的是用户资料、证书与流量库，
+  # 因此即使已经存在也要按 700 收紧——那是有意的。
   run_step_or_rollback rollback_deploy install -d -m 700 \
-    "$MANAGER_DATA_DIR" "$MANAGER_DATA_DIR/backups" "$CERT_DIR" /var/lib/nfuse /usr/local/sbin || return 1
+    "$MANAGER_DATA_DIR" "$MANAGER_DATA_DIR/backups" "$CERT_DIR" /var/lib/nfuse || return 1
+  # /usr/local/sbin 不是本项目的目录，是系统共享的。**已经存在就一字不动**：
+  # 旧版本把它跟上面四个一起按 700 建，于是每台装过本脚本的机器上它都变成了
+  # 只有 root 能进（公开 Issue #246）。缺失时按 755 建，那是它该有的样子。
+  run_step_or_rollback rollback_deploy ensure_manager_directory /usr/local/sbin 755 || return 1
   if [[ "$PROXY_KERNEL" == singbox ]]; then
     # sing-box 自己的配置目录。今天与管理器数据目录是同一个，上面那行已经建好，
     # 这里是重复调用、无副作用；分开写是因为两者属于不同的东西——管理器数据
@@ -11513,6 +11576,10 @@ resolve_deployment_kernel() {
 
 install_environment() {
   local choice answer config_path state_path
+  # 一台完好的机器走不到 deploy_environment（下面第一个分支直接返回），
+  # 而它同样可能带着旧版本留下的 700。「修复环境」这个名字应当名副其实，
+  # 所以在这里也修一次（公开 Issue #246）。函数幂等，重复调用无副作用。
+  repair_system_directory_modes
   resolve_deployment_kernel || return 1
   show_environment_diagnostics
   case "$ENVIRONMENT_CLASS" in

@@ -25,6 +25,7 @@ complete_environment_change
 download_binaries
 enable_user_without_transaction
 ensure_anytls_certificate
+ensure_manager_directory
 fetch_latest_releases
 initialize_deployed_state
 install_manager_binary

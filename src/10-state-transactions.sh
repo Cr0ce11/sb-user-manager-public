@@ -1061,15 +1061,27 @@ release_environment_lock() {
   { exec 8>&-; } 2>/dev/null || true
 }
 
+# 建一个属于管理器的目录。**已经存在时只检查类型，绝不改动权限。**
+# `install -d -m` 一旦点到一个已经存在的目录，就会直接 chmod 它——把这一条
+# 用在系统目录上，后果是静静改掉整台机器的权限：环境事务的恢复记录曾经放在
+# /var/lib 正下方，取父目录建出来的正是 /var/lib，于是每次环境操作都把它改成
+# 700，apt 的下载沙箱与所有以非 root 身份读 /var/lib/<服务名> 的服务随之失效
+# （公开 Issue #246）。
+# 顺带拒绝符号链接：跟随它会把权限改到别处去。
+# 锁目录一直是这么做的，这里把同一份防护收敛成唯一入口，供两处共用。
+ensure_manager_directory() {
+  local directory="$1" mode="${2:-700}"
+  if [[ -e "$directory" || -L "$directory" ]]; then
+    [[ -d "$directory" && ! -L "$directory" ]] || return 1
+    return 0
+  fi
+  install -d -m "$mode" -- "$directory" || return 1
+}
+
 ensure_environment_lock_directory() {
   local lock_directory
   lock_directory="$(dirname "$ENVIRONMENT_LOCK_FILE")" || return 1
-  if [[ -e "$lock_directory" || -L "$lock_directory" ]]; then
-    # 目录已存在时只做类型检查，不改动既有权限
-    [[ -d "$lock_directory" && ! -L "$lock_directory" ]] || return 1
-    return 0
-  fi
-  install -d -m 755 -- "$lock_directory"
+  ensure_manager_directory "$lock_directory" 755
 }
 
 begin_environment_transaction() {
@@ -1090,7 +1102,7 @@ begin_environment_transaction() {
   fi
   verify_environment_backup "$snapshot" || { release_environment_lock; return 1; }
   for path in "$@"; do is_environment_recovery_path "$path" || { release_environment_lock; return 1; }; done
-  install -d -m 700 "$(dirname "$ENVIRONMENT_TRANSACTION_JOURNAL")" || { release_environment_lock; return 1; }
+  ensure_manager_directory "$(dirname "$ENVIRONMENT_TRANSACTION_JOURNAL")" || { release_environment_lock; return 1; }
   tmp="$(mktemp "$(dirname "$ENVIRONMENT_TRANSACTION_JOURNAL")/.transaction.XXXXXX")" || { release_environment_lock; return 1; }
   register_temp_path "$tmp" || { release_environment_lock; return 1; }
   if ! jq -n --argjson format "$TRANSACTION_FORMAT_VERSION" --arg operation "$operation" \
