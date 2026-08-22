@@ -41,7 +41,7 @@
 | 最新正式版 | v4.25.26 |
 | 主开发分支 | `main` |
 | 正式支持环境 | Debian 12 x86_64 |
-| 测试环境 | 开发机上的本地 OrbStack 测试机（Debian 12 x86_64，完整 systemd）；`audit`、`release`、`lifecycle`（含分流）、`full` 四种验收模式与跨机迁移恢复演练均已实测通过，能力范围与限制见 [公开 Issue #139](https://github.com/Cr0ce11/sb-user-manager-public/issues/139)。发布仍以本地门禁与公开仓库 GitHub CI 为基础 |
+| 测试环境 | 开发机上的本地 OrbStack 测试机（Debian 12 x86_64，完整 systemd）。**2026-08-22 起只剩三台**：`sbm-deb13`（mihomo，中立数据目录）、`sbm-mihomo`（mihomo，老目录）、`sbm-gate`（只跑门禁）；三台 sing-box 机器随 sing-box 线归档一并删除（[公开 Issue #227](https://github.com/Cr0ce11/sb-user-manager-public/issues/227)），**因此已无法在真机上验证 sing-box 的行为**，该代码路径只剩单元测试夹具覆盖。`audit`、`release`、`lifecycle`（含分流）、`full` 四种验收模式与跨机迁移恢复演练均已实测通过，能力范围与限制见 [公开 Issue #139](https://github.com/Cr0ce11/sb-user-manager-public/issues/139)。发布仍以本地门禁与公开仓库 GitHub CI 为基础 |
 | 正式环境 | **五台正式服务器已全部升级到 v4.25.26 并从 sing-box 切换到 mihomo**（2026-08-22，[公开 Issue #217](https://github.com/Cr0ce11/sb-user-manager-public/issues/217)）：切换后「服务与配置检查」0 个问题，客户端无需改配置即可连接，sing-box 残留已清理。**正式环境从此没有 sing-box 在跑。**此前各服务器曾统一升级到 v4.25.16，升级后运行「服务与配置检查」未报出任何骨架缺项（[公开 Issue #163](https://github.com/Cr0ce11/sb-user-manager-public/issues/163)）；此前 v4.25.11 的升级与一致性检查误报消失记录见 [公开 Issue #120](https://github.com/Cr0ce11/sb-user-manager-public/issues/120)，v4.25.8 的升级与迁移备份验证记录见 [公开 Issue #100](https://github.com/Cr0ce11/sb-user-manager-public/issues/100)，v4.25.7 的升级与只读自检记录见 [公开 Issue #69](https://github.com/Cr0ce11/sb-user-manager-public/issues/69)。历次升级均由项目所有者自行执行，仓库侧未登录复核，因此没有仓库可核对的验收报告。首次上线记录见 Issue #96（地址和凭据不进入仓库） |
 | 发布形态 | `Cr0ce11/sb-user-manager-public` 是唯一正式仓库；开发、Issue、Pull Request、完整 CI、匿名在线更新和不可变 Release 全部在这里完成 |
 | 阶段 0 | 已完成（Issue #46，经 PR #47 合并） |
