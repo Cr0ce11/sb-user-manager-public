@@ -2736,18 +2736,29 @@ EOF
       choice="$PROMPT_VALUE"
       case "$choice" in
         1)
-          config_path="$(system_path /etc/sing-box/config.json)"
+          # 内核配置的位置、容器名与标识字段都按内核取值。此前这三处写死了
+          # sing-box 的形状（`/etc/sing-box/config.json`、`.inbounds[]`、`.tag`），
+          # 于是 mihomo 机器上这条路必定停在下面那句 die 上——而那台机器本来就
+          # 不该有 sing-box 的配置文件（公开 Issue #242）。注意别把「管理器数据
+          # 目录」当成内核配置：存量机器的数据目录确实叫 /etc/sing-box，但那里
+          # 放的是用户资料与内部备份，不是内核的运行配置。
+          config_path="$(kernel_runtime_config_path)" || return 1
+          config_path="$(system_path "$config_path")"
           state_path="$(system_path "$MANAGER_DATA_DIR/managed-users.json")"
-          [[ -f "$config_path" ]] || die "sing-box 配置缺失，无法安全自动修复；请从备份恢复或选择全新部署"
-          if [[ ! -f "$state_path" ]] && jq -e '
-            any(.inbounds[]?; (.tag // "") | test("^(st-|ss-|anytls-)"))
+          [[ -f "$config_path" ]] || die "$(kernel_display_name) 配置缺失，无法安全自动修复；请从备份恢复或选择全新部署"
+          # 入口名的前缀两个内核通用（st- / ss- / ss-direct- / ss-udp- / anytls-），
+          # 不同的只是容器与标识字段，因此只有这两样按内核取。
+          if [[ ! -f "$state_path" ]] && jq -e \
+            --arg container "$(kernel_managed_container)" --arg entry_key "$(kernel_managed_key)" '
+            any(.[$container][]?; (.[$entry_key] // "") | test("^(st-|ss-|anytls-)"))
           ' "$config_path" >/dev/null 2>&1; then
             die "检测到已有用户连接配置，但用户资料缺失。为避免用户无法连接，脚本不会自动修改；请先恢复备份或选择重新安装"
           fi
           install_prerequisites || return 1
           fetch_latest_releases false || return 1
           # 修复流程不得把测试通道静默替换为正式版；sing-box 由版本管理单独更新。
-          if [[ "$(current_singbox_channel)" == preview ]]; then
+          # 通道是 sing-box 独有的概念，mihomo 上没有对应物，因此整段按内核包住。
+          if [[ "$PROXY_KERNEL" == singbox && "$(current_singbox_channel)" == preview ]]; then
             LATEST_KERNEL_VERSION="$(installed_singbox_version)"
           fi
           deploy_environment false
