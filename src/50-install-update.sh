@@ -209,7 +209,7 @@ write_expiry_units() {
   kernel_unit="$(kernel_service_name)" || return 1
   cat > "$(system_path /etc/systemd/system/sb-user-expiry.service)" <<EOF || return 1
 [Unit]
-Description=Expire sing-box managed users
+Description=Expire sb-user-manager managed users
 After=${kernel_unit}.service nfuse.service
 [Service]
 Type=oneshot
@@ -217,7 +217,7 @@ ExecStart=/usr/local/sbin/sb-user-manager --internal-expire
 EOF
   cat > "$(system_path /etc/systemd/system/sb-user-expiry.timer)" <<'EOF' || return 1
 [Unit]
-Description=Check sing-box user expiry
+Description=Check sb-user-manager user expiry
 [Timer]
 OnBootSec=5min
 OnUnitActiveSec=15min
@@ -422,149 +422,6 @@ github_download_to() {
     -o "$target" "$url"
 }
 
-singbox_release_metadata() {
-  local release_json="$1"
-  jq -cer --arg arch "$SINGBOX_ARCH" '
-    (.tag_name // "" | sub("^v"; "")) as $version |
-    ("sing-box-" + $version + "-" + $arch + ".tar.gz") as $asset_name |
-    ([.assets[]? | select(.name == $asset_name)] | first) as $asset |
-    {
-      version: $version,
-      asset: $asset_name,
-      url: ($asset.browser_download_url // ""),
-      sha256: (($asset.digest // "") | sub("^sha256:"; ""))
-    } |
-    select(
-      (.version | length) > 0 and
-      (.url | startswith("https://")) and
-      (.sha256 | test("^[0-9a-fA-F]{64}$"))
-    )
-  ' <<<"$release_json"
-}
-
-fetch_singbox_channel_releases() {
-  local stable_json releases_json preview_json stable_metadata preview_metadata
-  stable_json="$(github_api_get "https://api.github.com/repos/${SINGBOX_REPOSITORY}/releases/latest")" || {
-    echo "无法查询 sing-box 最新正式版，请检查服务器网络。" >&2
-    return 1
-  }
-  releases_json="$(github_api_get "https://api.github.com/repos/${SINGBOX_REPOSITORY}/releases?per_page=30")" || {
-    echo "无法查询 sing-box 最新测试版，请检查服务器网络。" >&2
-    return 1
-  }
-  preview_json="$(jq -cer '[.[] | select(.draft == false and .prerelease == true)] | max_by(.published_at)' <<<"$releases_json")" || {
-    echo "sing-box 当前没有可用的测试版。" >&2
-    return 1
-  }
-  stable_metadata="$(singbox_release_metadata "$stable_json")" || {
-    echo "最新正式版缺少适用于 ${SINGBOX_ARCH} 的可信发行文件。" >&2
-    return 1
-  }
-  preview_metadata="$(singbox_release_metadata "$preview_json")" || {
-    echo "最新测试版缺少适用于 ${SINGBOX_ARCH} 的可信发行文件。" >&2
-    return 1
-  }
-  LATEST_STABLE_SINGBOX_VERSION="$(jq -r '.version' <<<"$stable_metadata")"
-  LATEST_STABLE_SINGBOX_ASSET="$(jq -r '.asset' <<<"$stable_metadata")"
-  LATEST_STABLE_SINGBOX_URL="$(jq -r '.url' <<<"$stable_metadata")"
-  LATEST_STABLE_SINGBOX_SHA256="$(jq -r '.sha256' <<<"$stable_metadata")"
-  LATEST_PREVIEW_SINGBOX_VERSION="$(jq -r '.version' <<<"$preview_metadata")"
-  LATEST_PREVIEW_SINGBOX_ASSET="$(jq -r '.asset' <<<"$preview_metadata")"
-  LATEST_PREVIEW_SINGBOX_URL="$(jq -r '.url' <<<"$preview_metadata")"
-  LATEST_PREVIEW_SINGBOX_SHA256="$(jq -r '.sha256' <<<"$preview_metadata")"
-}
-
-singbox_channel_label() {
-  if [[ "$1" == *-* ]]; then printf '测试版'; else printf '正式版'; fi
-}
-
-singbox_channel_name() {
-  if [[ "$1" == *-* ]]; then printf 'preview'; else printf 'stable'; fi
-}
-
-current_singbox_channel() {
-  local current stored_channel stored_version
-  current="$(installed_singbox_version)"
-  if [[ -r "$SINGBOX_CHANNEL_STATE" ]] && jq -e '
-      .format_version == 1 and (.channel == "stable" or .channel == "preview") and
-      (.current_version | type == "string" and length > 0)
-    ' "$SINGBOX_CHANNEL_STATE" >/dev/null 2>&1; then
-    stored_channel="$(jq -r '.channel' "$SINGBOX_CHANNEL_STATE")"
-    stored_version="$(jq -r '.current_version' "$SINGBOX_CHANNEL_STATE")"
-    if [[ -n "$current" && "$stored_version" == "$current" ]]; then printf '%s' "$stored_channel"; return 0; fi
-  fi
-  singbox_channel_name "${current:-0.0.0}"
-}
-
-write_singbox_channel_state() {
-  local channel="$1" version="$2" previous_channel="$3" previous_version="$4"
-  local dir tmp stable_version preview_version
-  dir="$(dirname "$SINGBOX_CHANNEL_STATE")"
-  install -d -m 700 "$dir" || return 1
-  tmp="$(mktemp "$dir/.singbox-channel.XXXXXX")" || return 1
-  register_temp_path "$tmp" || return 1
-  stable_version="$(kernel_binary_version "$SINGBOX_VERSION_STORE/stable/sing-box")"
-  preview_version="$(kernel_binary_version "$SINGBOX_VERSION_STORE/preview/sing-box")"
-  if ! jq -n --arg channel "$channel" --arg version "$version" \
-      --arg stable "$stable_version" --arg preview "$preview_version" \
-      --arg previous_channel "$previous_channel" --arg previous_version "$previous_version" \
-      --arg updated_at "$(date -Iseconds)" '
-        {format_version:1,channel:$channel,current_version:$version,updated_at:$updated_at,
-         cached:{stable_version:$stable,preview_version:$preview},
-         previous:{channel:$previous_channel,version:$previous_version}}
-      ' > "$tmp" || ! chmod 600 "$tmp" || ! mv -- "$tmp" "$SINGBOX_CHANNEL_STATE"; then
-    rm -f -- "$tmp"
-    return 1
-  fi
-  sync_transaction_path "$SINGBOX_CHANNEL_STATE" || return 1
-}
-
-update_deployed_singbox_version() {
-  local version="$1" versions="$DEPLOYED_VERSIONS_FILE" tmp
-  [[ -f "$versions" ]] || return 0
-  tmp="$(mktemp "$(dirname "$versions")/.singbox-channel.XXXXXX")" || return 1
-  register_temp_path "$tmp" || return 1
-  awk -v version="$version" '
-    BEGIN {updated=0}
-    /^SINGBOX_VERSION=/ {print "SINGBOX_VERSION=" version; updated=1; next}
-    {print}
-    END {if (!updated) print "SINGBOX_VERSION=" version}
-  ' "$versions" > "$tmp" || { rm -f -- "$tmp"; return 1; }
-  chmod --reference="$versions" "$tmp" 2>/dev/null || chmod 600 "$tmp" || return 1
-  mv -- "$tmp" "$versions" || return 1
-  sync_transaction_path "$versions" || return 1
-}
-
-show_singbox_channel_versions() {
-  local current current_channel current_label='未知' cached_stable='未保存' cached_preview='未保存'
-  # environment_is_deployed 按当前内核判断核心文件是否齐全，因此必须先确定内核。
-  # 此前靠「调用它之前一定有人载入过配置」，而这条约束没写在任何地方、也没有
-  # 检查看守（公开 Issue #171）。重复调用是幂等的。
-  resolve_deployment_kernel || return 1
-  environment_is_deployed || { echo "检测结果：尚未安装，请先选择「安装或修复环境」。"; return 0; }
-  load_runtime_config
-  need_cmd curl; need_cmd jq
-  echo "正在查询 sing-box 官方版本…"
-  fetch_singbox_channel_releases || return 0
-  current="$(installed_singbox_version)"
-  [[ -z "$current" ]] || current_label="$(singbox_channel_label "$current")"
-  current_channel="$(current_singbox_channel)"
-  cached_stable="$(kernel_binary_version "$SINGBOX_VERSION_STORE/stable/sing-box")"; cached_stable="${cached_stable:-未保存}"
-  cached_preview="$(kernel_binary_version "$SINGBOX_VERSION_STORE/preview/sing-box")"; cached_preview="${cached_preview:-未保存}"
-  printf '\n%-16s %-26s\n' '项目' '版本'
-  printf '%-16s %-26s\n' '----------------' '--------------------------'
-  printf '%-16s %-26s\n' '当前版本' "${current:-未知}（${current_label}）"
-  printf '%-16s %-26s\n' '最新正式版' "$LATEST_STABLE_SINGBOX_VERSION"
-  printf '%-16s %-26s\n' '最新测试版' "$LATEST_PREVIEW_SINGBOX_VERSION"
-  printf '%-16s %-26s\n' '当前通道' "$([[ "$current_channel" == preview ]] && echo 测试版 || echo 正式版)"
-  printf '%-16s %-26s\n' '已保存正式版' "$cached_stable"
-  printf '%-16s %-26s\n' '已保存测试版' "$cached_preview"
-  cat <<'EOF'
-
-这里只显示官方版本信息，不会更换当前版本。
-EOF
-}
-
 check_rule_set_with_binary() {
   local binary="$1" url="$2" format downloaded decoded
   format="$(split_rule_format "$url")" || { echo "规则集地址格式不受支持：$url" >&2; return 1; }
@@ -590,253 +447,6 @@ check_rule_set_with_binary() {
   rm -f -- "$downloaded" "$decoded"
   ((rc == 0)) || echo "目标版本无法识别规则集：$url" >&2
   return "$rc"
-}
-
-list_singbox_rule_set_urls() {
-  {
-    jq -r '.route.rule_set[]? | select(.type == "remote") | .url // empty' "$SINGBOX_CONFIG" 2>/dev/null || true
-    jq -r '.splits[]? | .url // empty' "$STATE_FILE" 2>/dev/null || true
-  } | awk 'NF && !seen[$0]++'
-}
-
-prepare_singbox_release_binary() {
-  local version="$1" asset="$2" url="$3" sha256="$4" work="$5" slot="$6"
-  local target_dir="$work/$slot" archive binary detected
-  install -d -m 700 "$target_dir" || return 1
-  archive="$target_dir/$asset"
-  binary="$target_dir/sing-box"
-  if ! github_download_to "$archive" "$url" ||
-     ! printf '%s  %s\n' "$sha256" "$archive" | sha256sum -c - >/dev/null; then
-    return 1
-  fi
-  if ! tar -xzf "$archive" -C "$target_dir" --no-same-owner --strip-components=1 "sing-box-${version}-${SINGBOX_ARCH}/sing-box" ||
-     [[ ! -f "$binary" || -L "$binary" || ! -x "$binary" ]]; then
-    return 1
-  fi
-  detected="$(kernel_binary_version "$binary")"
-  [[ "$detected" == "$version" ]] || return 1
-  PREPARED_SINGBOX_BINARY="$binary"
-}
-
-check_singbox_release_compatibility() {
-  local channel="$1" version asset url sha256 work binary stable_binary normalized output rule_url rule_count=0
-  SINGBOX_COMPATIBLE=false
-  SINGBOX_COMPATIBLE_VERSION=""
-  resolve_deployment_kernel || return 1
-  environment_is_deployed || { echo "检测结果：尚未安装，请先选择「安装或修复环境」。"; return 0; }
-  load_runtime_config
-  need_cmd curl; need_cmd jq; need_cmd tar; need_cmd sha256sum
-  echo "正在查询 sing-box 官方版本…"
-  fetch_singbox_channel_releases || return 0
-  case "$channel" in
-    stable)
-      version="$LATEST_STABLE_SINGBOX_VERSION"; asset="$LATEST_STABLE_SINGBOX_ASSET"
-      url="$LATEST_STABLE_SINGBOX_URL"; sha256="$LATEST_STABLE_SINGBOX_SHA256"
-      ;;
-    preview)
-      version="$LATEST_PREVIEW_SINGBOX_VERSION"; asset="$LATEST_PREVIEW_SINGBOX_ASSET"
-      url="$LATEST_PREVIEW_SINGBOX_URL"; sha256="$LATEST_PREVIEW_SINGBOX_SHA256"
-      ;;
-    *) echo "未知版本通道。" >&2; return 0;;
-  esac
-  work="$(mktemp -d /tmp/sb-channel-check.XXXXXX)" || return 1
-  register_temp_path "$work"
-  printf '正在下载 sing-box %s（%s）…\n' "$version" "$(singbox_channel_label "$version")"
-  if ! prepare_singbox_release_binary "$version" "$asset" "$url" "$sha256" "$work" target; then
-    echo "检查失败：下载文件、校验值、压缩包内容或版本标记不符合预期；当前版本没有改变。"
-    rm -rf -- "$work"
-    return 0
-  fi
-  binary="$PREPARED_SINGBOX_BINARY"
-  if ! output="$(kernel_check_config_with "$binary" "$SINGBOX_CONFIG" 2>&1)"; then
-    echo "检查结果：暂时不能切换到 sing-box ${version}。"
-    echo "原因：现有连接配置不被该版本接受。"
-    [[ -n "$output" ]] && printf '详细信息：%s\n' "$(tail -n 1 <<<"$output")"
-    echo "当前版本和全部配置均未改变。"
-    rm -rf -- "$work"
-    return 0
-  fi
-  normalized="$work/target-formatted-config.json"
-  if ! output="$($binary format -c "$SINGBOX_CONFIG" 2>&1 >"$normalized")" ||
-     ! output="$(kernel_check_config_with "$binary" "$normalized" 2>&1)"; then
-    echo "检查结果：暂时不能切换到 sing-box ${version}。"
-    echo "原因：目标版本无法安全解析并重新生成现有配置。"
-    [[ -n "$output" ]] && printf '详细信息：%s\n' "$(tail -n 1 <<<"$output")"
-    echo "当前版本和全部配置均未改变。"
-    rm -rf -- "$work"
-    return 0
-  fi
-  while IFS= read -r rule_url; do
-    [[ -n "$rule_url" ]] || continue
-    ((rule_count+=1))
-    if ! check_rule_set_with_binary "$binary" "$rule_url"; then
-      echo "检查结果：暂时不能切换到 sing-box ${version}。"
-      echo "原因：至少有一个现有分流规则集不兼容或无法下载。"
-      echo "当前版本和全部配置均未改变。"
-      rm -rf -- "$work"
-      return 0
-    fi
-  done < <(list_singbox_rule_set_urls)
-  if [[ "$channel" == preview ]]; then
-    echo "正在检查测试版处理后的配置能否安全回到最新正式版…"
-    if ! prepare_singbox_release_binary \
-      "$LATEST_STABLE_SINGBOX_VERSION" "$LATEST_STABLE_SINGBOX_ASSET" \
-      "$LATEST_STABLE_SINGBOX_URL" "$LATEST_STABLE_SINGBOX_SHA256" "$work" stable; then
-      echo "检查失败：无法验证回到正式版所需的官方程序；当前版本没有改变。"
-      rm -rf -- "$work"
-      return 0
-    fi
-    stable_binary="$PREPARED_SINGBOX_BINARY"
-    if ! output="$(kernel_check_config_with "$stable_binary" "$normalized" 2>&1)"; then
-      echo "检查结果：测试版可以读取当前配置，但不满足安全往返要求。"
-      echo "原因：测试版重新整理配置后，最新正式版无法读取。"
-      [[ -n "$output" ]] && printf '详细信息：%s\n' "$(tail -n 1 <<<"$output")"
-      echo "为避免以后无法切回正式版，本阶段会把它视为不兼容；当前版本没有改变。"
-      rm -rf -- "$work"
-      return 0
-    fi
-  fi
-  printf '\n检查通过：sing-box %s 可以读取当前连接配置' "$version"
-  if ((rule_count > 0)); then printf '和 %d 个分流规则集' "$rule_count"; fi
-  printf '。\n'
-  if [[ "$channel" == preview ]]; then
-    printf '测试版处理后的配置也通过了最新正式版检查。\n'
-  fi
-  SINGBOX_COMPATIBLE=true
-  SINGBOX_COMPATIBLE_VERSION="$version"
-  printf '本次只做检查，没有更换当前版本。\n'
-  rm -rf -- "$work"
-}
-
-perform_singbox_channel_switch() {
-  local channel="$1" version="$2" asset="$3" url="$4" sha256="$5"
-  local work binary current_channel current_version previous_dir current_dir target_dir
-  ensure_safe_ssh_for_kernel_restart || return 0
-  work="$(mktemp -d /tmp/sb-channel-switch.XXXXXX)" || return 1
-  register_temp_path "$work"
-  if ! prepare_singbox_release_binary "$version" "$asset" "$url" "$sha256" "$work" target; then
-    echo "下载或校验目标版本失败，当前版本没有改变。"
-    rm -rf -- "$work"
-    return 1
-  fi
-  binary="$PREPARED_SINGBOX_BINARY"
-  prepare_core
-  current_channel="$(current_singbox_channel)"
-  current_version="$(installed_singbox_version)"
-  if ! kernel_check_config_with "$binary" "$SINGBOX_CONFIG" >/dev/null 2>&1; then
-    echo "写入前复检失败，现有配置已经发生变化；本次切换已取消。"
-    release_operation_lock
-    rm -rf -- "$work"
-    return 1
-  fi
-  create_environment_backup || { release_operation_lock; rm -rf -- "$work"; return 1; }
-  rollback_channel_switch() {
-    local rc="${1:-$?}"
-    trap - ERR
-    clear_signal_rollback
-    restore_failed_environment_change "sing-box 版本切换" "$ENV_BACKUP" "$work" || true
-    release_operation_lock
-    return "$rc"
-  }
-  trap rollback_channel_switch ERR
-  set_signal_rollback rollback_channel_switch
-  run_step_or_rollback rollback_channel_switch begin_environment_transaction \
-    "sing-box-${current_channel}-to-${channel}" "$ENV_BACKUP" "$SINGBOX_VERSION_STORE" || return 1
-  previous_dir="$SINGBOX_VERSION_STORE/previous"
-  current_dir="$SINGBOX_VERSION_STORE/$current_channel"
-  target_dir="$SINGBOX_VERSION_STORE/$channel"
-  run_step_or_rollback rollback_channel_switch install -d -m 700 "$previous_dir" "$current_dir" "$target_dir" || return 1
-  run_step_or_rollback rollback_channel_switch atomic_install_file "$SINGBOX_BIN" "$previous_dir/sing-box" 755 || return 1
-  run_step_or_rollback rollback_channel_switch atomic_install_file "$SINGBOX_BIN" "$current_dir/sing-box" 755 || return 1
-  run_step_or_rollback rollback_channel_switch atomic_install_file "$binary" "$target_dir/sing-box" 755 || return 1
-  run_step_or_rollback rollback_channel_switch atomic_install_file "$binary" "$SINGBOX_BIN" 755 || return 1
-  run_step_or_rollback rollback_channel_switch kernel_check_config "$SINGBOX_CONFIG" || return 1
-  run_step_or_rollback rollback_channel_switch systemctl restart sing-box || return 1
-  run_step_or_rollback rollback_channel_switch systemctl is-active --quiet sing-box || return 1
-  run_step_or_rollback rollback_channel_switch systemctl is-active --quiet nfuse || return 1
-  run_step_or_rollback rollback_channel_switch systemctl is-active --quiet sb-user-expiry.timer || return 1
-  run_step_or_rollback rollback_channel_switch write_singbox_channel_state \
-    "$channel" "$version" "$current_channel" "$current_version" || return 1
-  run_step_or_rollback rollback_channel_switch update_deployed_singbox_version "$version" || return 1
-  run_step_or_rollback rollback_channel_switch complete_environment_change "$work" || return 1
-  release_operation_lock
-  printf '\nsing-box 已从 %s %s 切换到 %s %s。\n' \
-    "$(singbox_channel_label "$current_version")" "$current_version" "$(singbox_channel_label "$version")" "$version"
-  echo "用户、分流、配额和流量记录均未修改。"
-}
-
-switch_singbox_channel() {
-  local channel="$1" mode="${2:-switch}" current current_channel answer token
-  resolve_deployment_kernel || return 1
-  environment_is_deployed || { echo "检测结果：尚未安装，请先选择「安装或修复环境」。"; return 0; }
-  current="$(installed_singbox_version)"
-  current_channel="$(current_singbox_channel)"
-  if [[ "$channel" == preview && "$mode" == switch ]]; then
-    cat <<'EOF'
-测试版可能包含尚未稳定的功能和破坏式配置变更，切换时会短暂重启连接服务。
-脚本会先检查能否安全回到正式版；不满足往返条件时不会切换。
-EOF
-    read -r -p '是否开始兼容检查？[y/N]：' answer
-    [[ "$answer" =~ ^[Yy]$ ]] || { echo "已取消。"; return 0; }
-  fi
-  check_singbox_release_compatibility "$channel"
-  [[ "${SINGBOX_COMPATIBLE:-false}" == true ]] || return 0
-  if [[ "$current_channel" == "$channel" && "$current" == "$SINGBOX_COMPATIBLE_VERSION" ]]; then
-    printf '当前已经是最新%s %s。\n' "$(singbox_channel_label "$current")" "$current"
-    return 0
-  fi
-  if [[ "$channel" == preview ]]; then token='TEST'; else token='SWITCH'; fi
-  printf '\n准备从 %s %s 切换到 %s %s。\n' \
-    "$(singbox_channel_label "$current")" "$current" \
-    "$(singbox_channel_label "$SINGBOX_COMPATIBLE_VERSION")" "$SINGBOX_COMPATIBLE_VERSION"
-  read -r -p "确认继续请输入 ${token}：" answer
-  [[ "$answer" == "$token" ]] || { echo "已取消切换。"; return 0; }
-  if [[ "$channel" == stable ]]; then
-    perform_singbox_channel_switch stable "$LATEST_STABLE_SINGBOX_VERSION" "$LATEST_STABLE_SINGBOX_ASSET" "$LATEST_STABLE_SINGBOX_URL" "$LATEST_STABLE_SINGBOX_SHA256"
-  else
-    perform_singbox_channel_switch preview "$LATEST_PREVIEW_SINGBOX_VERSION" "$LATEST_PREVIEW_SINGBOX_ASSET" "$LATEST_PREVIEW_SINGBOX_URL" "$LATEST_PREVIEW_SINGBOX_SHA256"
-  fi
-}
-
-update_current_singbox_channel() {
-  local channel
-  channel="$(current_singbox_channel)"
-  switch_singbox_channel "$channel" update
-}
-
-singbox_channel_menu() {
-  local choice
-  # 守卫判断的是调用时刻的 PROXY_KERNEL，因此先确定内核再判断（公开 Issue #171）。
-  resolve_deployment_kernel || return 1
-  # 正式版／测试版通道是 sing-box 特有的发布形态。其它内核没有对应物，
-  # 这里明确说明并返回，而不是让下面的流程按 sing-box 的资产名去查一个不存在的东西。
-  if [[ "$PROXY_KERNEL" != singbox ]]; then
-    printf '当前部署使用的代理内核是 %s，没有正式版／测试版通道之分。\n' "$(kernel_display_name)"
-    printf '内核版本随「检查更新」一并更新。\n'
-    pause_menu
-    return 0
-  fi
-  while true; do
-    prepare_menu_screen
-    cat <<'EOF'
-sing-box 版本管理
-
-1. 查看当前通道和可用版本
-2. 切换到最新测试版
-3. 切换回最新正式版
-4. 更新当前通道
-0. 返回上一级
-EOF
-    read_menu_choice '请选择：' '0,1,2,3,4' '' '请输入 0-4 之间的数字' || return 0
-    choice="$PROMPT_VALUE"
-    case "$choice" in
-      1) show_singbox_channel_versions; pause_menu;;
-      2) switch_singbox_channel preview; pause_menu;;
-      3) switch_singbox_channel stable; pause_menu;;
-      4) update_current_singbox_channel; pause_menu;;
-      0) return 0;;
-    esac
-  done
 }
 
 fetch_latest_manager_release() {
@@ -1342,9 +952,25 @@ take_over_installed_manager() {
 }
 # <<< manager_channel_handoff
 
+# 写死 sing-box 路径的专用入口。只剩一个用处：判断存量 sing-box 机器上装的是不是
+# 一个测试版（版本号带 `-`），好在更新与修复时不把它静默换成正式版。
 installed_singbox_version() { kernel_binary_version "${SINGBOX_BIN:-/usr/local/bin/sing-box}"; }
-# 当前部署实际使用的内核版本。sing-box 通道管理仍用上面那个专用入口，
-# 因为通道是 sing-box 独有的概念，换内核后不存在对应物。
+
+# 这台机器上装着的是不是一个 sing-box 测试版。sing-box 的测试版版本号带 `-`
+# （如 1.14.0-alpha.44），正式版不带。
+#
+# 正式版／测试版通道的**管理入口**已随 sing-box 线归档一并撤除（公开 Issue #256），
+# 这个判据却必须留着：存量机器上可能仍然装着一个测试版，而**保留现有部署的流程
+# 绝不能把它静默换成正式版**——那等于使用者点了一次「检测更新」或「修复环境」
+# 之后，内核版本莫名其妙地变了。以前判据来自通道状态文件加版本号，现在只看
+# 版本号，结论一样而少一个要维护的状态文件。
+#
+# 保留现有部署的每一条流程都必须先问这一句，静态门禁看守该约定。
+singbox_preview_deployed() {
+  [[ "$PROXY_KERNEL" == singbox ]] || return 1
+  [[ "$(installed_singbox_version)" == *-* ]]
+}
+# 当前部署实际使用的内核版本，按内核取。
 installed_kernel_version() {
   local binary
   binary="$(kernel_binary_path)" || return 1
@@ -2346,360 +1972,6 @@ deploy_environment() {
   log "部署完成；备份位于 $backup"
 }
 
-# ============================================================
-# 换内核：把一台在跑的 sing-box 机器整机切到 mihomo（公开 Issue #203）
-# ============================================================
-# 这不是「改一下管理配置」——部署之后改内核会得到一台配置属于旧内核、服务属于新
-# 内核的半迁移机器——配置属于旧内核、服务属于新内核。因此走一次完整的
-# 环境事务：先把要做的事整个算清楚，再动手，任何一步失败整体回到切换前。
-#
-# **分流规则集的转换是单向的**（.srs／.json → yaml 能做，反过来做不到）。所以回退
-# 靠的是切换前的环境快照，而不是「切回 sing-box」；也因此**不提供反向切换入口**——
-# 那会让人以为分流也能跟着回去。
-#
-# 使用者这一侧：客户端配置一个字都不用改（`#154` 实测三种入口互通），端口、密码、
-# 有效期、配额与累计用量都不变，服务会断几秒。
-
-# 状态里所有需要转换的规则集来源，去重。分流与规则预置都存 url，两处都要转。
-singbox_rule_sources_in_state() {
-  jq -r '[(.splits[]?, .rule_presets[]?) | .url // empty] | unique | .[]' "$STATE_FILE"
-}
-
-# 把状态里的每一个规则集来源转成一个 mihomo 规则文件，全部落到 $1 这个目录里。
-# 输出一份 JSON：{来源地址: 文件名}。**任何一个来源转不了就整体失败**——静默丢掉
-# 一条规则的后果是那部分流量从「走上游」变成「走直连」，没有人会发现。
-plan_rule_set_migration() {
-  local outdir="$1" source name json rc=0
-  local -a pairs=()
-  while IFS= read -r source; do
-    [[ -n "$source" ]] || continue
-    name="$(migrated_rule_file_name "$source")" || return 1
-    json="$(mktemp /tmp/sb-rule-source-json.XXXXXX)" || return 1
-    register_temp_path "$json" || { rm -f -- "$json"; return 1; }
-    if ! fetch_singbox_rule_set_json "$source" "$json"; then
-      printf '规则集无法取得：%s\n' "$source" >&2
-      rc=1
-    elif ! singbox_rule_set_json_to_mihomo_yaml "$json" "$outdir/$name"; then
-      printf '上面这条说的是这个规则集：%s\n' "$source" >&2
-      rc=1
-    else
-      pairs+=("$source" "$name")
-    fi
-    rm -f -- "$json"
-    unregister_temp_path "$json" || true
-    ((rc == 0)) || return 1
-  done <<<"$(singbox_rule_sources_in_state)"
-  # 没有分流的机器是常态，这一支必须单独走：把空数组喂给 printf 会打出一个空行，
-  # 那一行会被后面的 jq 当成一个来源，算出一个键为空串的假条目。
-  if ((${#pairs[@]} == 0)); then
-    printf '{}\n'
-    return 0
-  fi
-  printf '%s\n' "${pairs[@]}" | jq -Rn '[inputs] |
-    [range(0; length; 2) as $i | {key: .[$i], value: .[$i + 1]}] | from_entries'
-}
-
-# 把算好的规则文件装进规则目录，并把状态里的 url 换成 rule_file。
-# 写法一律是 classical：转换器产出的就是完整规则行。
-apply_rule_set_migration() {
-  local plan="$1" staged="$2" name
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    install -m 644 "$staged/$name" "$(mihomo_rule_file_path "$name")" || return 1
-  done <<<"$(jq -r '.[]' <<<"$plan")"
-  # 状态改写走既有的原子更新，权限与属主的处理与别处一致。
-  atomic_state_update '
-      def migrate:
-        if has("url") then
-          ($plan[.url] // error("规则集来源没有对应的规则文件：" + .url)) as $file |
-          .rule_file = $file | .rule_behavior = "classical" | del(.url)
-        else . end;
-      .splits = [.splits[]? | migrate] |
-      .rule_presets = [.rule_presets[]? | migrate]' --argjson plan "$plan"
-}
-
-# 切换前的检查。任一条不过就拒绝，且**什么都不动**。
-switch_kernel_preflight() {
-  [[ "$PROXY_KERNEL" == singbox ]] || {
-    echo "错误：本机的代理内核不是 sing-box，无需切换。" >&2
-    return 1
-  }
-  environment_is_deployed || {
-    echo "错误：本机尚未完成部署，请先选择「安装或修复环境」。" >&2
-    return 1
-  }
-  [[ "$(uname -m)" == x86_64 ]] || { echo "错误：仅支持 x86_64 Linux。" >&2; return 1; }
-  need_cmd curl; need_cmd jq
-  [[ -x "$SINGBOX_BIN" ]] || {
-    echo "错误：找不到本机的 sing-box，可执行文件是转换分流规则集的前提。" >&2
-    return 1
-  }
-}
-
-# 只算不改：把要做的事和转换结果打印出来，机器一个字节都不动。
-# 项目所有者要的就是这一步——在动生产机器之前先看一眼转出来的规则对不对。
-preview_kernel_switch() {
-  local staged="$1" plan count users splits
-  plan="$(plan_rule_set_migration "$staged")" || return 1
-  count="$(jq 'length' <<<"$plan")" || return 1
-  users="$(jq '[.users[]?] | length' "$STATE_FILE")" || return 1
-  splits="$(jq '[.splits[]?] | length' "$STATE_FILE")" || return 1
-  printf '\n将要发生的事\n'
-  printf '  用户 %s 个：端口、密码、加密方式、有效期、配额与累计用量都不变，客户端配置不用改。\n' "$users"
-  printf '  分流 %s 条：规则集会被转换成 mihomo 的规则文件（见下），关联关系不变。\n' "$splits"
-  printf '  服务会切换：停 sing-box、起 mihomo，中间会断几秒。\n'
-  printf '  sing-box 不会被删除，只是停用并取消开机启动；确认无误后可以另行清理。\n'
-  if ((count > 0)); then
-    printf '\n规则集的转换结果（共 %s 个来源）\n' "$count"
-    while IFS=$'\t' read -r source name; do
-      [[ -n "$source" ]] || continue
-      printf '  %s\n    → %s（%s 条规则）\n' "$source" "$(mihomo_rule_file_path "$name")" \
-        "$(($(wc -l < "$staged/$name") - 1))"
-    done <<<"$(jq -r 'to_entries[] | "\(.key)\t\(.value)"' <<<"$plan")"
-    printf '\n这些文件生成之后归你维护，管理器不会再改它们的内容。\n'
-  else
-    printf '\n本机没有分流，也就没有规则集要转换。\n'
-  fi
-  printf '%s\n' "$plan" > "$staged/.plan.json"
-}
-
-switch_kernel_to_mihomo() {
-  local iface work backup staged plan singbox_was_enabled=false
-  local -a switch_created=()
-  local switch_created_count=0
-  resolve_deployment_kernel || return 1
-  load_runtime_config || return 1
-  switch_kernel_preflight || return 1
-  if ! acquire_operation_lock; then
-    log "错误：$OPERATION_LOCK_ERROR"
-    return 1
-  fi
-  ensure_safe_ssh_for_kernel_restart || { release_operation_lock; return 0; }
-  staged="$(mktemp -d /tmp/sb-kernel-switch.XXXXXX)" || { release_operation_lock; return 1; }
-  register_temp_path "$staged" || { rm -rf -- "$staged"; release_operation_lock; return 1; }
-  # 先只算不改。算不出来就停在这里，机器一个字节都没动。
-  if ! preview_kernel_switch "$staged"; then
-    echo '错误：切换没有开始，本机未做任何改动。' >&2
-    rm -rf -- "$staged"
-    unregister_temp_path "$staged" || true
-    release_operation_lock
-    return 1
-  fi
-  plan="$(cat "$staged/.plan.json")" || { rm -rf -- "$staged"; release_operation_lock; return 1; }
-  cat <<'EOF'
-
-切换之后不能用「切回 sing-box」退回来：分流的规则集只能从 sing-box 的格式转成
-mihomo 的，反过来转不了。事后要退回 sing-box，走的是重装一台 sing-box 机器、
-再从切换前的 .sbm 加密迁移备份恢复——备份里的分流仍然是 sing-box 的规则集地址。
-
-切换前会创建一份完整环境快照，但它只在这次切换中途失败时由脚本自动还原，
-菜单里没有事后手工恢复它的入口（ADR 0032）。
-EOF
-  print_offsite_recovery_status
-  local answer
-  read -r -p '确认现在切换到 mihomo？[y/N]：' answer || { rm -rf -- "$staged"; release_operation_lock; return 1; }
-  [[ "$answer" =~ ^[Yy]$ ]] || {
-    echo '已取消，本机未做任何改动。'
-    rm -rf -- "$staged"
-    unregister_temp_path "$staged" || true
-    release_operation_lock
-    return 0
-  }
-  iface="$(default_network_interface)" || { rm -rf -- "$staged"; release_operation_lock; die "无法识别默认网络接口"; }
-  [[ -n "$iface" ]] || { rm -rf -- "$staged"; release_operation_lock; die "无法识别默认网络接口"; }
-  work="$(mktemp -d /tmp/sb-user-manager.XXXXXX)" || { rm -rf -- "$staged"; release_operation_lock; return 1; }
-  register_temp_path "$work" || { rm -rf -- "$work" "$staged"; release_operation_lock; return 1; }
-  create_environment_backup || { rm -rf -- "$work" "$staged"; release_operation_lock; return 1; }
-  backup="$ENV_BACKUP"
-  systemctl is-enabled --quiet sing-box 2>/dev/null && singbox_was_enabled=true
-  rollback_switch() {
-    local rc="${1:-$?}"
-    trap - ERR
-    clear_signal_rollback
-    systemctl stop sb-user-expiry.timer mihomo nfuse 2>/dev/null || true
-    if ((switch_created_count > 0)); then
-      cleanup_deploy_created_paths "${switch_created[@]}"
-    fi
-    restore_failed_environment_change 切换内核 "$backup" "$work"
-    # 快照恢复只还原文件；sing-box 的开机启用状态与服务本身要显式拉回来。
-    if [[ "$singbox_was_enabled" == true ]]; then systemctl enable sing-box >/dev/null 2>&1 || true; fi
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl restart nfuse sing-box >/dev/null 2>&1 || true
-    systemctl start sb-user-expiry.timer >/dev/null 2>&1 || true
-    rm -rf -- "$staged"
-    release_operation_lock
-    return "$rc"
-  }
-  local path
-  while IFS= read -r path; do
-    if [[ ! -e "$path" && ! -L "$path" ]]; then
-      switch_created[switch_created_count]="$path"
-      ((switch_created_count+=1))
-    fi
-  done < <(deploy_tracked_paths)
-  if ! begin_environment_transaction "switch-kernel" "$backup" "${switch_created[@]}"; then
-    rm -rf -- "$work" "$staged"
-    release_operation_lock
-    return 1
-  fi
-  trap rollback_switch ERR
-  set_signal_rollback rollback_switch
-  # 目录先建：规则文件要落进规则目录，而它必须与单元里 SAFE_PATHS 的第二条一字不差。
-  run_step_or_rollback rollback_switch install -d -m 700 /etc/mihomo || return 1
-  run_step_or_rollback rollback_switch install -d -m 755 "$MIHOMO_WORK_DIR" || return 1
-  run_step_or_rollback rollback_switch install -d -m 755 "$MIHOMO_RULES_DIR" || return 1
-  # 规则集与状态改写要在**翻内核之前**做完：转换靠的是本机现有的 sing-box。
-  run_step_or_rollback rollback_switch apply_rule_set_migration "$plan" "$staged" || return 1
-  PROXY_KERNEL=mihomo
-  run_step_or_rollback rollback_switch write_manager_config || return 1
-  # download_binaries 依赖 fetch_latest_releases 填好的那几个变量；忘了它的后果
-  # 不是「下载失败」而是**未定义变量导致整个进程当场退出**，回滚都来不及跑，
-  # 机器停在半迁移状态上（真机演练撞到过，靠启动时的事务恢复才回去的）。
-  # 传 false：管理脚本自身不在这次切换的更新范围内。
-  run_step_or_rollback rollback_switch fetch_latest_releases false || return 1
-  run_step_or_rollback rollback_switch download_binaries "$work" || return 1
-  run_step_or_rollback rollback_switch write_base_config || return 1
-  run_step_or_rollback rollback_switch rebuild_protocol_inbounds ss2022 || return 1
-  run_step_or_rollback rollback_switch rebuild_protocol_inbounds anytls || return 1
-  run_step_or_rollback rollback_switch rebuild_all_split_configs || return 1
-  run_step_or_rollback rollback_switch write_systemd_units "$iface" || return 1
-  run_step_or_rollback rollback_switch kernel_check_default_install || return 1
-  run_step_or_rollback rollback_switch stop_singbox_for_switch || return 1
-  run_step_or_rollback rollback_switch activate_managed_services || return 1
-  run_step_or_rollback rollback_switch verify_kernel_switch || return 1
-  run_step_or_rollback rollback_switch complete_environment_change "$work" || return 1
-  rm -rf -- "$staged"
-  unregister_temp_path "$staged" || true
-  release_operation_lock
-  log "已切换到 mihomo；切换前的完整环境快照在 $backup"
-  cat <<'EOF'
-
-切换完成。请自己连一次确认客户端还能用——客户端配置不需要改。
-sing-box 已停用并取消开机启动，文件还在；确认无误之后可以在「部署与卸载」里清理它。
-EOF
-}
-
-# 停掉 sing-box 并取消开机启动。**不删文件**：项目所有者定的是「保留但停用」，
-# 出事时机器上还留着旧二进制与旧配置，排查便宜得多。
-stop_singbox_for_switch() {
-  systemctl disable --now sing-box >/dev/null 2>&1 || true
-  if systemctl is-active --quiet sing-box 2>/dev/null; then
-    echo '错误：sing-box 停不下来，切换不能继续。' >&2
-    return 1
-  fi
-}
-
-# 切换之后的自检。任一条不过都会触发整体回滚——一台切了一半的机器比没切更糟。
-verify_kernel_switch() {
-  local expected_ports listening port
-  kernel_service_is_active || { echo '错误：mihomo 没有起来。' >&2; return 1; }
-  systemctl is-active --quiet nfuse || { echo '错误：Nfuse 没有起来。' >&2; return 1; }
-  expected_ports="$(jq -r '[.users[]? | select(.status == "active") | .endpoints[]?.port] | unique | .[]' "$STATE_FILE")" || return 1
-  [[ -n "$expected_ports" ]] || return 0
-  listening="$(ss -lntup 2>/dev/null | awk '/mihomo/ {print $5}' | sed 's/.*://')" || return 1
-  while IFS= read -r port; do
-    [[ -n "$port" ]] || continue
-    grep -Fxq "$port" <<<"$listening" || {
-      printf '错误：切换后端口 %s 没有被 mihomo 监听。\n' "$port" >&2
-      return 1
-    }
-  done <<<"$expected_ports"
-}
-
-# sing-box 自己的东西，写死的字面量清单。展示、删除与删除后的复检共用这一份，
-# 三处各写一遍迟早只改一处。
-# **不包含管理器的数据目录**：它今天恰好也叫 /etc/sing-box，里面是用户资料、内部
-# 备份与 AnyTLS 证书，删掉就没了。这里只删那个目录里属于内核的配置文件。
-singbox_leftover_paths() {
-  printf '%s\n' \
-    /usr/local/bin/sing-box \
-    /etc/systemd/system/sing-box.service \
-    /etc/systemd/system/multi-user.target.wants/sing-box.service \
-    /var/lib/sing-box \
-    "$SINGBOX_CONFIG" \
-    "$SINGBOX_CHANNEL_STATE"
-}
-
-# 清理之后的复检：mihomo 还在跑，且清单上的东西确实都没了。
-verify_singbox_cleanup() {
-  local path
-  kernel_service_is_active || { echo '错误：清理之后 mihomo 不在运行。' >&2; return 1; }
-  while IFS= read -r path; do
-    [[ -n "$path" ]] || continue
-    if [[ -e "$path" || -L "$path" ]]; then
-      printf '错误：%s 仍然存在。\n' "$path" >&2
-      return 1
-    fi
-  done <<<"$(singbox_leftover_paths)"
-}
-
-# 切换完成、确认无误之后，把 sing-box 自己的东西清掉。
-# **单独一个动作而不是切换的一部分**：项目所有者定的是「保留但停用」，留着旧
-# 二进制与旧配置，出事时排查便宜得多；等你自己连过、确认没问题了再来清。
-#
-# 清单是写死的字面量，且**只包含 sing-box 自己的东西**。管理器的数据目录今天恰好
-# 也叫 /etc/sing-box（用户资料、内部备份、AnyTLS 证书都在里面），**绝不能删**——
-# 这里删的是那个目录里属于内核的那一个配置文件，以及内核的可执行文件、单元与
-# 工作目录。
-cleanup_singbox_leftovers() {
-  local answer backup work path
-  resolve_deployment_kernel || return 1
-  load_runtime_config || return 1
-  [[ "$PROXY_KERNEL" == mihomo ]] || {
-    echo '错误：本机的代理内核仍是 sing-box，不能清理它。' >&2
-    return 1
-  }
-  if systemctl is-active --quiet sing-box 2>/dev/null; then
-    echo '错误：sing-box 仍在运行，先确认本机已经切换完成。' >&2
-    return 1
-  fi
-  printf '\n将要删除的内容\n'
-  local found=false
-  while IFS= read -r path; do
-    if [[ -e "$path" || -L "$path" ]]; then printf '  %s\n' "$path"; found=true; fi
-  done <<<"$(singbox_leftover_paths)"
-  [[ "$found" == true ]] || { echo '  没有找到 sing-box 的残留文件，无需清理。'; return 0; }
-  printf '\n管理器自己的数据目录（%s）不会被动，用户资料、内部备份与证书都在里面。\n' "$MANAGER_DATA_DIR"
-  printf '删除之后**再也无法回到 sing-box**：这台机器上 sing-box 的可执行文件与运行配置\n'
-  printf '都会消失。退回 sing-box 的路是重装一台机器、再从切换前的 .sbm 加密迁移备份恢复，\n'
-  printf '与这里删不删残留无关；机器上的完整环境快照只在本次清理失败时由脚本自动还原。\n'
-  print_offsite_recovery_status
-  read -r -p '确认删除？[y/N]：' answer || return 1
-  [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消。'; return 0; }
-  if ! acquire_operation_lock; then
-    log "错误：$OPERATION_LOCK_ERROR"
-    return 1
-  fi
-  work="$(mktemp -d /tmp/sb-user-manager.XXXXXX)" || { release_operation_lock; return 1; }
-  register_temp_path "$work" || { rm -rf -- "$work"; release_operation_lock; return 1; }
-  create_environment_backup || { rm -rf -- "$work"; release_operation_lock; return 1; }
-  backup="$ENV_BACKUP"
-  if ! begin_environment_transaction "cleanup-singbox" "$backup"; then
-    rm -rf -- "$work"
-    release_operation_lock
-    return 1
-  fi
-  rollback_cleanup() {
-    local rc="${1:-$?}"
-    trap - ERR
-    clear_signal_rollback
-    restore_failed_environment_change 清理 "$backup" "$work"
-    release_operation_lock
-    return "$rc"
-  }
-  trap rollback_cleanup ERR
-  set_signal_rollback rollback_cleanup
-  while IFS= read -r path; do
-    [[ -n "$path" ]] || continue
-    run_step_or_rollback rollback_cleanup rm -rf -- "$path" || return 1
-  done <<<"$(singbox_leftover_paths)"
-  run_step_or_rollback rollback_cleanup systemctl daemon-reload || return 1
-  run_step_or_rollback rollback_cleanup verify_singbox_cleanup || return 1
-  run_step_or_rollback rollback_cleanup complete_environment_change "$work" || return 1
-  release_operation_lock
-  log "sing-box 的残留已清理；清理前的完整环境快照在 $backup"
-}
-
 # 确定本次安装或更新按哪个内核进行。
 # 已部署的机器一律以管理配置里的声明为准；干净机器一律装 mihomo，不给选择
 # （公开 Issue #157 的 2f）。仅供测试的内核选择开关已于 sing-box 线归档后剥离
@@ -2790,9 +2062,8 @@ EOF
           fi
           install_prerequisites || return 1
           fetch_latest_releases false || return 1
-          # 修复流程不得把测试通道静默替换为正式版；sing-box 由版本管理单独更新。
-          # 通道是 sing-box 独有的概念，mihomo 上没有对应物，因此整段按内核包住。
-          if [[ "$PROXY_KERNEL" == singbox && "$(current_singbox_channel)" == preview ]]; then
+          # 与 check_updates 同理：修复流程不得把一个测试版静默换成正式版。
+          if singbox_preview_deployed; then
             LATEST_KERNEL_VERSION="$(installed_singbox_version)"
           fi
           deploy_environment false
@@ -3113,17 +2384,15 @@ check_updates() {
   kernel_label="$(kernel_display_name)" || { release_operation_lock; return 1; }
   current_kernel="$(installed_kernel_version)"; current_nfuse="$(installed_nfuse_version)"
   current_manager="$(installed_manager_version)"
-  # 版本通道是 sing-box 独有的概念，其它内核没有对应物。
-  if [[ "$PROXY_KERNEL" == singbox ]]; then current_channel="$(current_singbox_channel)"; else current_channel=stable; fi
-  kernel_latest_label="$LATEST_KERNEL_VERSION"
-  if [[ "$current_channel" == preview ]]; then
-    if fetch_singbox_channel_releases; then
-      kernel_latest_label="${LATEST_PREVIEW_SINGBOX_VERSION}（测试通道）"
-    else
-      kernel_latest_label="未知（请到版本管理检查）"
-    fi
-    # 通用更新流程不得把测试通道静默替换为正式版；sing-box 由版本管理单独更新。
+  # 不再显示「最新测试版是多少」——那需要另查一次 GitHub 的预发布列表，
+  # 而这条线已经不跟踪了。见 singbox_preview_deployed 上方的说明。
+  if singbox_preview_deployed; then
+    current_channel=preview
+    kernel_latest_label='不跟踪（测试版）'
     LATEST_KERNEL_VERSION="$current_kernel"
+  else
+    current_channel=stable
+    kernel_latest_label="$LATEST_KERNEL_VERSION"
   fi
   manager_latest_label="$LATEST_MANAGER_VERSION"
   if version_gt "$LATEST_MANAGER_VERSION" "${current_manager:-0}"; then
@@ -3146,7 +2415,8 @@ check_updates() {
   printf '%-18s %-18s %-18s\n' 'Nfuse' "${current_nfuse:-未知}" "$LATEST_NFUSE_VERSION"
   printf '%-18s %-18s %-18s\n' '管理脚本' "${current_manager:-未知}" "$manager_latest_label"
   if [[ "$current_channel" == preview ]]; then
-    echo "提示：sing-box 测试通道请在「sing-box 版本管理 → 更新当前通道」中更新。"
+    echo "提示：本机装的是 sing-box 测试版。测试版通道已不再由本脚本跟踪或更新，"
+    echo "      这里也不会把它换成正式版；要换请自行处理 sing-box 二进制。"
   fi
   if [[ "$needs_update" != true ]]; then
     if [[ "$current_channel" == preview ]]; then printf '\n其余组件已经是最新版本。\n'

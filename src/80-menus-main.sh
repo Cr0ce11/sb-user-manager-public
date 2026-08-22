@@ -226,9 +226,6 @@ system_management_menu() {
     prepare_menu_screen
     ui_menu_begin
     ui_header '系统管理' '运行、维护与基础配置'
-    # 「sing-box 版本管理」只在 sing-box 机器上出现。mihomo 没有正式版／测试版
-    # 通道这回事，留一个永远点不动的菜单项比少一项更让人困惑（公开 Issue #157 的 2f）。
-    # 底层的守卫不撤：菜单是给人看的，守卫防的是别的调用点。
     ui_menu_items \
       deploy '部署与卸载' update '检测更新' \
       status '查看服务状态' diagnostics '检查与故障报告' \
@@ -236,7 +233,6 @@ system_management_menu() {
     # 「geo 数据源」只在 mihomo 上出现：sing-box 部署里没有 GeoSite／GeoIP
     # 这回事，留一个永远点不动的菜单项比少一项更让人困惑（公开 Issue #219）。
     [[ "$PROXY_KERNEL" != mihomo ]] || ui_menu_items geo 'geo 数据源'
-    [[ "$PROXY_KERNEL" != singbox ]] || ui_menu_items channel 'sing-box 版本管理'
     ui_back_item '返回主菜单'
     ui_menu_select || return 0
     case "$UI_MENU_ACTION" in
@@ -247,7 +243,6 @@ system_management_menu() {
       backup) migration_backup_menu;;
       sni) global_sni_menu;;
       geo) geo_source_menu;;
-      channel) singbox_channel_menu;;
       back) return 0;;
     esac
   done
@@ -258,10 +253,7 @@ deployment_management_menu() {
     prepare_menu_screen
     ui_menu_begin
     ui_header '部署与卸载' '安装、修复或移除运行环境'
-    ui_menu_items \
-      install '安装或修复环境' \
-      switch '切换到 mihomo 内核' \
-      cleanup '清理 sing-box 残留'
+    ui_menu_items install '安装或修复环境'
     printf '\n'
     ui_section '危险操作'
     printf '%s' "$UI_RED"
@@ -271,8 +263,6 @@ deployment_management_menu() {
     ui_menu_select || return 0
     case "$UI_MENU_ACTION" in
       install) install_environment; pause_menu;;
-      switch) switch_kernel_to_mihomo; pause_menu;;
-      cleanup) cleanup_singbox_leftovers; pause_menu;;
       uninstall)
         MENU_RETURNED=false
         uninstall_environment

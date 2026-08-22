@@ -150,9 +150,10 @@ kernel_check_config() {
   kernel_check_config_with "$(kernel_binary_path)" "$1" || return 1
 }
 
-# 用指定的内核可执行文件校验配置文件。
-# 切换 sing-box 正式版与测试版通道时，需要用非当前的二进制校验。
-# （接管既有安装那条路已于 v4.25.23 撤除，公开 Issue #157。）
+# 用指定的内核可执行文件校验配置文件。校验用的二进制不一定是当前在跑的那个：
+# 分流规则集的探针会拿候选二进制先试一遍。
+# （接管既有安装那条路已于 v4.25.23 撤除，公开 Issue #157；sing-box 通道切换
+# 已于 sing-box 线归档时撤除，公开 Issue #256。）
 # 两个内核的写法不同：sing-box 是 `check -c 文件`，mihomo 是 `-t -d 工作目录 -f 文件`。
 # mihomo 必须带 -d：不带时它会按自己的默认目录找配置并在那里落下运行期文件。
 # 还必须带 SAFE_PATHS，且与 systemd 单元里的那一份同源：`mihomo -t` 会当场

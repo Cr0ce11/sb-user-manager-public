@@ -69,8 +69,6 @@ MIHOMO_REPOSITORY="MetaCubeX/mihomo"
 # CPU 上直接拒绝运行（退出码 1）。廉价 VPS 上只到 v2 的老 Xeon 仍然常见，
 # 本项目的测试机自己也跑不了 v3。详见公开 Issue #165。
 MIHOMO_ARCH="linux-amd64-compatible"
-SINGBOX_CHANNEL_STATE="${SB_SINGBOX_CHANNEL_STATE:-/var/lib/sb-user-manager/singbox-channel.json}"
-SINGBOX_VERSION_STORE="${SB_SINGBOX_VERSION_STORE:-/var/lib/sb-user-manager/singbox-versions}"
 DEPLOYED_VERSIONS_FILE="${SB_DEPLOYED_VERSIONS_FILE:-/var/lib/sb-user-manager/versions}"
 DIAGNOSTIC_REPORT_DIR="${SB_DIAGNOSTIC_REPORT_DIR:-/root/sb-user-manager-diagnostics}"
 DEFAULT_SS2022_SHADOWTLS_SNI="publicassets.cdn-apple.com"
@@ -416,7 +414,6 @@ is_managed_temp_path() {
   [[ "$path" == /tmp/sb-* ]] ||
     [[ "$name" =~ ^\.(managed-users|migration-config|migration-state|state-restore|restore-config|restore-state|restore-previous-state|restore-manager-config|sb-user-manager\.conf|sb-user-manager\.launch|atomic-install|manager-handoff|config|normalized|takeover-normalized|takeover-config)\. ]] ||
     [[ "$name" =~ ^\.(nfuse-snapshot|transaction)\. ]] ||
-    [[ "$name" =~ ^\.singbox-channel\. ]] ||
     [[ "$name" =~ ^\.shared-preset-runtime\. ]] ||
     [[ -n "${STATE_FILE:-}" && "$path" == "${STATE_FILE}.tmp" ]] ||
     [[ "$name" == sb-user-data-*.sbm.tmp ]]
