@@ -56,28 +56,32 @@
 
 ### 测试环境（本轮逐台实读）
 
-开发机上的五台 OrbStack 机器（能力与未覆盖项见
+开发机上的三台 OrbStack 机器（能力与未覆盖项见
 [公开 Issue #139](https://github.com/Cr0ce11/sb-user-manager-public/issues/139)）。
 
 | 机器 | 版本 | 内核 | 管理器数据目录 | 用户／分流 | 说明 |
 |---|---|---|---|---|---|
-| `sbm-deb12` | **4.25.25** | sing-box | `/etc/sing-box` | 1／0 | 上一轮通过真实菜单更新路径升上来的 |
-| `sbm-deb12b` | **4.25.23** | sing-box | `/etc/sing-box` | 1／0 | 换内核演练机，已用快照还原；上两轮都没动它 |
-| `sbm-deb13` | **4.25.24** | mihomo | `/etc/sb-user-manager` | 0／0 | 2f 全新安装出来的机器；上一轮没升 |
-| `sbm-mihomo` | **4.25.25** | mihomo | `/etc/sing-box` | 0／0 | 2f 之前装的，目录仍是老名字 |
+| `sbm-deb13` | 4.25.24 | mihomo | `/etc/sb-user-manager` | 0／0 | 2f 全新安装出来的机器，用中立数据目录 |
+| `sbm-mihomo` | 4.25.26 | mihomo | `/etc/sing-box` | 0／0 | 2f 之前装的，目录仍是老名字 |
 | `sbm-gate` | 未部署 | — | — | — | 只跑本地门禁 |
-| `sbm-upgrade` | **4.25.26** | sing-box | `/etc/sing-box` | 2／1 | **2026-08-22 新建**，OPS-007 的跨版直升演练机；从 v4.25.16 全新装出来再一步升到 v4.25.26。是目前唯一一台**带分流**的 sing-box 机器（分流用真实公网规则集 `geosite-openai.srs`），可作换内核演练与 sing-box 回归的对照。不再需要时可以直接 `orb delete sbm-upgrade` |
 
-`sbm-deb12` 与 `sbm-deb12b` 的管理配置里**没有** `PROXY_KERNEL` 这一行——它们是内核声明
-之前装的存量机器，内核由 `singbox_deployment_present` 判出来。这不是缺陷。
+**三台 sing-box 测试机（`sbm-deb12`、`sbm-deb12b`、`sbm-upgrade`）已于 2026-08-22 删除**，
+与 [公开 Issue #227](https://github.com/Cr0ce11/sb-user-manager-public/issues/227) 的剥离一起，
+由项目所有者决定 sing-box 线归档后执行。删除前已用它们完成剥离的回归验证。
 
-**四台部署机上都有一条绕开宿主机代理 fake-IP DNS 的 `/etc/hosts` 条目**
+> ⚠️ **从此没有任何办法在真机上验证 sing-box 的行为。** 全新安装只装 mihomo，
+> 而唯一能装出 sing-box 的开关（`SB_DEPLOY_PROXY_KERNEL`）已随本次剥离删除。
+> 真需要一台 sing-box 机器时，只能用 **v4.25.22 或更早的不可变 Release** 去装，
+> 装出来的是旧版管理器，不能用来验当前版本的行为。sing-box 代码路径现在只剩
+> `tests/test-unit.sh` 的夹具在覆盖。
+
+**两台部署机上都有一条绕开宿主机代理 fake-IP DNS 的 `/etc/hosts` 条目**
 （`raw.githubusercontent.com` 指向 GitHub 的真实地址）。含远程规则集的验收依赖它，
 详见第五节。
 
-**一处历史记录的错误已经查实**：[Issue #63](https://github.com/Cr0ce11/sb-user-manager-public/issues/63)
-的两条评论把 `sbm-deb12b` 记成 4.25.21，本轮登机实读确认**是 4.25.23**。
-机器版本以登机实读为准，不要引用 Issue 里的旧数字。
+**机器版本一律以登机实读为准，不要引用 Issue 或本文件里的旧数字。** 曾经吃过一次：
+[Issue #63](https://github.com/Cr0ce11/sb-user-manager-public/issues/63) 的两条评论把
+`sbm-deb12b` 记成 4.25.21，登机实读才发现是 4.25.23（那台机器现已删除）。
 
 ---
 
