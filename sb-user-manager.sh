@@ -2661,14 +2661,22 @@ rollback_active_operation() {
 }
 
 run_step_or_rollback() {
-  local rollback="$1" rc
+  local rollback="$1" rc step
   declare -F "$rollback" >/dev/null || die "操作回滚函数不存在：$rollback"
   shift
+  step="$1"
+  # 失败码必须写在 else 里：`if ... fi` 没有 else 分支时整条语句的退出码恒为 0，
+  # 在 fi 之后读 $? 只会读到 0。静态门禁看守这条约定，本次改动正是被它抓住的。
   if "$@"; then
     return 0
   else
     rc=$?
   fi
+  # 说出是哪一步失败的。以前只有一句「操作失败，正在自动撤销本次修改」，
+  # 一次真实的生产故障因此只能靠逐行读源码定位（公开 Issue #265）。
+  # **只记函数名，绝不记参数**：参数里有用户密码（例如 append_inbounds 收到的
+  # 整段入站片段），记进日志等于把凭据扩散到日志和随后被贴出来的终端输出里。
+  log "步骤失败：${step}（退出码 ${rc}）"
   "$rollback" "$rc" || true
   return "$rc"
 }
@@ -12309,6 +12317,7 @@ repair_consistency() {
        (if $metered then (.limit_gib|tostring) else "" end),
        (if $metered then (.billing_anchor|tostring) else "" end)] | @tsv
     ' <<<"$user")"; then
+      log "无法自动修复：用户「$(jq -r '.name // "(无名)"' <<<"$user")」的记录不完整，请先在「用户管理」中检查这一条"
       rollback_active_operation 1 || true
       return 1
     fi
@@ -12338,21 +12347,30 @@ repair_consistency() {
       fi
     done < <(jq -r 'if (.endpoints | type) == "array" then .endpoints[].port else .port end' <<<"$user")
   done <<<"$user_rows"
+  # 分流记录的三选一来源：网址、本机规则文件、GeoSite／GeoIP 类别（公开 Issue #219）。
+  # **geo 类别那种既没有网址也没有规则文件**，状态里只有一份类别清单；这里漏掉它的
+  # 后果不是报错，而是整条自动修复失败并回滚，使用者看不到任何原因——正式服务器
+  # Air 上就是这么坏的（公开 Issue #265）。判据与迁移包校验、重建分流配置保持一致。
   while IFS= read -r split; do
     [[ -n "$split" ]] || continue
     if ! jq -e '
       select((.name|type)=="string" and (.name|length)>0) |
       select(.status=="active" or .status=="disabled") |
       select(.scope=="all" or .scope=="user") |
-      select(((.url // .rule_file)|type)=="string" and ((.url // .rule_file)|length)>0) |
+      select(
+        (((.url // .rule_file)|type)=="string" and ((.url // .rule_file)|length)>0) or
+        ((.rule_geo|type)=="array" and (.rule_geo|length)>0)
+      ) |
       select((.upstream|type)=="object")
     ' <<<"$split" >/dev/null; then
+      log "无法自动修复：分流「$(jq -r '.name // "(无名)"' <<<"$split")」的记录不完整，请先在「分流管理」中检查这一条"
       rollback_active_operation 1 || true
       return 1
     fi
     scope="$(jq -er '.scope' <<<"$split")" || { rollback_active_operation 1 || true; return 1; }
     scope_user="$(jq -er '.user // ""' <<<"$split")" || { rollback_active_operation 1 || true; return 1; }
     if [[ "$scope" == user ]] && ! user_exists "$scope_user"; then
+      log "无法自动修复：分流「$(jq -r '.name // "(无名)"' <<<"$split")」指向一个不存在的用户，请先在「分流管理」中处理这一条"
       rollback_active_operation 1 || true
       return 1
     fi

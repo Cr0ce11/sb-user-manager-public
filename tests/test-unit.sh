@@ -10275,4 +10275,108 @@ Protocol version: TLSv1.2'
     echo 'mihomo 机器上适配层应当正常工作' >&2; exit 1; }
 )
 
+# ============================================================
+# 自动修复必须认得 geo 类别分流（公开 Issue #265）
+# ============================================================
+# 分流的规则集来源有三种：网址、本机规则文件、GeoSite／GeoIP 类别。第三种既没有
+# 网址也没有规则文件，状态里只有一份类别清单。`repair_consistency` 的校验此前只
+# 认前两种，于是**任何带 geo 类别分流的机器，自动修复必定失败并整体回滚**——正式
+# 服务器 Air 上就是这么坏的，而且一个字都不打印，只能靠登机比对状态文件才定位得到。
+#
+# 这一组用 Air 上那条分流的真实形状做夹具（名字与类别照抄，不含任何凭据）。
+repair_geo_fixture() {
+  local out="$1" source_json="$2"
+  jq -n --argjson src "$source_json" '{
+    schema_version: 7,
+    users: [{name:"geo-user", status:"active", metered:false,
+             endpoints:[{protocol:"anytls", port:20011}]}],
+    splits: [({name:"AI", status:"active", scope:"user", user:"geo-user",
+               upstream:{server:"example.com", server_port:443, protocol:"anytls"}} + $src)],
+    outbound_presets: [], rule_presets: []
+  }' > "$out"
+}
+
+repair_geo_run() {
+  local state="$1"
+  (
+    STATE_FILE="$state"
+    collect_unit_drift_rows() { printf ''; }
+    ensure_safe_ssh_for_kernel_restart() { return 0; }
+    create_environment_backup() { ENV_BACKUP="$work/repair-geo-backup"; }
+    start_managed_operation() { return 0; }
+    finish_managed_operation() { return 0; }
+    rollback_active_operation() { return "${1:-1}"; }
+    state_sync_linked_split_snapshots() { return 0; }
+    remove_user_inbounds() { return 0; }
+    append_inbounds() { return 0; }
+    make_user_inbounds_from_state() { printf '{}'; }
+    rebuild_all_split_configs() { return 0; }
+    check_singbox_and_restart() { return 0; }
+    user_exists() { [[ "$1" == geo-user ]]; }
+    nfuse() {
+      case "${1:-}" in
+        list) printf '[{"name":"geo-user","tier":"c","ports":[{"start":20011,"end":20011}]}]\n' ;;
+        *) return 0 ;;
+      esac
+    }
+    repair_consistency
+  )
+}
+
+# 一、Air 上那条分流的形状：只有 rule_geo。修复必须走得通。
+repair_geo_fixture "$work/repair-geo.json" '{"rule_geo":["GEOSITE,category-ai-!cn"]}'
+repair_geo_run "$work/repair-geo.json" >"$work/repair-geo.out" 2>&1 || {
+  echo 'geo 类别分流不该让自动修复失败' >&2
+  cat "$work/repair-geo.out" >&2
+  exit 1
+}
+
+# 二、对照：另外两种来源本来就该通过，证明上面那条不是因为校验整个失效了。
+repair_geo_fixture "$work/repair-url.json" '{"url":"https://example.com/rule.srs"}'
+repair_geo_run "$work/repair-url.json" >/dev/null 2>&1 || {
+  echo '网址来源的分流应当照常通过' >&2; exit 1; }
+repair_geo_fixture "$work/repair-file.json" '{"rule_file":"ai.yaml","rule_behavior":"classical"}'
+repair_geo_run "$work/repair-file.json" >/dev/null 2>&1 || {
+  echo '本机规则文件来源的分流应当照常通过' >&2; exit 1; }
+
+# 三、**反面样本**：三种来源一个都没有的分流仍然必须被拦下——校验不能松成恒真。
+repair_geo_fixture "$work/repair-none.json" '{}'
+if repair_geo_run "$work/repair-none.json" >"$work/repair-none.out" 2>&1; then
+  echo '没有任何规则集来源的分流必须被拦下' >&2
+  exit 1
+fi
+# 而且要说得出是哪一条。以前这里一个字都不打印，一次真实的生产故障因此只能靠
+# 逐行读源码定位（公开 Issue #265）。
+grep -Fq '分流「AI」的记录不完整' "$work/repair-none.out" || {
+  echo '拦下时必须说出是哪一条分流' >&2
+  cat "$work/repair-none.out" >&2
+  exit 1
+}
+
+# 四、空的 rule_geo 不算数：类别清单是空的等于没有来源。
+repair_geo_fixture "$work/repair-empty-geo.json" '{"rule_geo":[]}'
+if repair_geo_run "$work/repair-empty-geo.json" >/dev/null 2>&1; then
+  echo '空的类别清单不该被当成有效来源' >&2
+  exit 1
+fi
+
+# 五、失败的步骤要报出名字（公开 Issue #265）。只报函数名，不报参数——参数里有用户密码。
+step_name_out="$(
+  # 这一段要断言「参数没有出现在输出里」，因此必须关掉 xtrace——
+  # 用 `bash -x` 跑整份测试时，追踪行本身会把参数打到 stderr，
+  # 断言会被自己的调试输出弄假。
+  set +x
+  rollback_noop() { return "${1:-1}"; }
+  failing_step() { return 42; }
+  run_step_or_rollback rollback_noop failing_step 'secret-looking-argument' 2>&1 || true
+)"
+[[ "$step_name_out" == *'步骤失败：failing_step'* ]] || {
+  printf '失败步骤应当报出函数名，实际：%s\n' "$step_name_out" >&2; exit 1; }
+[[ "$step_name_out" == *'退出码 42'* ]] || {
+  printf '失败步骤应当报出原始退出码，实际：%s\n' "$step_name_out" >&2; exit 1; }
+if [[ "$step_name_out" == *secret-looking-argument* ]]; then
+  echo '失败步骤的日志绝不能带上参数：参数里可能是用户密码' >&2
+  exit 1
+fi
+
 echo 'unit checks passed'
