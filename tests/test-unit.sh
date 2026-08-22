@@ -8395,167 +8395,18 @@ ANYTLS_SNI="b.example.com"'
 )
 
 # ============================================================
-# 搬迁管理器数据目录（公开 Issue #276，公开 Issue #172 三步走第三步）
-#
-# **这是一次性工具的用例。** 正式机器执行完之后迁移入口整段撤除，本节届时一并
-# 删除——项目所有者要求跑完即撤，不在项目里留不必要的历史遗留。
+# 恢复记录的路径白名单要按字面认得管理器数据目录（公开 Issue #276）
 # ============================================================
 
-# 一、要搬的正好是三样，源与目标都由数据目录派生，不是各写一处字面量。
-(
-  MANAGER_DATA_DIR=/etc/sing-box
-  resolve_manager_data_paths
-  STATE_FILE="$MANAGER_DATA_DIR/managed-users.json"
-  BACKUP_DIR="$MANAGER_DATA_DIR/backups"
-  migration_rows="$(manager_data_migration_items /etc/sb-user-manager)" || exit 1
-  [[ "$(printf '%s\n' "$migration_rows" | wc -l)" == 3 ]] || exit 1
-  [[ "$migration_rows" == *$'用户资料\t/etc/sing-box/managed-users.json\t/etc/sb-user-manager/managed-users.json'* ]] || exit 1
-  [[ "$migration_rows" == *$'内部备份\t/etc/sing-box/backups\t/etc/sb-user-manager/backups'* ]] || exit 1
-  [[ "$migration_rows" == *$'AnyTLS 证书\t/etc/sing-box/cert\t/etc/sb-user-manager/cert'* ]] || exit 1
-) || {
-  echo '搬迁清单必须是由管理器数据目录派生的三样' >&2
-  exit 1
-}
-
-# 二、内容指纹要真的能分辨差别。它是「搬过去的是同一份东西」这条断言的全部依据，
-# 分辨不出权限或内容的变化，那条断言就是恒真的。
-(
-  fingerprint_a="$work/migrate-fingerprint-a"
-  fingerprint_b="$work/migrate-fingerprint-b"
-  mkdir -p "$fingerprint_a/sub" "$fingerprint_b/sub"
-  printf 'x' > "$fingerprint_a/one"
-  printf 'x' > "$fingerprint_b/one"
-  chmod 600 "$fingerprint_a/one" "$fingerprint_b/one"
-  [[ "$(manager_data_tree_fingerprint "$fingerprint_a")" == "$(manager_data_tree_fingerprint "$fingerprint_b")" ]] || exit 1
-  chmod 644 "$fingerprint_b/one"
-  [[ "$(manager_data_tree_fingerprint "$fingerprint_a")" != "$(manager_data_tree_fingerprint "$fingerprint_b")" ]] || exit 1
-  chmod 600 "$fingerprint_b/one"
-  printf 'y' > "$fingerprint_b/one"
-  [[ "$(manager_data_tree_fingerprint "$fingerprint_a")" != "$(manager_data_tree_fingerprint "$fingerprint_b")" ]] || exit 1
-  # 两边都不存在也要能对上：本机从没用过 AnyTLS 时证书目录就是这种情形。
-  [[ "$(manager_data_tree_fingerprint "$work/migrate-fingerprint-missing")" == '（不存在）' ]] || exit 1
-) || {
-  echo '内容指纹必须能分辨权限与内容的差别' >&2
-  exit 1
-}
-
-# 三、改管理配置**只动与数据目录有关的三行，其余逐字保留**。
-# 这是本节最要紧的一条：整份重写会把使用者自己改过的握手端口、SNI、对外地址
-# 一并按默认值写回去，等于顺手抹掉他的设置。末尾的对照用 write_manager_config
-# 真做一遍，证明这个担心不是假想的。
-(
-  migrate_conf="$work/migrate-manager-config.conf"
-  cat > "$migrate_conf" <<'CONFEOF'
-HANDSHAKE_PORT=8443
-SHADOWTLS_STRICT_MODE=false
-SS2022_SHADOWTLS_SNI="my.example.com"
-ANYTLS_SNI="other.example.com"
-PROXY_KERNEL="mihomo"
-MIHOMO_BIN="/usr/local/bin/mihomo"
-STATE_FILE="/etc/sing-box/managed-users.json"
-BACKUP_DIR="/etc/sing-box/backups"
-LOCK_FILE="/run/lock/sb-user-manager.lock"
-CLIENT_SERVER_PORT_OVERRIDE="9999"
-PUBLIC_SERVER_OVERRIDE="node.example.com"
-CONFEOF
-  chown() { :; }
-  ( CONF_FILE="$migrate_conf"; rewrite_manager_config_data_dir /etc/sb-user-manager ) || exit 1
-  grep -Fxq 'MANAGER_DATA_DIR="/etc/sb-user-manager"' "$migrate_conf" || exit 1
-  grep -Fxq 'STATE_FILE="/etc/sb-user-manager/managed-users.json"' "$migrate_conf" || exit 1
-  grep -Fxq 'BACKUP_DIR="/etc/sb-user-manager/backups"' "$migrate_conf" || exit 1
-  # 老行必须被删掉，而不是新行追加在后面留下两份。
-  [[ "$(grep -c '^STATE_FILE=' "$migrate_conf")" == 1 ]] || exit 1
-  [[ "$(grep -c '^BACKUP_DIR=' "$migrate_conf")" == 1 ]] || exit 1
-  [[ "$(grep -c '^MANAGER_DATA_DIR=' "$migrate_conf")" == 1 ]] || exit 1
-  # 其余取值逐字不动。
-  grep -Fxq 'HANDSHAKE_PORT=8443' "$migrate_conf" || exit 1
-  grep -Fxq 'SHADOWTLS_STRICT_MODE=false' "$migrate_conf" || exit 1
-  grep -Fxq 'SS2022_SHADOWTLS_SNI="my.example.com"' "$migrate_conf" || exit 1
-  grep -Fxq 'ANYTLS_SNI="other.example.com"' "$migrate_conf" || exit 1
-  grep -Fxq 'CLIENT_SERVER_PORT_OVERRIDE="9999"' "$migrate_conf" || exit 1
-  grep -Fxq 'PUBLIC_SERVER_OVERRIDE="node.example.com"' "$migrate_conf" || exit 1
-  # 改完的配置必须还能被自己的解析器接受，并解析出新目录。
-  ( CONF_FILE="$migrate_conf"
-    unset MANAGER_DATA_DIR STATE_FILE BACKUP_DIR CERT_DIR ANYTLS_CERT_FILE ANYTLS_KEY_FILE
-    load_runtime_config >/dev/null 2>&1 || exit 1
-    [[ "$MANAGER_DATA_DIR" == /etc/sb-user-manager ]] || exit 1
-    [[ "$STATE_FILE" == /etc/sb-user-manager/managed-users.json ]] || exit 1
-    [[ "$BACKUP_DIR" == /etc/sb-user-manager/backups ]] || exit 1
-    [[ "$CERT_DIR" == /etc/sb-user-manager/cert ]] || exit 1
-    [[ "$HANDSHAKE_PORT" == 8443 ]] || exit 1
-    [[ "$PUBLIC_SERVER_OVERRIDE" == node.example.com ]] || exit 1 ) || exit 1
-  # 对照：换成整份重写，上面那几个自定义取值当场变回默认值。
-  ( CONF_FILE="$migrate_conf"
-    PROXY_KERNEL=mihomo
-    MANAGER_DATA_DIR=/etc/sb-user-manager
-    resolve_manager_data_paths
-    STATE_FILE="$MANAGER_DATA_DIR/managed-users.json"
-    BACKUP_DIR="$MANAGER_DATA_DIR/backups"
-    write_manager_config ) || exit 1
-  grep -Fxq 'HANDSHAKE_PORT=443' "$migrate_conf" || exit 1
-  if grep -Fq 'node.example.com' "$migrate_conf"; then exit 1; fi
-) || {
-  echo '改配置必须只动数据目录那三行，其余逐字保留' >&2
-  exit 1
-}
-
-# 四、残留证书路径的检查要抓得住，也不能误伤。漏掉运行配置或单元里任何一处，
-# 内核都会去一个马上要被删掉的目录里读证书。
-(
-  stale_root="$work/migrate-stale-cert"
-  mkdir -p "$stale_root/etc/systemd/system"
-  SB_SYSTEM_ROOT="$stale_root"
-  PROXY_KERNEL=mihomo
-  MIHOMO_SERVICE=mihomo
-  MIHOMO_CONFIG="$stale_root/config.json"
-  stale_unit="$stale_root/etc/systemd/system/mihomo.service"
-  # 对照：两处都已经指向新目录时必须通过。
-  printf '{"listeners":[{"certificate":"/etc/sb-user-manager/cert/anytls.crt"}]}\n' > "$MIHOMO_CONFIG"
-  printf 'Environment=SAFE_PATHS=/etc/sb-user-manager/cert:/etc/mihomo/rules\n' > "$stale_unit"
-  verify_no_stale_cert_references /etc/sing-box/cert >/dev/null 2>&1 || exit 1
-  # 反面样本一：运行配置里还留着老路径。
-  printf '{"listeners":[{"certificate":"/etc/sing-box/cert/anytls.crt"}]}\n' > "$MIHOMO_CONFIG"
-  if verify_no_stale_cert_references /etc/sing-box/cert >/dev/null 2>&1; then exit 1; fi
-  # 反面样本二：运行配置干净了，但单元里的允许路径还指着老目录。
-  printf '{"listeners":[{"certificate":"/etc/sb-user-manager/cert/anytls.crt"}]}\n' > "$MIHOMO_CONFIG"
-  printf 'Environment=SAFE_PATHS=/etc/sing-box/cert:/etc/mihomo/rules\n' > "$stale_unit"
-  if verify_no_stale_cert_references /etc/sing-box/cert >/dev/null 2>&1; then exit 1; fi
-) || {
-  echo '残留证书路径的检查必须抓得住运行配置与单元这两处' >&2
-  exit 1
-}
-
-# 五、拒绝路径与对照。
-(
-  migrate_preflight_conf="$work/migrate-preflight.conf"
-  printf 'HANDSHAKE_PORT=443\n' > "$migrate_preflight_conf"
-  # 反面样本：sing-box 机器必须被拒绝，而且说得出是因为内核不对。
-  if migrate_reject_output="$( PROXY_KERNEL=singbox
-      migrate_manager_data_preflight /etc/sb-user-manager 2>&1 )"; then exit 1; fi
-  [[ "$migrate_reject_output" == *'只支持 mihomo 部署'* ]] || exit 1
-  # 反面样本：目标目录已经存在时必须停下来，不能把两份用户资料混在一起。
-  migrate_existing_target="$work/migrate-existing-target"
-  mkdir -p "$migrate_existing_target"
-  if migrate_reject_output="$( PROXY_KERNEL=mihomo
-      environment_is_deployed() { :; }
-      STATE_FILE="$migrate_preflight_conf"
-      migrate_manager_data_preflight "$migrate_existing_target" 2>&1 )"; then exit 1; fi
-  [[ "$migrate_reject_output" == *'目标目录已经存在'* ]] || exit 1
-  # 对照：形状正常的 mihomo 机器必须通过，证明上面两条不是「什么都拒绝」。
-  ( PROXY_KERNEL=mihomo
-    environment_is_deployed() { :; }
-    STATE_FILE="$migrate_preflight_conf"
-    migrate_manager_data_preflight "$work/migrate-absent-target" >/dev/null 2>&1 ) || exit 1
-) || {
-  echo '搬迁的拒绝路径必须抓得住，且不误伤形状正常的机器' >&2
-  exit 1
-}
-
-# 五之二、恢复记录的路径白名单必须**按字面**认得中立数据目录。
-# 恢复记录是给下一次运行的进程读的，而那个进程的 MANAGER_DATA_DIR 来自它当时
-# 读到的管理配置：搬迁崩在改配置之前时，配置里写的还是老目录，只靠「按当前取值
-# 匹配」那一条，记录里的新目录会被判成不受管路径，开机自检拒绝恢复，机器卡在
-# 半迁移状态上要人工介入。真机演练撞到过一次。
+# 恢复记录是给**下一次运行的进程**读的，而那个进程的 MANAGER_DATA_DIR 来自它当时
+# 读到的管理配置。因此白名单里不能只有「按当前取值匹配」那一条：取值一旦与记录里
+# 写的目录不一致，记录里的路径会被判成不受管路径，开机自检拒绝恢复，机器卡在半截
+# 状态上要人工介入。`/etc/sb-user-manager` 是本项目固定的管理器数据目录名，因此它
+# 必须同时是白名单里的**字面量**。
+#
+# 这一条是搬迁管理器数据目录（公开 Issue #276）的真机演练撞出来的——那次崩在改配置
+# 之前，配置里写的还是老目录。**搬迁入口已随公开 Issue #283 撤除，这一条不跟着回退**：
+# 它钉的是固定目录名，与那个一次性入口无关。
 (
   MANAGER_DATA_DIR=/etc/sing-box
   # 反面样本的形状：数据目录仍是老目录，新目录必须照样被认。
@@ -8583,29 +8434,6 @@ CONFEOF
   done
 ) || {
   echo '恢复记录的白名单必须按字面认得中立数据目录，且不能因此放行无关路径' >&2
-  exit 1
-}
-
-# 六、对照：已经在中立目录上的机器要明确说「无需搬迁」并且原地不动，
-# 而不是空跑一遍流程——2f 之后新装的机器全是这个形状。
-(
-  migrate_neutral_conf="$work/migrate-neutral.conf"
-  cat > "$migrate_neutral_conf" <<'CONFEOF'
-HANDSHAKE_PORT=443
-PROXY_KERNEL="mihomo"
-MANAGER_DATA_DIR="/etc/sb-user-manager"
-STATE_FILE="/etc/sb-user-manager/managed-users.json"
-BACKUP_DIR="/etc/sb-user-manager/backups"
-CONFEOF
-  migrate_neutral_output="$( CONF_FILE="$migrate_neutral_conf"
-    unset MANAGER_DATA_DIR STATE_FILE BACKUP_DIR
-    # 取锁与照快照都不该发生；真被调到就让用例当场失败，而不是悄悄改机器。
-    acquire_operation_lock() { echo '不该取锁' >&2; return 1; }
-    create_environment_backup() { echo '不该照快照' >&2; return 1; }
-    migrate_manager_data_directory 2>&1 )" || exit 1
-  [[ "$migrate_neutral_output" == *'无需搬迁'* ]] || exit 1
-) || {
-  echo '已经在中立目录上的机器必须被明确告知无需搬迁' >&2
   exit 1
 }
 
