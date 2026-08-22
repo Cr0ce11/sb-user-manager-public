@@ -29,8 +29,21 @@ assert_log() {
   }
 }
 
+# 每个用例都从文件级默认值重新开始。真机上定时任务每 15 分钟是一个**全新进程**，
+# 而这份测试在同一个进程里连着跑十几个用例：确定内核那一步会改 PROXY_KERNEL 与
+# MANAGER_DATA_DIR（干净机器按 2f 走中立数据目录），不重置就会漏到后面的用例里，
+# 让后面的断言测的是一个真机上不存在的状态组合。
+reset_kernel_defaults() {
+  PROXY_KERNEL=singbox
+  MANAGER_DATA_DIR=/etc/sing-box
+  resolve_manager_data_paths
+  STATE_FILE="$MANAGER_DATA_DIR/managed-users.json"
+  BACKUP_DIR="$MANAGER_DATA_DIR/backups"
+}
+
 reset_calls() {
   : > "$work/calls"
+  reset_kernel_defaults
 }
 
 record_call() {
@@ -196,6 +209,63 @@ for failure_case in \
   assert_log "$expected_calls"
 done
 FAIL_AT=""
+
+# 公开 Issue #251 的回归：到期任务在载入管理配置之前就检查环境完不完整，那一刻
+# PROXY_KERNEL 还是文件级默认值 sing-box，于是一台 mihomo 机器会被判成「没装好」，
+# 定时任务每 15 分钟失败一次、到期用户永远不会被自动停用。
+# **夹具必须是 mihomo 形状**——上面那份是 sing-box 形状，恰好与那个错误的默认值一致，
+# 所以它永远看不见这个缺陷。
+mihomo_footprint_paths=(
+  /etc/sb-user-manager.conf
+  /etc/mihomo/config.json
+  /usr/local/bin/mihomo
+  /etc/systemd/system/mihomo.service
+  /etc/sb-user-manager/managed-users.json
+  /usr/local/sbin/sb-user-manager
+  /usr/local/bin/nfuse
+  /etc/systemd/system/nfuse.service
+  /etc/systemd/system/sb-user-expiry.service
+  /etc/systemd/system/sb-user-expiry.timer
+)
+
+make_mihomo_standalone_footprint() {
+  local logical rooted
+  rm -rf -- "$SB_SYSTEM_ROOT"
+  for logical in "${mihomo_footprint_paths[@]}"; do
+    rooted="$(system_path "$logical")"
+    mkdir -p "$(dirname "$rooted")"
+    : > "$rooted"
+  done
+}
+
+(
+  # 子 shell：resolve_deployment_kernel 会改 PROXY_KERNEL 与 MANAGER_DATA_DIR，
+  # 不让它漏到后面的用例里。
+  # 管理配置指向一个不存在的路径，以走「按机器上已有的东西推断内核」那条分支——
+  # CONF_FILE 不经 SB_SYSTEM_ROOT，否则这里会读到跑测试那台机器的真实配置。
+  CONF_FILE="$work/absent-manager.conf"
+
+  make_mihomo_standalone_footprint
+  reset_calls
+  run_standalone_internal_expire >"$work/mihomo-expire.out" 2>&1 ||
+    fail 'mihomo deployment rejected the internal expiry task'
+  assert_log $'recover-environment\nhandoff:--internal-expire\nprepare-core\nexpire'
+
+  # 对照：装了一半的 mihomo 机器仍然必须被拒绝。少了这一条，就分不清是缺陷修好了
+  # 还是这项检查整个失效了。
+  for missing_path in /etc/mihomo/config.json /usr/local/bin/mihomo /usr/local/bin/nfuse; do
+    make_mihomo_standalone_footprint
+    rm -f -- "$(system_path "$missing_path")"
+    reset_calls
+    if run_standalone_internal_expire >"$work/mihomo-partial-expire.out" 2>&1; then
+      fail "partial mihomo environment without $missing_path accepted the internal expiry task"
+    fi
+    grep -Fq '尚未完成单机部署' "$work/mihomo-partial-expire.out"
+  done
+)
+
+# 后面的用例仍按 sing-box 形状的完整夹具进行。
+make_complete_standalone_footprint
 
 main_body="$(declare -f main)"
 grep -Fq 'run_standalone_interactive_startup' <<<"$main_body"
