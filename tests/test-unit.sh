@@ -8564,6 +8564,23 @@ CONFEOF
   # 对照：白名单不能因此变成什么都收。
   if is_environment_recovery_path /etc/passwd; then exit 1; fi
   if is_environment_recovery_path /etc/sb-user-manager-other; then exit 1; fi
+  # 那一条 case 分支是一行几十个模式的长行，往里插东西很容易顺手挤掉旁边一个。
+  # 加这个 P276 时就挤掉过 /etc/sb-user-manager.conf 与 /etc/sing-box 两条，
+  # 只有「完整卸载」那个用例在一长串调用之后才报出来。核心路径逐条钉住。
+  for recovery_path in /etc/sb-user-manager.conf /etc/sing-box /etc/sing-box/config.json \
+    /etc/sb-user-manager /etc/sb-user-manager/managed-users.json \
+    /etc/mihomo /etc/mihomo/config.json /var/lib/nfuse /var/lib/nfuse/nfuse.db \
+    /var/lib/sing-box /var/lib/mihomo /var/lib/sb-user-manager /var/lib/sb-user-manager/versions \
+    /etc/systemd/system/sing-box.service /etc/systemd/system/mihomo.service \
+    /etc/systemd/system/nfuse.service /etc/systemd/system/sb-user-expiry.service \
+    /etc/systemd/system/sb-user-expiry.timer /usr/local/sbin/sb-user-manager \
+    /usr/local/bin/sbm /usr/local/bin/sing-box /usr/local/bin/mihomo /usr/local/bin/nfuse \
+    /run/nfuse.sock; do
+    is_environment_recovery_path "$recovery_path" || {
+      printf '恢复记录白名单漏掉了核心路径：%s\n' "$recovery_path" >&2
+      exit 1
+    }
+  done
 ) || {
   echo '恢复记录的白名单必须按字面认得中立数据目录，且不能因此放行无关路径' >&2
   exit 1

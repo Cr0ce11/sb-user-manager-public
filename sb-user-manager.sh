@@ -2503,7 +2503,7 @@ is_environment_recovery_path() {
     # 它当时读到的管理配置——搬迁（公开 Issue #276）中途崩在改配置之前时，配置
     # 里写的还是老目录，于是记录里的 /etc/sb-user-manager 会被判为不受管路径，
     # 开机自检拒绝恢复，机器卡在半迁移状态上要人工介入。真机演练撞到过一次。
-    /etc/sb-user-manager|/etc/sb-user-manager/*|/etc/sing-box/*|/etc/systemd/system/sing-box.service|/etc/systemd/system/nfuse.service|/etc/systemd/system/sb-user-expiry.service|/etc/systemd/system/sb-user-expiry.timer|/etc/systemd/system/multi-user.target.wants/sing-box.service|/etc/systemd/system/multi-user.target.wants/nfuse.service|/etc/systemd/system/timers.target.wants/sb-user-expiry.timer|/var/lib/nfuse|/var/lib/nfuse/*|/var/lib/sing-box|/var/lib/sing-box/*|/var/lib/sb-user-manager|/var/lib/sb-user-manager/*|/usr/local/sbin/sb-user-manager|/usr/local/bin/sbm|/usr/local/bin/sing-box|/usr/local/bin/nfuse|/run/nfuse.sock) return 0;;
+    /etc/sb-user-manager|/etc/sb-user-manager/*|/etc/sb-user-manager.conf|/etc/sing-box|/etc/sing-box/*|/etc/systemd/system/sing-box.service|/etc/systemd/system/nfuse.service|/etc/systemd/system/sb-user-expiry.service|/etc/systemd/system/sb-user-expiry.timer|/etc/systemd/system/multi-user.target.wants/sing-box.service|/etc/systemd/system/multi-user.target.wants/nfuse.service|/etc/systemd/system/timers.target.wants/sb-user-expiry.timer|/var/lib/nfuse|/var/lib/nfuse/*|/var/lib/sing-box|/var/lib/sing-box/*|/var/lib/sb-user-manager|/var/lib/sb-user-manager/*|/usr/local/sbin/sb-user-manager|/usr/local/bin/sbm|/usr/local/bin/sing-box|/usr/local/bin/nfuse|/run/nfuse.sock) return 0;;
     # mihomo 部署的路径。两个内核的路径同时列在白名单里而不是按内核分派：
     # 白名单只决定「这条路径允不允许出现在事务里」，多列几条不会让不存在的文件
     # 被创建，而按内核分派会让一台机器换内核后旧路径突然不被允许清理。
