@@ -938,17 +938,22 @@ grep -Fq 'complete_environment_change()' sb-user-manager.sh
 # 为什么必须存在。
 # 这些数字在 2f 撤除「接管既有 sing-box 安装」之后整体降了一档（公开 Issue #157），
 # 又在 sing-box 线归档撤除换内核与清理残留之后再降一档（公开 Issue #256）。
-# default_network_interface 的三处：全新部署、服务单元漂移的检查与修复（公开
-# Issue #190）——后两处必须现场识别接口，不能读旧单元里的那个，那正是可能不对的
-# 东西。第四处曾经是换内核。
-# activate_managed_services 的两处：部署，以及重写单元之后的重新激活（不
-# daemon-reload 就等于「修了但没生效」）。第三处曾经是换内核之后启用新内核的服务。
-# restore_failed_environment_change 与 complete_environment_change 现在各剩部署
-# 这一处；卸载走的是自己那套。这几个降到 1 之后断言只剩「别再抄一份实现」这一层
+# **下面这一档里有四个数字是临时的**：搬迁管理器数据目录（公开 Issue #276）是
+# 一次性工具，正式机器执行完之后整段撤除，届时这四个数字要各减一档回到括号里
+# 写的那个值——default_network_interface 4→3、activate_managed_services 3→2、
+# restore_failed_environment_change 2→1、complete_environment_change 2→1。
+# default_network_interface 的四处：全新部署、服务单元漂移的检查与修复（公开
+# Issue #190）——这两处必须现场识别接口，不能读旧单元里的那个，那正是可能不对的
+# 东西——以及搬迁管理器数据目录时重写单元。曾经的另一处是换内核。
+# activate_managed_services 的三处：部署、重写单元之后的重新激活（不
+# daemon-reload 就等于「修了但没生效」），以及搬迁之后重启服务。曾经的另一处是
+# 换内核之后启用新内核的服务。
+# restore_failed_environment_change 与 complete_environment_change 各是部署与搬迁
+# 两处；卸载走的是自己那套。这几个降到 1 之后断言只剩「别再抄一份实现」这一层
 # 意思，仍然值得留着。
-for shared_helper in default_network_interface:3 ensure_anytls_certificate:1 install_manager_binary:1 \
-  write_deployed_versions:1 activate_managed_services:2 restore_failed_environment_change:1 \
-  complete_environment_change:1; do
+for shared_helper in default_network_interface:4 ensure_anytls_certificate:1 install_manager_binary:1 \
+  write_deployed_versions:1 activate_managed_services:3 restore_failed_environment_change:2 \
+  complete_environment_change:2; do
   expected_calls="${shared_helper##*:}"
   shared_helper="${shared_helper%%:*}"
   shared_helper_calls="$(awk -v helper="$shared_helper" 'index($0, helper) && !index($0, helper "()") {count++} END {print count+0}' sb-user-manager.sh)"
@@ -967,10 +972,11 @@ grep -Fq 'run_managed_step()' sb-user-manager.sh
 grep -Fq 'begin_environment_transaction()' sb-user-manager.sh
 grep -Fq 'recover_environment_transaction()' sb-user-manager.sh
 grep -Fq 'acquire_operation_lock()' sb-user-manager.sh
-# 取锁的三处：部署、卸载、迁移恢复——都是改环境的动作，不取锁就会与别的写入撞车。
-# 接管既有安装曾经是第四处（公开 Issue #157 的 2f 撤除），换内核与清理 sing-box
-# 残留曾经是第五、第六处（公开 Issue #256 撤除）。
-[[ "$(grep -Fc 'if ! acquire_operation_lock; then' sb-user-manager.sh)" == 3 ]]
+# 取锁的四处：部署、卸载、迁移恢复，以及搬迁管理器数据目录——都是改环境的动作，
+# 不取锁就会与别的写入撞车。第四处是一次性的（公开 Issue #276），撤除时这个数字
+# 回到 3。接管既有安装曾经也是一处（公开 Issue #157 的 2f 撤除），换内核与清理
+# sing-box 残留曾经是另外两处（公开 Issue #256 撤除）。
+[[ "$(grep -Fc 'if ! acquire_operation_lock; then' sb-user-manager.sh)" == 4 ]]
 for serialized_recovery in recover_environment_transaction acquire_manager_handoff_lock; do
   if ! awk -v function_name="$serialized_recovery" '
       $0 == function_name "() {" {inside=1}
@@ -1122,24 +1128,35 @@ grep -Fq "trap 'handle_runtime_signal INT 130' INT" sb-user-manager.sh
 grep -Fq "trap 'handle_runtime_signal TERM 143' TERM" sb-user-manager.sh
 signal_rollback_count="$(grep -Ec '^[[:space:]]+set_signal_rollback rollback_' sb-user-manager.sh || true)"
 clear_rollback_count="$(grep -Ec '^[[:space:]]+clear_signal_rollback$' sb-user-manager.sh || true)"
-# 五处登记：部署、卸载、迁移恢复、用户与分流的写入路径。接管既有安装曾经是第六处
-# （公开 Issue #157 的 2f 撤除），换内核与清理 sing-box 残留曾经是另外两处
-# （公开 Issue #256 撤除）。收到 INT/TERM 时没登记回滚的那条路，会把机器停在
+# 六处登记：部署、卸载、迁移恢复、用户与分流的写入路径，以及搬迁管理器数据目录。
+# 最后一处是一次性的（公开 Issue #276），撤除时这个数字回到 5。接管既有安装曾经
+# 也是一处（公开 Issue #157 的 2f 撤除），换内核与清理 sing-box 残留曾经是另外
+# 两处（公开 Issue #256 撤除）。收到 INT/TERM 时没登记回滚的那条路，会把机器停在
 # 改了一半的状态上。
-if [[ "$signal_rollback_count" != 5 ]]; then
-  echo "expected 5 signal rollback registrations, found $signal_rollback_count" >&2
+if [[ "$signal_rollback_count" != 6 ]]; then
+  echo "expected 6 signal rollback registrations, found $signal_rollback_count" >&2
   exit 1
 fi
-if [[ "$clear_rollback_count" != 10 ]]; then
-  echo "expected 10 signal rollback clears, found $clear_rollback_count" >&2
+if [[ "$clear_rollback_count" != 11 ]]; then
+  echo "expected 11 signal rollback clears, found $clear_rollback_count" >&2
   exit 1
 fi
 grep -Fq 'set_signal_rollback rollback_manager_handoff' sb-user-manager.sh
-# print_offsite_recovery_status 随它仅有的两个调用点（换内核、清理 sing-box 残留）
-# 一并删除（公开 Issue #256）。ADR 0032 的配套要求本身没有作废——它现在由「完整
-# 卸载」自己那套更重的备份流程承担；再添一个不可逆操作时必须重新落实这条。
-if grep -Fq 'print_offsite_recovery_status' sb-user-manager.sh; then
-  echo 'offsite recovery notice lost its only call sites; it must not linger as dead code' >&2
+# print_offsite_recovery_status 曾随它仅有的两个调用点（换内核、清理 sing-box
+# 残留）一并删除（公开 Issue #256），当时钉的是「不得作为死代码留下」。
+# 搬迁管理器数据目录（公开 Issue #276）是新添的不可逆操作——它在校验通过后删掉
+# 老位置的用户资料、备份与证书——因此按 ADR 0032「后续」一节的要求把它写了回来，
+# 断言随之从「不得存在」改成「必须正好有一个调用点」：这两种失败方式（死代码、
+# 有函数却没人调）正是这条历史要防的两头。
+# **搬迁入口是一次性的**，撤除那一版里这个函数会再次变成孤儿，届时把这条断言
+# 改回「不得存在」。
+if ! grep -Fq 'print_offsite_recovery_status() {' sb-user-manager.sh; then
+  echo 'offsite recovery notice must exist while an irreversible operation needs it' >&2
+  exit 1
+fi
+offsite_notice_calls="$(awk 'index($0, "print_offsite_recovery_status") && !index($0, "print_offsite_recovery_status()") {count++} END {print count+0}' sb-user-manager.sh)"
+if [[ "$offsite_notice_calls" != 1 ]]; then
+  echo "expected offsite recovery notice to have 1 caller, found $offsite_notice_calls" >&2
   exit 1
 fi
 # 这两句旧文案承诺了一条并不存在的路，不得复活。

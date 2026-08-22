@@ -60,6 +60,11 @@ uninstall_environment() {
   MENU_RETURNED=true
 }
 
+migrate_manager_data_directory() {
+  acquire_test_lock
+  echo 'mock migrate manager data'
+}
+
 check_updates() {
   acquire_test_lock
   echo 'mock update check'
@@ -275,10 +280,17 @@ def main() -> None:
             send("\n")
             expect("部署与卸载")
             expect_choice_prompt()
-            # 换内核与清理 sing-box 残留两项已随 sing-box 线归档撤除
-            # （公开 Issue #256），「部署与卸载」下只剩安装／修复与完整卸载，
-            # 卸载的编号因此回到 2。
+            # 「搬迁管理器数据目录」是一次性入口（公开 Issue #276），排在安装／修复
+            # 之后、危险操作之前；它撤除时这一段连同上面那个桩一并删掉，卸载的编号
+            # 回到 2。换内核与清理 sing-box 残留两项此前已随 sing-box 线归档撤除
+            # （公开 Issue #256）。
             send("2\n")
+            expect("mock migrate manager data")
+            expect("按回车返回菜单…")
+            send("\n")
+            expect("部署与卸载")
+            expect_choice_prompt()
+            send("3\n")
             expect("mock uninstall return")
             expect("部署与卸载")
             expect_choice_prompt()

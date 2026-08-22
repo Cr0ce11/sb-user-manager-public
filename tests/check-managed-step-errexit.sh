@@ -19,6 +19,7 @@ append_inbounds_from_new_user_snapshot
 apply_mihomo_geo_settings
 check_singbox_and_restart
 complete_environment_change
+copy_manager_data_to_target
 download_binaries
 enable_user_without_transaction
 ensure_anytls_certificate
@@ -30,10 +31,12 @@ kernel_check_default_install
 nfuse
 rebuild_all_split_configs
 rebuild_protocol_inbounds
+remove_legacy_manager_data
 remove_managed_uninstall_paths
 remove_split_config
 remove_user_inbounds
 replace_user_inbounds
+rewrite_manager_config_data_dir
 run_quietly
 state_add_anytls
 state_add_multi_user
@@ -56,6 +59,7 @@ state_set_status
 state_sync_linked_split_snapshots
 stop_managed_services_for_uninstall
 verify_managed_uninstall_paths_removed
+verify_manager_data_migration
 write_base_config
 write_deployed_versions
 write_geo_source_config

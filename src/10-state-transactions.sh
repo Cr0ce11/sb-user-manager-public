@@ -1043,11 +1043,16 @@ recover_pending_transaction() {
 
 is_environment_recovery_path() {
   case "$1" in
-    # 管理器自身数据的目录。今天它等于 /etc/sing-box，下面那条字面量已经覆盖；
-    # 单列一条是为了 MANAGER_DATA_DIR 改值之后，白名单不会把管理器的用户资料
-    # 与内部备份挡在事务之外（公开 Issue #172）。
+    # 管理器自身数据的目录。存量机器上它是 /etc/sing-box，2f 之后新装的机器上是
+    # /etc/sb-user-manager；两个名字下面都有字面量，这一条管的是管理配置把它指到
+    # 别处的机器（公开 Issue #172）。
     "$MANAGER_DATA_DIR"|"$MANAGER_DATA_DIR"/*) return 0;;
-    /etc/sb-user-manager.conf|/etc/sing-box|/etc/sing-box/*|/etc/systemd/system/sing-box.service|/etc/systemd/system/nfuse.service|/etc/systemd/system/sb-user-expiry.service|/etc/systemd/system/sb-user-expiry.timer|/etc/systemd/system/multi-user.target.wants/sing-box.service|/etc/systemd/system/multi-user.target.wants/nfuse.service|/etc/systemd/system/timers.target.wants/sb-user-expiry.timer|/var/lib/nfuse|/var/lib/nfuse/*|/var/lib/sing-box|/var/lib/sing-box/*|/var/lib/sb-user-manager|/var/lib/sb-user-manager/*|/usr/local/sbin/sb-user-manager|/usr/local/bin/sbm|/usr/local/bin/sing-box|/usr/local/bin/nfuse|/run/nfuse.sock) return 0;;
+    # **中立数据目录必须是字面量，不能只靠上面那条按当前取值匹配。**
+    # 恢复记录是给「下一次运行的进程」读的，而那个进程的 MANAGER_DATA_DIR 来自
+    # 它当时读到的管理配置——搬迁（公开 Issue #276）中途崩在改配置之前时，配置
+    # 里写的还是老目录，于是记录里的 /etc/sb-user-manager 会被判为不受管路径，
+    # 开机自检拒绝恢复，机器卡在半迁移状态上要人工介入。真机演练撞到过一次。
+    /etc/sb-user-manager|/etc/sb-user-manager/*|/etc/sb-user-manager.conf|/etc/sing-box|/etc/sing-box/*|/etc/systemd/system/sing-box.service|/etc/systemd/system/nfuse.service|/etc/systemd/system/sb-user-expiry.service|/etc/systemd/system/sb-user-expiry.timer|/etc/systemd/system/multi-user.target.wants/sing-box.service|/etc/systemd/system/multi-user.target.wants/nfuse.service|/etc/systemd/system/timers.target.wants/sb-user-expiry.timer|/var/lib/nfuse|/var/lib/nfuse/*|/var/lib/sing-box|/var/lib/sing-box/*|/var/lib/sb-user-manager|/var/lib/sb-user-manager/*|/usr/local/sbin/sb-user-manager|/usr/local/bin/sbm|/usr/local/bin/sing-box|/usr/local/bin/nfuse|/run/nfuse.sock) return 0;;
     # mihomo 部署的路径。两个内核的路径同时列在白名单里而不是按内核分派：
     # 白名单只决定「这条路径允不允许出现在事务里」，多列几条不会让不存在的文件
     # 被创建，而按内核分派会让一台机器换内核后旧路径突然不被允许清理。
