@@ -1478,7 +1478,7 @@ diagnostic_report_uid() {
 }
 
 create_diagnostic_report() {
-  local raw sanitized audit_file log_file report os_name singbox_version nfuse_version channel recorded_version kernel_bin_path kernel_cfg_path
+  local raw sanitized audit_file log_file report os_name kernel_version nfuse_version channel recorded_version kernel_bin_path kernel_cfg_path
   local sing_state nfuse_state expiry_state config_result nfuse_result state_result audit_result transaction_result launcher_result overall
   local users_total=0 users_active=0 users_disabled=0 users_ss=0 users_ss_legacy=0 users_anytls=0 users_metered=0 users_self=0
   local splits_total=0 splits_active=0 splits_disabled=0 splits_all=0 splits_user=0
@@ -1504,13 +1504,19 @@ create_diagnostic_report() {
   report="$DIAGNOSTIC_REPORT_DIR/diagnostic-$(date '+%Y%m%d-%H%M%S')-$$.txt"
 
   os_name="$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -n1 | sed 's/^"//;s/"$//' || true)"
-  singbox_version="$(installed_singbox_version)"; singbox_version="${singbox_version:-未知}"
+  kernel_version="$(installed_kernel_version)"; kernel_version="${kernel_version:-未知}"
   nfuse_version="$(installed_nfuse_version)"; nfuse_version="${nfuse_version:-未知}"
-  if [[ -x "$SINGBOX_BIN" ]]; then channel="$(current_singbox_channel)"; else channel=未知; fi
-  case "$channel" in
-    preview) channel='测试版';;
-    stable) channel='正式版';;
-  esac
+  # 正式版／测试版通道是 sing-box 独有的概念，mihomo 没有对应物：那里只印版本号，
+  # 不印一个必定「未知」的通道。此前这里写死了 sing-box 的取值入口，mihomo 机器上
+  # 因此每次都印出「sing-box：未知（未知）」，而同一份报告上一行印的是「代理内核：mihomo」。
+  channel=""
+  if [[ "$PROXY_KERNEL" == singbox && -x "$SINGBOX_BIN" ]]; then
+    case "$(current_singbox_channel)" in
+      preview) channel='（测试版）';;
+      stable) channel='（正式版）';;
+      *) channel='（未知通道）';;
+    esac
+  fi
   recorded_version="$(sed -n 's/^SCRIPT_VERSION=//p' "$DEPLOYED_VERSIONS_FILE" 2>/dev/null | head -n1 || true)"
   [[ "$recorded_version" == "$SCRIPT_VERSION" ]] && recorded_version="一致（${SCRIPT_VERSION}）" || recorded_version="不一致（记录 ${recorded_version:-缺失}，当前 ${SCRIPT_VERSION}）"
   if [[ -f /root/sb-user-manager.sh ]]; then
@@ -1581,17 +1587,17 @@ create_diagnostic_report() {
     printf '安装版本记录：%s\n' "$recorded_version"
     printf 'root 启动副本：%s\n' "$launcher_result"
     printf '代理内核：%s\n' "$PROXY_KERNEL"
-    printf 'sing-box：%s（%s）\n' "$singbox_version" "$channel"
+    printf '%s：%s%s\n' "$(kernel_display_name)" "$kernel_version" "$channel"
     printf 'Nfuse：%s\n' "$nfuse_version"
     printf '系统：%s\n' "${os_name:-未知}"
     printf '系统内核：%s｜架构：%s\n' "$(uname -r 2>/dev/null || echo 未知)" "$(uname -m 2>/dev/null || echo 未知)"
     echo
     echo '== 服务与基础检查 =='
-    printf '连接服务（sing-box）：%s\n' "$sing_state"
+    printf '连接服务（%s）：%s\n' "$(kernel_display_name)" "$sing_state"
     printf '流量统计（Nfuse）：%s\n' "$nfuse_state"
     printf '到期自动检查：%s\n' "$expiry_state"
     printf '管理配置：%s\n' "$([[ "$DIAGNOSTIC_CONFIG_READABLE" == true ]] && echo 可读取 || echo 缺失或不可读)"
-    printf 'sing-box 配置：%s\n' "$config_result"
+    printf '%s 配置：%s\n' "$(kernel_display_name)" "$config_result"
     printf 'Nfuse 通信与数据：%s\n' "$nfuse_result"
     printf '用户数据：%s\n' "$state_result"
     printf '未完成操作：%s\n' "$transaction_result"

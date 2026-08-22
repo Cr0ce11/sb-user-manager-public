@@ -275,7 +275,7 @@ prompt_add_outbound_preset() {
   prompt_split_upstream_fields "$PRESET_PROTOCOL" '{}' || { MENU_RETURNED=true; return 0; }
   upstream="$PROMPTED_SPLIT_UPSTREAM"
   printf '\n保存预览：\n  名称：%s\n  协议：%s\n  服务器：%s:%s\n' "$PRESET_NAME" "$(outbound_protocol_label "$PRESET_PROTOCOL")" "$(jq -r '.server' <<<"$upstream")" "$(jq -r '.server_port' <<<"$upstream")"
-  echo '说明：保存预置不会修改 sing-box，也不会影响现有分流。'
+  printf '说明：保存预置不会修改 %s，也不会影响现有分流。\n' "$(kernel_display_name)"
   read -r -p '确认检查并保存？[y/N]：' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消保存。'; return 0; }
   cmd_outbound_preset_add "$PRESET_NAME" "$upstream"
@@ -303,7 +303,7 @@ EOF
   case "$choice" in 1) protocol="$(jq -r '.protocol' <<<"$current")";; 2) protocol=anytls; current='{}';; 3) protocol=shadowsocks; current='{}';; 4) protocol=ss_shadowtls; current='{}';; 0) MENU_RETURNED=true; return 0;; esac
   prompt_split_upstream_fields "$protocol" "$current" || { MENU_RETURNED=true; return 0; }
   upstream="$PROMPTED_SPLIT_UPSTREAM"
-  if ((active > 0)); then echo '保存后会同步更新所有关联分流，并只重启一次 sing-box。'; else echo '保存后会同步更新关联记录；当前没有启用中的关联分流，不会重启服务。'; fi
+  if ((active > 0)); then printf '保存后会同步更新所有关联分流，并只重启一次 %s。\n' "$(kernel_display_name)"; else echo '保存后会同步更新关联记录；当前没有启用中的关联分流，不会重启服务。'; fi
   read -r -p '确认检查并保存？[y/N]：' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消修改。'; return 0; }
   cmd_outbound_preset_edit "$name" "$upstream"

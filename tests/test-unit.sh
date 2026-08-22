@@ -482,7 +482,9 @@ grep -Fq '内部错误：不支持的新增用户协议：unknown' <<<"$unknown_
     echo 'AnyTLS user conflict check should reject an existing candidate tag' >&2
     exit 1
   fi
-  grep -Fq '错误：tag 已存在' <<<"$anytls_conflict_output"
+  # 两个协议分支说的是同一件事，此前一边带 tag 名、一边只说「tag 已存在」；
+  # 现在统一成带名字的说法，内核名也改由适配层给出（内核无关路径不该写死 sing-box）。
+  grep -Fq '错误：sing-box 已存在 tag：anytls-conflict' <<<"$anytls_conflict_output"
 
   # 预检后配置发生变化时不得用旧快照覆盖新内容。
   cp "$base_config" "$SINGBOX_CONFIG"
@@ -5269,6 +5271,31 @@ printf 'SINGBOX_BIN="%s"\nSINGBOX_CONFIG="%s"\nNFUSE_BIN="%s"\nNFUSE_SOCKET="%s"
   grep -Fq '管理配置：缺失或不可读' "$partial_report"
   grep -Fq 'sing-box 配置：未通过' "$partial_report"
   grep -Fq 'Nfuse 通信与数据：异常' "$partial_report"
+
+  # 对照：同一份报告在 mihomo 上必须说 mihomo。这三行的**取值**一直走适配层，
+  # 错的只是标签——此前写死 sing-box，于是 mihomo 机器的报告上一行印
+  # 「代理内核：mihomo」，下面紧跟「sing-box：未知（未知）」。通道是 sing-box
+  # 独有的概念，mihomo 上不该印出一个必定「未知」的通道。
+  DIAGNOSTIC_REPORT_DIR="$diagnostic_root/mihomo-reports"
+  (
+    PROXY_KERNEL=mihomo
+    installed_kernel_version() { printf '1.19.30'; }
+    create_diagnostic_report > "$diagnostic_root/mihomo-output"
+  )
+  mihomo_report="$(find "$DIAGNOSTIC_REPORT_DIR" -type f -name 'diagnostic-*.txt' -print -quit)"
+  [[ -n "$mihomo_report" ]]
+  grep -Fq '代理内核：mihomo' "$mihomo_report"
+  grep -Fq 'mihomo：1.19.30' "$mihomo_report"
+  grep -Fq '连接服务（mihomo）：' "$mihomo_report"
+  grep -Fq 'mihomo 配置：' "$mihomo_report"
+  if grep -Fq 'sing-box：' "$mihomo_report"; then
+    echo 'mihomo 机器的诊断报告不得印出 sing-box 的版本行' >&2
+    exit 1
+  fi
+  if grep -Fq '连接服务（sing-box）' "$mihomo_report"; then
+    echo 'mihomo 机器的诊断报告不得把连接服务标成 sing-box' >&2
+    exit 1
+  fi
 )
 
 (

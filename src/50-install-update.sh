@@ -235,7 +235,7 @@ write_systemd_units() {
 
 # 机器上活着的 systemd 单元与「当前版本应该写出的」是否一致。
 #
-# 单元只在全新部署、接管既有安装、以及「修复缺失内容」这三条路径上写出，
+# 单元只在全新部署与「修复缺失内容」这两条路径上写出，
 # **升级脚本从来不会刷新它们**：一台完整部署的机器进「安装或修复环境」会被
 # 直接告知「安装完整，无需重复部署」然后原样返回（公开 Issue #190）。
 # 因此新版本改了单元内容时，存量机器会静静地落在旧单元上，而管理器按新单元的
@@ -2968,7 +2968,7 @@ uninstall_managed_environment() {
   fi
   migration_dir="$(migration_backup_dir)"
   printf '\n完整卸载已完成。\n'
-  printf 'sing-box、Nfuse、用户数据、运行配置、管理脚本和内部回滚材料已移除。\n'
+  printf '%s、Nfuse、用户数据、运行配置、管理脚本和内部回滚材料已移除。\n' "$(kernel_display_name)"
   if [[ -d "$migration_dir" ]]; then
     printf '加密迁移备份已保留在：%s\n' "$migration_dir"
   else

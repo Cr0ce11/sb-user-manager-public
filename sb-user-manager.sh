@@ -630,7 +630,8 @@ kernel_check_config() {
 }
 
 # 用指定的内核可执行文件校验配置文件。
-# 切换正式版与测试版通道、以及接管既有安装时，需要用非当前的二进制校验。
+# 切换 sing-box 正式版与测试版通道时，需要用非当前的二进制校验。
+# （接管既有安装那条路已于 v4.25.23 撤除，公开 Issue #157。）
 # 两个内核的写法不同：sing-box 是 `check -c 文件`，mihomo 是 `-t -d 工作目录 -f 文件`。
 # mihomo 必须带 -d：不带时它会按自己的默认目录找配置并在那里落下运行期文件。
 # 还必须带 SAFE_PATHS，且与 systemd 单元里的那一份同源：`mihomo -t` 会当场
@@ -656,7 +657,7 @@ kernel_check_default_install() {
 
 # 内核配置骨架的唯一定义。语义是「幂等补齐，不覆盖已有值」：
 # 对空对象应用它得到全新安装的初始配置，对既有配置应用它只补上缺的部分。
-# 全新安装、接管既有安装、一致性审计三处共用这一份，避免各写一套之后悄悄分叉——
+# 全新安装与一致性审计共用这一份，避免各写一套之后悄悄分叉——
 # v4.25.11 所修的缺陷正是同一份判断被写成两处而产生的。
 # 骨架属于内核特有的 schema 知识，因此放在适配层，每个内核各一份。
 SINGBOX_SKELETON_ENSURE_PROGRAM='
@@ -5444,11 +5445,9 @@ check_new_user_conflicts() {
     [$tags[] as $wanted | select(any(.[$container][]?; .[$entry_key] == $wanted)) | $wanted][0] // empty
   ' <<<"$config_json")" || die "无法解析或格式化运行配置：$(kernel_runtime_config_path)"
   if [[ -n "$conflict_tag" ]]; then
-    if [[ "$protocol" == ss2022 ]]; then
-      die "sing-box 已存在 tag：$conflict_tag"
-    else
-      die "tag 已存在"
-    fi
+    # 两个分支说的是同一件事，此前一边带 tag 名一边不带；统一成带名字的说法，
+    # 便于直接定位是哪个入口撞了。内核名走适配层——这条路径与内核无关。
+    die "$(kernel_display_name) 已存在 tag：$conflict_tag"
   fi
   if [[ "$protocol" == anytls ]]; then
     anytls_certificate_ready || die "AnyTLS 证书不存在，请先重新安装环境"
@@ -5496,16 +5495,16 @@ check_new_endpoint_conflicts() {
   nfuse_port_exists "$port" && die "Nfuse 已管理端口：$port"
   if [[ "$kind" == anytls ]]; then
     anytls_certificate_ready || die "AnyTLS 证书不存在，请先重新安装环境"
-    tag_exists_in_config "anytls-$name" && die "sing-box 已存在 tag：anytls-$name"
+    tag_exists_in_config "anytls-$name" && die "$(kernel_display_name) 已存在 tag：anytls-$name"
   else
     jq -e --arg name "$name" 'any(.users[]? | select(.name == $name) | .endpoints[]?;
       .protocol == "ss2022" and .transport == "shadowtls")' "$STATE_FILE" >/dev/null && has_legacy=true
     if [[ "$has_legacy" == true ]]; then
-      tag_exists_in_config "ss-direct-$name" && die "sing-box 已存在 tag：ss-direct-$name"
+      tag_exists_in_config "ss-direct-$name" && die "$(kernel_display_name) 已存在 tag：ss-direct-$name"
     else
-      tag_exists_in_config "st-$name" && die "sing-box 已存在 tag：st-$name"
-      tag_exists_in_config "ss-$name" && die "sing-box 已存在 tag：ss-$name"
-      tag_exists_in_config "ss-udp-$name" && die "sing-box 已存在 tag：ss-udp-$name"
+      tag_exists_in_config "st-$name" && die "$(kernel_display_name) 已存在 tag：st-$name"
+      tag_exists_in_config "ss-$name" && die "$(kernel_display_name) 已存在 tag：ss-$name"
+      tag_exists_in_config "ss-udp-$name" && die "$(kernel_display_name) 已存在 tag：ss-udp-$name"
     fi
   fi
   return 0
@@ -5846,7 +5845,7 @@ prepare_user_enable() {
   fragment="$(make_user_inbounds_from_state "$user")" || return 1
   while IFS= read -r tag; do
     [[ -n "$tag" ]] || continue
-    tag_exists_in_config "$tag" && die "sing-box 已存在 tag：$tag"
+    tag_exists_in_config "$tag" && die "$(kernel_display_name) 已存在 tag：$tag"
   done < <(jq -r '.[].tag' <<<"$fragment")
   metered="$(jq -r '.metered // (.limit_gib != null)' <<<"$user")" || return 1
   [[ "$metered" == true || "$metered" == false ]] || return 1
@@ -9040,7 +9039,7 @@ write_systemd_units() {
 
 # 机器上活着的 systemd 单元与「当前版本应该写出的」是否一致。
 #
-# 单元只在全新部署、接管既有安装、以及「修复缺失内容」这三条路径上写出，
+# 单元只在全新部署与「修复缺失内容」这两条路径上写出，
 # **升级脚本从来不会刷新它们**：一台完整部署的机器进「安装或修复环境」会被
 # 直接告知「安装完整，无需重复部署」然后原样返回（公开 Issue #190）。
 # 因此新版本改了单元内容时，存量机器会静静地落在旧单元上，而管理器按新单元的
@@ -11773,7 +11772,7 @@ uninstall_managed_environment() {
   fi
   migration_dir="$(migration_backup_dir)"
   printf '\n完整卸载已完成。\n'
-  printf 'sing-box、Nfuse、用户数据、运行配置、管理脚本和内部回滚材料已移除。\n'
+  printf '%s、Nfuse、用户数据、运行配置、管理脚本和内部回滚材料已移除。\n' "$(kernel_display_name)"
   if [[ -d "$migration_dir" ]]; then
     printf '加密迁移备份已保留在：%s\n' "$migration_dir"
   else
@@ -13417,7 +13416,7 @@ diagnostic_report_uid() {
 }
 
 create_diagnostic_report() {
-  local raw sanitized audit_file log_file report os_name singbox_version nfuse_version channel recorded_version kernel_bin_path kernel_cfg_path
+  local raw sanitized audit_file log_file report os_name kernel_version nfuse_version channel recorded_version kernel_bin_path kernel_cfg_path
   local sing_state nfuse_state expiry_state config_result nfuse_result state_result audit_result transaction_result launcher_result overall
   local users_total=0 users_active=0 users_disabled=0 users_ss=0 users_ss_legacy=0 users_anytls=0 users_metered=0 users_self=0
   local splits_total=0 splits_active=0 splits_disabled=0 splits_all=0 splits_user=0
@@ -13443,13 +13442,19 @@ create_diagnostic_report() {
   report="$DIAGNOSTIC_REPORT_DIR/diagnostic-$(date '+%Y%m%d-%H%M%S')-$$.txt"
 
   os_name="$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | head -n1 | sed 's/^"//;s/"$//' || true)"
-  singbox_version="$(installed_singbox_version)"; singbox_version="${singbox_version:-未知}"
+  kernel_version="$(installed_kernel_version)"; kernel_version="${kernel_version:-未知}"
   nfuse_version="$(installed_nfuse_version)"; nfuse_version="${nfuse_version:-未知}"
-  if [[ -x "$SINGBOX_BIN" ]]; then channel="$(current_singbox_channel)"; else channel=未知; fi
-  case "$channel" in
-    preview) channel='测试版';;
-    stable) channel='正式版';;
-  esac
+  # 正式版／测试版通道是 sing-box 独有的概念，mihomo 没有对应物：那里只印版本号，
+  # 不印一个必定「未知」的通道。此前这里写死了 sing-box 的取值入口，mihomo 机器上
+  # 因此每次都印出「sing-box：未知（未知）」，而同一份报告上一行印的是「代理内核：mihomo」。
+  channel=""
+  if [[ "$PROXY_KERNEL" == singbox && -x "$SINGBOX_BIN" ]]; then
+    case "$(current_singbox_channel)" in
+      preview) channel='（测试版）';;
+      stable) channel='（正式版）';;
+      *) channel='（未知通道）';;
+    esac
+  fi
   recorded_version="$(sed -n 's/^SCRIPT_VERSION=//p' "$DEPLOYED_VERSIONS_FILE" 2>/dev/null | head -n1 || true)"
   [[ "$recorded_version" == "$SCRIPT_VERSION" ]] && recorded_version="一致（${SCRIPT_VERSION}）" || recorded_version="不一致（记录 ${recorded_version:-缺失}，当前 ${SCRIPT_VERSION}）"
   if [[ -f /root/sb-user-manager.sh ]]; then
@@ -13520,17 +13525,17 @@ create_diagnostic_report() {
     printf '安装版本记录：%s\n' "$recorded_version"
     printf 'root 启动副本：%s\n' "$launcher_result"
     printf '代理内核：%s\n' "$PROXY_KERNEL"
-    printf 'sing-box：%s（%s）\n' "$singbox_version" "$channel"
+    printf '%s：%s%s\n' "$(kernel_display_name)" "$kernel_version" "$channel"
     printf 'Nfuse：%s\n' "$nfuse_version"
     printf '系统：%s\n' "${os_name:-未知}"
     printf '系统内核：%s｜架构：%s\n' "$(uname -r 2>/dev/null || echo 未知)" "$(uname -m 2>/dev/null || echo 未知)"
     echo
     echo '== 服务与基础检查 =='
-    printf '连接服务（sing-box）：%s\n' "$sing_state"
+    printf '连接服务（%s）：%s\n' "$(kernel_display_name)" "$sing_state"
     printf '流量统计（Nfuse）：%s\n' "$nfuse_state"
     printf '到期自动检查：%s\n' "$expiry_state"
     printf '管理配置：%s\n' "$([[ "$DIAGNOSTIC_CONFIG_READABLE" == true ]] && echo 可读取 || echo 缺失或不可读)"
-    printf 'sing-box 配置：%s\n' "$config_result"
+    printf '%s 配置：%s\n' "$(kernel_display_name)" "$config_result"
     printf 'Nfuse 通信与数据：%s\n' "$nfuse_result"
     printf '用户数据：%s\n' "$state_result"
     printf '未完成操作：%s\n' "$transaction_result"
@@ -14227,7 +14232,7 @@ prompt_add_outbound_preset() {
   prompt_split_upstream_fields "$PRESET_PROTOCOL" '{}' || { MENU_RETURNED=true; return 0; }
   upstream="$PROMPTED_SPLIT_UPSTREAM"
   printf '\n保存预览：\n  名称：%s\n  协议：%s\n  服务器：%s:%s\n' "$PRESET_NAME" "$(outbound_protocol_label "$PRESET_PROTOCOL")" "$(jq -r '.server' <<<"$upstream")" "$(jq -r '.server_port' <<<"$upstream")"
-  echo '说明：保存预置不会修改 sing-box，也不会影响现有分流。'
+  printf '说明：保存预置不会修改 %s，也不会影响现有分流。\n' "$(kernel_display_name)"
   read -r -p '确认检查并保存？[y/N]：' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消保存。'; return 0; }
   cmd_outbound_preset_add "$PRESET_NAME" "$upstream"
@@ -14255,7 +14260,7 @@ EOF
   case "$choice" in 1) protocol="$(jq -r '.protocol' <<<"$current")";; 2) protocol=anytls; current='{}';; 3) protocol=shadowsocks; current='{}';; 4) protocol=ss_shadowtls; current='{}';; 0) MENU_RETURNED=true; return 0;; esac
   prompt_split_upstream_fields "$protocol" "$current" || { MENU_RETURNED=true; return 0; }
   upstream="$PROMPTED_SPLIT_UPSTREAM"
-  if ((active > 0)); then echo '保存后会同步更新所有关联分流，并只重启一次 sing-box。'; else echo '保存后会同步更新关联记录；当前没有启用中的关联分流，不会重启服务。'; fi
+  if ((active > 0)); then printf '保存后会同步更新所有关联分流，并只重启一次 %s。\n' "$(kernel_display_name)"; else echo '保存后会同步更新关联记录；当前没有启用中的关联分流，不会重启服务。'; fi
   read -r -p '确认检查并保存？[y/N]：' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { echo '已取消修改。'; return 0; }
   cmd_outbound_preset_edit "$name" "$upstream"
