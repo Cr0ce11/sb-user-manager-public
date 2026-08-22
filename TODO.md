@@ -127,6 +127,8 @@
 | BUG-006 | P1 | 完成 | [公开 Issue #38](https://github.com/DTB201/sb-user-manager-public/issues/38)、[公开 PR #39](https://github.com/DTB201/sb-user-manager-public/pull/39) | 修复损坏有效期在自动到期检查中被静默放行 | 坏记录明确告警并跳过，其他到期用户继续停用；一致性检查报告“需要处理”，生成物、本地门禁与公开 CI 通过 |
 | BUG-007 | P1 | 完成 | [公开 Issue #40](https://github.com/DTB201/sb-user-manager-public/issues/40)、[公开 PR #41](https://github.com/DTB201/sb-user-manager-public/pull/41) | 建立环境操作与用户操作的双向互斥 | 四个环境入口、启动恢复和脚本接管与用户/分流共用操作锁，两类事务日志双向排斥；全新环境、冲突、失败、回滚、描述符释放、本地门禁与公开 CI 通过 |
 | UX-003 | P2 | 暂缓 | [公开 Issue #16](https://github.com/DTB201/sb-user-manager-public/issues/16) | 增加 Mihomo 格式的用户配置导出 | 项目所有者尚未确认实际必要性；不进入目标版本，待使用场景和维护价值明确后重新评估 |
+| BUG-008 | P2 | 完成 | [公开 Issue #246](https://github.com/Cr0ce11/sb-user-manager-public/issues/246)、[公开 PR #248](https://github.com/Cr0ce11/sb-user-manager-public/pull/248) | 每次环境操作都把 `/var/lib` 与 `/usr/local/sbin` 改成 700 | 恢复记录挪进 `/var/lib/sb-user-manager/`（旧位置留着记录时仍以旧位置为准）；新增 `ensure_manager_directory`，目录已存在时只检查类型、绝不改动权限，锁目录原有的防护收敛成唯一入口；被改坏的机器在部署、修复与更新三条路径上修回 755，只认 700 这个指纹；静态断言禁止把管理器的文件直接摆在 `/var/lib` 正下方，带反面样本与两个对照；单元测试三组各配对照；真机走完整菜单路径验收，两个目录都回到 755 而管理器自己的目录仍是 700 |
+| OPS-010 | — | 完成 | [公开 Issue #247](https://github.com/Cr0ce11/sb-user-manager-public/issues/247) | 两台正式服务器上 apt 装的 sing-box 残包 | 切到 mihomo 并跑过「清理 sing-box 残留」之后，机器上仍留着一整套 apt 装的 sing-box（65 MB，`/usr/bin` 与 `/usr/lib/systemd/system`），而清理清单只认脚本自己那套 `/usr/local` 布局，因此报了假的「已清理」。**结论是不改实现**——dpkg 装的东西必须由 dpkg 卸载，且 sing-box 线已归档不再添新东西；两台已由项目所有者 `apt purge` 卸净、其中一台的软件源与密钥一并清掉，事后「服务与配置检查」均无问题。这一条也让第二步撤除那两个菜单项更有理由 |
 
 ## 当前最值得继续的顺序
 

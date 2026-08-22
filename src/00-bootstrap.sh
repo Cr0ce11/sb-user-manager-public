@@ -40,7 +40,17 @@ TRANSACTION_FORMAT_VERSION=1
 OPERATION_BACKUP_RETENTION="${SB_OPERATION_BACKUP_RETENTION:-10}"
 ENVIRONMENT_BACKUP_RETENTION="${SB_ENVIRONMENT_BACKUP_RETENTION:-5}"
 MIGRATION_REPORT_RETENTION="${SB_MIGRATION_REPORT_RETENTION:-20}"
-ENVIRONMENT_TRANSACTION_JOURNAL="${SB_ENVIRONMENT_TRANSACTION_JOURNAL:-/var/lib/sb-user-manager.recovery.json}"
+# 环境事务的恢复记录。**必须放在管理器自己的目录之内**，不能直接摆在 /var/lib 下：
+# begin_environment_transaction 会创建它的父目录，而 `install -d -m` 点到一个已经
+# 存在的目录时会直接 chmod 它。这个默认值曾经是 /var/lib/sb-user-manager.recovery.json，
+# 取出来的父目录就是 /var/lib 本身，于是每次环境操作都把 /var/lib 改成 700——
+# apt 的下载沙箱与所有以非 root 身份读 /var/lib/<服务名> 的服务都会因此失效
+# （公开 Issue #246）。tests/test-static.sh 有一条断言钉住这个位置。
+ENVIRONMENT_TRANSACTION_JOURNAL="${SB_ENVIRONMENT_TRANSACTION_JOURNAL:-/var/lib/sb-user-manager/recovery.json}"
+# 换位置之前的旧路径。**必须继续认得它**：更新流程在事务中途替换管理脚本，
+# 若恰好在替换之后、清除记录之前中断，下一次运行的就是新脚本、而记录还留在
+# 旧路径上。认不出它，等于把一台半截机器当成干净机器放行。
+LEGACY_ENVIRONMENT_TRANSACTION_JOURNAL="${SB_LEGACY_ENVIRONMENT_TRANSACTION_JOURNAL:-/var/lib/sb-user-manager.recovery.json}"
 ENVIRONMENT_LOCK_FILE="${SB_ENVIRONMENT_LOCK_FILE:-/run/lock/sb-user-manager-environment.lock}"
 MANAGER_HANDOFF_DIRECTORY="${SB_MANAGER_HANDOFF_DIRECTORY:-/var/lib/sb-user-manager/manager-handoff}"
 MANAGER_HANDOFF_JOURNAL="${SB_MANAGER_HANDOFF_JOURNAL:-$MANAGER_HANDOFF_DIRECTORY/active.json}"
@@ -82,6 +92,17 @@ resolve_manager_data_paths() {
   ANYTLS_KEY_FILE="$CERT_DIR/anytls.key"
 }
 resolve_manager_data_paths
+
+# 恢复记录换过位置（公开 Issue #246）。新位置不存在、旧位置却留着一份时，
+# 本次运行整体以旧路径为准——认得它的每一处（开工前的拦截、开机自检的恢复、
+# 诊断报告、清除记录）因此自动一致，不必逐个调用点各判一次。
+# 只在这一处解析：漏掉任何一处的后果都是把一台半截机器当成干净机器放行。
+resolve_environment_transaction_journal() {
+  [[ ! -e "$ENVIRONMENT_TRANSACTION_JOURNAL" && ! -L "$ENVIRONMENT_TRANSACTION_JOURNAL" ]] || return 0
+  [[ -e "$LEGACY_ENVIRONMENT_TRANSACTION_JOURNAL" || -L "$LEGACY_ENVIRONMENT_TRANSACTION_JOURNAL" ]] || return 0
+  ENVIRONMENT_TRANSACTION_JOURNAL="$LEGACY_ENVIRONMENT_TRANSACTION_JOURNAL"
+}
+resolve_environment_transaction_journal
 
 # mihomo 部署下，使用者自己的分流规则文件放在这里。管理器建这个目录、
 # 读里面的文件，但**永远不写它们**——那是使用者从社区抄来的片段。

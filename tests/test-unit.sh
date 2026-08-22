@@ -10470,4 +10470,87 @@ https://example.com/b.json'
   fi
 )
 
+# 公开 Issue #246：环境事务的恢复记录曾经放在 /var/lib 正下方，创建它的父目录
+# 时把 /var/lib 本身改成了 700，apt 的下载沙箱与所有以非 root 身份读
+# /var/lib/<服务名> 的服务随之失效。三件事各验一遍，每件都配对照——只断言
+# 「限制生效」而不证明限制之外的东西仍然正常，分不清是机制起作用还是整个坏掉。
+(
+  expect() { # expect <说明> <期望> <实际>
+    [[ "$2" == "$3" ]] && return 0
+    printf '%s：期望 %s，实际 %s\n' "$1" "$2" "$3" >&2
+    exit 1
+  }
+  work_varlib="$work/varlib-246"
+  mkdir -p "$work_varlib"
+
+  # 一、建目录：已经存在的目录权限一字不动
+  existing="$work_varlib/existing"
+  mkdir -p "$existing"
+  chmod 755 "$existing"
+  ensure_manager_directory "$existing"
+  expect '已存在的目录权限不被改动' 755 "$(manager_file_mode "$existing")"
+  # 对照之一：缺失的目录仍按默认权限建出来，否则上面那条只证明函数什么也没干
+  ensure_manager_directory "$work_varlib/missing"
+  expect '缺失的目录按 700 建出来（对照）' 700 "$(manager_file_mode "$work_varlib/missing")"
+  # 对照之二：指定权限同样生效，锁目录用的就是这条路径
+  ensure_manager_directory "$work_varlib/missing-755" 755
+  expect '缺失的目录按指定权限建出来（对照）' 755 "$(manager_file_mode "$work_varlib/missing-755")"
+  # 对照之三：符号链接必须被拒绝——跟随它会把权限改到别处去
+  ln -s "$existing" "$work_varlib/link"
+  if ensure_manager_directory "$work_varlib/link" 2>/dev/null; then
+    echo '建目录必须拒绝符号链接' >&2
+    exit 1
+  fi
+
+  # 二、恢复记录换了位置，旧位置上的记录仍然要认得
+  new_journal="$work_varlib/new-recovery.json"
+  legacy_journal="$work_varlib/legacy-recovery.json"
+  (
+    ENVIRONMENT_TRANSACTION_JOURNAL="$new_journal"
+    LEGACY_ENVIRONMENT_TRANSACTION_JOURNAL="$legacy_journal"
+    : > "$legacy_journal"
+    resolve_environment_transaction_journal
+    expect '只有旧位置留着记录时以旧位置为准' "$legacy_journal" "$ENVIRONMENT_TRANSACTION_JOURNAL"
+  )
+  # 对照之一：两处都没有记录时，用的是新位置
+  (
+    ENVIRONMENT_TRANSACTION_JOURNAL="$new_journal"
+    LEGACY_ENVIRONMENT_TRANSACTION_JOURNAL="$work_varlib/absent-recovery.json"
+    resolve_environment_transaction_journal
+    expect '两处都没有记录时用新位置（对照）' "$new_journal" "$ENVIRONMENT_TRANSACTION_JOURNAL"
+  )
+  # 对照之二：新位置有记录时不因为旧位置也有而回退过去
+  (
+    ENVIRONMENT_TRANSACTION_JOURNAL="$new_journal"
+    LEGACY_ENVIRONMENT_TRANSACTION_JOURNAL="$legacy_journal"
+    : > "$new_journal"
+    resolve_environment_transaction_journal
+    expect '新位置有记录时不回退到旧位置（对照）' "$new_journal" "$ENVIRONMENT_TRANSACTION_JOURNAL"
+  )
+  rm -f "$new_journal" "$legacy_journal"
+
+  # 三、被旧版本改坏的机器要修回来。两个目录都验：/var/lib 与 /usr/local/sbin
+  varlib_root="$work_varlib/root"
+  mkdir -p "$varlib_root/var/lib" "$varlib_root/usr/local/sbin"
+  chmod 700 "$varlib_root/var/lib" "$varlib_root/usr/local/sbin"
+  ( SB_SYSTEM_ROOT="$varlib_root"; repair_system_directory_modes >/dev/null )
+  expect '被改成 700 的 /var/lib 修回 755' 755 "$(manager_file_mode "$varlib_root/var/lib")"
+  expect '被改成 700 的 /usr/local/sbin 修回 755' 755 \
+    "$(manager_file_mode "$varlib_root/usr/local/sbin")"
+  # 对照之一：管理员自己设的其它权限不许覆盖
+  chmod 750 "$varlib_root/var/lib"
+  ( SB_SYSTEM_ROOT="$varlib_root"; repair_system_directory_modes >/dev/null )
+  expect '不是 700 的权限不被覆盖（对照）' 750 "$(manager_file_mode "$varlib_root/var/lib")"
+  # 对照之二：本来就正常的机器不被动，也不该报错
+  chmod 755 "$varlib_root/var/lib"
+  ( SB_SYSTEM_ROOT="$varlib_root"; repair_system_directory_modes >/dev/null )
+  expect '已经正常的权限保持不变（对照）' 755 "$(manager_file_mode "$varlib_root/var/lib")"
+  # 对照之三：管理器自己的数据目录不在修复清单里，它就该是 700
+  mkdir -p "$varlib_root/var/lib/sb-user-manager"
+  chmod 700 "$varlib_root/var/lib/sb-user-manager"
+  ( SB_SYSTEM_ROOT="$varlib_root"; repair_system_directory_modes >/dev/null )
+  expect '管理器自己的目录不被放宽（对照）' 700 \
+    "$(manager_file_mode "$varlib_root/var/lib/sb-user-manager")"
+)
+
 echo 'unit checks passed'

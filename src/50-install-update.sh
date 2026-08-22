@@ -1576,7 +1576,9 @@ install_manager_shortcut() {
   shortcut="$(system_path /usr/local/bin/sbm)" || return 1
   validate_manager_shortcut_path || return 1
   [[ -L "$shortcut" ]] && return 0
-  install -d -m 755 -- "$(dirname "$shortcut")" || return 1
+  # /usr/local/bin 是系统共享目录：缺失时才建，已经存在就不动它的权限
+  # （同 Issue #246；某些发行版上它带 setgid 与组写位，按 755 覆盖会抹掉）。
+  ensure_manager_directory "$(dirname "$shortcut")" 755 || return 1
   ln -s -- "$target" "$shortcut" || return 1
 }
 
@@ -2208,10 +2210,32 @@ purge_fresh_deploy_paths() {
   rm -rf /var/lib/sb-user-manager
 }
 
+# 旧版本把两个系统共享目录按 700 建了出来（公开 Issue #246）：
+#   /var/lib        —— 恢复记录曾经放在它正下方，创建父目录时连它一起改了；
+#                      后果是 apt 的下载沙箱失效，以非 root 身份读
+#                      /var/lib/<服务名> 的服务也够不到自己的数据。
+#   /usr/local/sbin —— 与管理器自己的四个目录写在同一条 install 里，一起收到 700。
+# 缺陷本身已经修掉，但**被改坏的机器不会自己好**——凡是装过旧版本的机器，
+# 这两个目录到今天都还是 700。这里在部署、修复与更新三条路径上一次性修回来。
+# **只在恰好等于 700 时动手**：那正是本脚本留下的指纹。管理员自己设成别的值
+# 是他的决定，不要覆盖。修不动也不当失败——一次权限修复不该拖垮一次部署。
+repair_system_directory_modes() {
+  local path target mode
+  for path in /var/lib /usr/local/sbin; do
+    target="$(system_path "$path")" || continue
+    [[ -d "$target" && ! -L "$target" ]] || continue
+    mode="$(manager_file_mode "$target")" || continue
+    [[ "$mode" == 700 ]] || continue
+    chmod 755 -- "$target" || continue
+    log "已把 $path 的权限从 700 修回 755（旧版本缺陷，公开 Issue #246）"
+  done
+}
+
 deploy_environment() {
   local fresh="$1" update_manager="${2:-false}" iface work backup path deployed_state_file
   local -a deploy_created=()
   local deploy_created_count=0
+  repair_system_directory_modes
   # 再确认一次内核，使这个函数不依赖调用点是否记得先确定。
   resolve_deployment_kernel || return 1
   if ! acquire_operation_lock; then
@@ -2260,8 +2284,14 @@ deploy_environment() {
   trap rollback_deploy ERR
   set_signal_rollback rollback_deploy
   run_step_or_rollback rollback_deploy download_binaries "$work" || return 1
+  # 这四个都是本项目自己的目录，里面装的是用户资料、证书与流量库，
+  # 因此即使已经存在也要按 700 收紧——那是有意的。
   run_step_or_rollback rollback_deploy install -d -m 700 \
-    "$MANAGER_DATA_DIR" "$MANAGER_DATA_DIR/backups" "$CERT_DIR" /var/lib/nfuse /usr/local/sbin || return 1
+    "$MANAGER_DATA_DIR" "$MANAGER_DATA_DIR/backups" "$CERT_DIR" /var/lib/nfuse || return 1
+  # /usr/local/sbin 不是本项目的目录，是系统共享的。**已经存在就一字不动**：
+  # 旧版本把它跟上面四个一起按 700 建，于是每台装过本脚本的机器上它都变成了
+  # 只有 root 能进（公开 Issue #246）。缺失时按 755 建，那是它该有的样子。
+  run_step_or_rollback rollback_deploy ensure_manager_directory /usr/local/sbin 755 || return 1
   if [[ "$PROXY_KERNEL" == singbox ]]; then
     # sing-box 自己的配置目录。今天与管理器数据目录是同一个，上面那行已经建好，
     # 这里是重复调用、无副作用；分开写是因为两者属于不同的东西——管理器数据
@@ -2709,6 +2739,10 @@ resolve_deployment_kernel() {
 
 install_environment() {
   local choice answer config_path state_path
+  # 一台完好的机器走不到 deploy_environment（下面第一个分支直接返回），
+  # 而它同样可能带着旧版本留下的 700。「修复环境」这个名字应当名副其实，
+  # 所以在这里也修一次（公开 Issue #246）。函数幂等，重复调用无副作用。
+  repair_system_directory_modes
   resolve_deployment_kernel || return 1
   show_environment_diagnostics
   case "$ENVIRONMENT_CLASS" in

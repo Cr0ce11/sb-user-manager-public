@@ -57,7 +57,8 @@ negation_fixture="$(mktemp "${TMPDIR:-/tmp}/sb-negation-fixture.XXXXXX")"
 negation_output="$(mktemp "${TMPDIR:-/tmp}/sb-negation-output.XXXXXX")"
 kernel_adapter_fixture="$(mktemp -d "${TMPDIR:-/tmp}/sb-kernel-adapter.XXXXXX")"
 manager_data_fixture="$(mktemp -d "${TMPDIR:-/tmp}/sb-manager-data.XXXXXX")"
-trap 'rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fixture" "$shell_target_output" "$convention_fixture" "$convention_output" "$negation_fixture" "$negation_output"; rm -rf -- "$kernel_adapter_fixture" "$manager_data_fixture"' EXIT
+state_path_fixture="$(mktemp -d "${TMPDIR:-/tmp}/sb-state-path.XXXXXX")"
+trap 'rm -f -- "$managed_step_fixture" "$managed_step_output" "$shell_target_fixture" "$shell_target_output" "$convention_fixture" "$convention_output" "$negation_fixture" "$negation_output"; rm -rf -- "$kernel_adapter_fixture" "$manager_data_fixture" "$state_path_fixture"' EXIT
 # 读取内核配置必须经 src/05-kernel.sh 的适配层，其它模块不得直接调用内核。
 # 上游在小版本之间修改配置规范时，只应改适配层一处，而不是逐个模块跟进。
 # 说明：tests/ 下的直接调用是有意的，那里测的就是内核自身的行为。
@@ -135,6 +136,39 @@ if [[ -n "$(manager_data_path_literals "$manager_data_fixture")" ]]; then
   exit 1
 fi
 rm -f -- "$manager_data_fixture/91-config.sh"
+
+# 管理器自己的文件不许直接摆在 /var/lib 正下方，必须放进某个子目录里。
+# 保护的不变量是「这些文件的父目录必须是管理器自己建、也只归管理器管的目录」，
+# 不是「当前长这样」。理由是 `install -d -m` 点到一个已经存在的目录时会直接
+# chmod 它：环境事务的恢复记录曾经是 /var/lib/sb-user-manager.recovery.json，
+# 取父目录建出来的正是 /var/lib 本身，于是每次环境操作都把它改成 700，apt 的
+# 下载沙箱与所有以非 root 身份读 /var/lib/<服务名> 的服务随之失效
+# （公开 Issue #246）。
+# 记录旧位置的那个常量是唯一的例外：它存在的目的正是继续认得旧位置。
+var_lib_toplevel_defaults() {
+  grep -rn ':-/var/lib/[^/}"]*}' "$1" | grep -v '^[^:]*:[0-9]*:LEGACY_' || true
+}
+if [[ -n "$(var_lib_toplevel_defaults src)" ]]; then
+  var_lib_toplevel_defaults src >&2
+  echo 'manager files must live in a subdirectory of /var/lib, not directly under it' >&2
+  exit 1
+fi
+# 反面样本：直接摆在 /var/lib 下必须被拒绝，否则这条门禁只是看起来在。
+printf 'X="${SB_X:-/var/lib/sb-user-manager.recovery.json}"\n' > "$state_path_fixture/90-toplevel.sh"
+if [[ -z "$(var_lib_toplevel_defaults "$state_path_fixture")" ]]; then
+  echo 'var lib placement check must reject a file placed directly under /var/lib' >&2
+  exit 1
+fi
+rm -f -- "$state_path_fixture/90-toplevel.sh"
+# 对照：放进子目录的两种写法都不应变红——管理器自己的目录，以及 Nfuse 的目录。
+printf 'X="${SB_X:-/var/lib/sb-user-manager/recovery.json}"\nY="${SB_Y:-/var/lib/nfuse/nfuse.db}"\n' \
+  > "$state_path_fixture/91-subdir.sh"
+if [[ -n "$(var_lib_toplevel_defaults "$state_path_fixture")" ]]; then
+  var_lib_toplevel_defaults "$state_path_fixture" >&2
+  echo 'var lib placement check must not flag paths inside a subdirectory' >&2
+  exit 1
+fi
+rm -f -- "$state_path_fixture/91-subdir.sh"
 
 # 使用者的分流规则目录只能经 MIHOMO_RULES_DIR 取得。它必须与 mihomo 单元里
 # SAFE_PATHS 的第二条一字不差，写死两处之后改一处就是「配置根本加载不了」，
