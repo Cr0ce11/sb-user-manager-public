@@ -291,6 +291,32 @@ load_migration_backups() {
   )
 }
 
+# 不可逆操作之前当场清点服务器外退路（ADR 0032 的「配套要求」）。
+# 这个函数曾随换内核与清理 sing-box 残留一并删除（公开 Issue #256）——它们是它
+# 仅有的两个调用点，留着就是死代码。ADR 0032 的「后续」一节写明：**再添一个
+# 不可逆操作时必须把它写回来，并同时接上调用点**，不能默认它还在。
+# 现在的调用点是搬迁管理器数据目录（公开 Issue #276）——那个动作在校验通过后会
+# 删掉老位置的用户资料、内部备份与证书。该入口是一次性的，撤除时这个函数会再次
+# 变成孤儿，届时连同 tests/test-static.sh 里那条断言一起改回去。
+#
+# 它刻意**不阻止**操作：项目所有者可能有仓库不知道的服务器外副本。
+# 它只保证「没有退路」这件事不会悄悄发生。
+print_offsite_recovery_status() {
+  local newest
+  load_migration_backups
+  if ((${#MIGRATION_BACKUPS[@]} == 0)); then
+    printf '\n注意：本机没有任何加密迁移备份（.sbm）。\n'
+    printf '这个操作成功之后如果反悔，将没有退路：操作前的完整环境快照只在本次操作失败时\n'
+    printf '由脚本自动还原，菜单里没有事后手工恢复它的入口。\n'
+    printf '建议先返回「数据备份与恢复」创建一份，并复制到服务器之外。\n'
+    return 0
+  fi
+  newest="${MIGRATION_BACKUPS[0]}"
+  printf '\n本机现有加密迁移备份（.sbm）%s 份，最新一份是 %s。\n' \
+    "${#MIGRATION_BACKUPS[@]}" "$(basename "$newest")"
+  printf '事后反悔时的退路就是它——请确认它已经复制到服务器之外，并且内容足够新。\n'
+}
+
 print_migration_backups() {
   local i file size integrity
   load_migration_backups
