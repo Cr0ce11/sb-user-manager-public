@@ -12,6 +12,12 @@
 # 内核名无法识别时的统一出口。载入管理配置时已经拒绝过未知内核名，
 # 这里是防止将来有人绕开那条路径后静默走错分支。
 kernel_unknown() {
+  # 哨兵单独说一句：那不是「配置里写错了内核名」，而是「还没确定内核就用了适配层」，
+  # 两者的下一步完全不同（公开 Issue #262）。
+  if [[ "$PROXY_KERNEL" == "$KERNEL_UNRESOLVED" ]]; then
+    printf '内部错误：还没有确定本机的代理内核就调用了内核适配层；请先调用 load_runtime_config 或 resolve_deployment_kernel\n' >&2
+    return 1
+  fi
   printf '内部错误：代理内核名无法识别：%s\n' "${PROXY_KERNEL:-未设置}" >&2
   return 1
 }

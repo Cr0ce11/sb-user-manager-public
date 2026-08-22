@@ -15,9 +15,26 @@ SELF_PATH="$(readlink -f -- "$SELF_SOURCE_PATH")"
 SCRIPT_VERSION="4.25.28"
 SCRIPT_EDITION_LABEL="公开版"
 STATE_SCHEMA_VERSION=7
-# 代理内核的文件级默认值。载入管理配置之前也可能被读到（例如只读查询的早期路径），
-# 因此这里先定义，具体取值与校验仍由 load_runtime_config 负责。
-PROXY_KERNEL="singbox"
+# 「尚未解析」的哨兵，不是一个能用的取值（公开 Issue #262）。
+#
+# 这两个变量必须在文件级有值，否则 `set -u` 会让任何提前读到它们的代码当场结束
+# 进程。但**给它们一个像真的默认值比没有值更危险**：以前这里写的是 sing-box 与
+# /etc/sing-box，于是任何在载入管理配置之前读到它们的代码，都会拿到一个看起来
+# 完全正常、实际可能完全错误的答案——[公开 Issue #251] 就是这么坏的：到期任务在
+# 载入配置之前判断环境完整性，那一刻脚本以为自己是 sing-box 机器，于是在 mihomo
+# 机器上每次都去找一个不存在的配置文件，每 15 分钟静静失败一次，而它是一个不产生
+# 任何界面提示的 oneshot 服务。
+#
+# 现在提前使用会当场报错：适配层的每个分派都以 kernel_unknown 收尾，
+# 管理器数据路径的派生入口 resolve_manager_data_paths 也会拒绝哨兵。
+#
+# **存量机器的兼容兜底没有消失，只是挪了地方**：管理配置里不写这两个键的老机器，
+# 由 load_runtime_config 里那两行 `:=` 给出 singbox 与 /etc/sing-box；管理配置
+# 整个丢失的机器由 resolve_deployment_kernel 显式给出。两条路的结果与本次改动
+# 之前一字不差。
+KERNEL_UNRESOLVED="__unresolved__"
+MANAGER_DATA_DIR_UNRESOLVED="/__sb-user-manager-unresolved__"
+PROXY_KERNEL="$KERNEL_UNRESOLVED"
 # 内核的位置与服务名同理需要文件级默认值：部署流程在管理配置写出之前就要
 # 用适配层写单元文件、校验配置，而 load_runtime_config 在那之前只在子进程里跑过。
 # load_runtime_config 中同名的 := 兜底保留不动，管理配置里的显式取值仍然覆盖这里。
@@ -29,10 +46,13 @@ MIHOMO_CONFIG="/etc/mihomo/config.json"
 MIHOMO_SERVICE="mihomo"
 MIHOMO_WORK_DIR="/var/lib/mihomo"
 # 管理器自身数据的根目录：用户资料、内部备份、AnyTLS 自签证书都在这里。
-# 这些是管理器的数据，不是 sing-box 的；目录名沿用 /etc/sing-box 纯属历史原因。
-# 这里是这三类路径的唯一来源，改这一个值整组跟着变。默认值不变，
-# 长期方向与搬家计划见公开 Issue #172。
-MANAGER_DATA_DIR="/etc/sing-box"
+# 这些是管理器的数据，不是内核的。这里同样是哨兵，理由见上面 PROXY_KERNEL 那一段。
+# **这个变量指着用户数据，读错的代价比内核名更高**：管理配置里没有这一行的存量
+# 机器（`sbm-mihomo` 就是），AnyTLS 证书目录只能由它派生，指错了会被判定为证书
+# 不存在而重新签发，所有 AnyTLS 用户当场连不上；完整环境快照的路径清单里也直接
+# 放着它，指错了快照就不再收录用户数据。长期方向与搬家计划见公开 Issue #172。
+LEGACY_MANAGER_DATA_DIR="/etc/sing-box"
+MANAGER_DATA_DIR="$MANAGER_DATA_DIR_UNRESOLVED"
 MIN_SUPPORTED_STATE_SCHEMA_VERSION=0
 MIGRATION_FORMAT_VERSION=1
 MIGRATION_BUNDLE_VERSION=1
@@ -84,12 +104,26 @@ GEOIP_URL=""
 # 需要文件级取值的原因与 SINGBOX_BIN 那一组相同——部署流程在管理配置写出之前
 # 就要用到证书目录（mihomo 单元里的 SAFE_PATHS），而那时 load_runtime_config
 # 只在子进程里跑过。
+#
+# **哨兵到这里必须停住**（公开 Issue #262）：这三条路径指着 AnyTLS 的证书与私钥，
+# 用哨兵派生出来的目录一定不存在，上层会把它当成「证书还没生成」而重新签发一张
+# ——所有 AnyTLS 用户当场连不上，而过程中没有任何一步会报错。宁可响亮地停下。
 resolve_manager_data_paths() {
+  if [[ "$MANAGER_DATA_DIR" == "$MANAGER_DATA_DIR_UNRESOLVED" ]]; then
+    printf '内部错误：还没有确定管理器数据目录就去派生它下面的路径；请先调用 load_runtime_config 或 resolve_deployment_kernel\n' >&2
+    return 1
+  fi
   CERT_DIR="$MANAGER_DATA_DIR/cert"
   ANYTLS_CERT_FILE="$CERT_DIR/anytls.crt"
   ANYTLS_KEY_FILE="$CERT_DIR/anytls.key"
 }
-resolve_manager_data_paths
+# 文件级只把三个变量摆成同样「尚未解析」的样子，好让 `set -u` 有值可读，
+# **不经过上面那个函数**——源文件被 source 的这一刻本来就还没解析，
+# 在这里调用它等于让守卫对着自己报错。真正的取值由 load_runtime_config 或
+# resolve_deployment_kernel 给出。派生写法仍然只有函数里那一份。
+CERT_DIR="$MANAGER_DATA_DIR_UNRESOLVED/cert"
+ANYTLS_CERT_FILE="$CERT_DIR/anytls.crt"
+ANYTLS_KEY_FILE="$CERT_DIR/anytls.key"
 
 # 恢复记录换过位置（公开 Issue #246）。新位置不存在、旧位置却留着一份时，
 # 本次运行整体以旧路径为准——认得它的每一处（开工前的拦截、开机自检的恢复、
@@ -204,6 +238,13 @@ load_runtime_config() {
   # 否则「已经改回默认源」的机器会继续按上一次的自定义地址算（公开 Issue #219）。
   GEOSITE_URL=""
   GEOIP_URL=""
+  # 内核与管理器数据目录同理，而且理由更硬：它们的文件级取值是「尚未解析」哨兵
+  # （公开 Issue #262），清空之后下面那两行 `:=` 才是存量机器的兜底判据——
+  # 管理配置里不写这两个键的老机器全靠它们。不清空的话，哨兵是非空值，`:=` 永远
+  # 不会生效，老机器会拿到哨兵；而如果同一个进程先载入过另一份配置，还会沿用上
+  # 一份的取值，回滚到旧配置的机器就会按新配置的目录去找用户资料。
+  PROXY_KERNEL=""
+  MANAGER_DATA_DIR=""
   unset GITHUB_TOKEN SB_GITHUB_TOKEN
   # 配置按白名单解析，不能作为 root shell 代码执行。
   parse_runtime_config
@@ -233,8 +274,9 @@ load_runtime_config() {
   : "${NFUSE_SOCKET:=/run/nfuse.sock}"
   : "${NFUSE_DB:=/var/lib/nfuse/nfuse.db}"
   # 管理器数据目录。既有部署与 sing-box 新装机器的管理配置里不写这一项，
-  # 取默认值后与历史版本一字不差；显式写了就以配置为准。
-  : "${MANAGER_DATA_DIR:=/etc/sing-box}"
+  # 取这里的兜底值后与历史版本一字不差；显式写了就以配置为准。
+  # 这一行是存量机器唯一的判据，不能删（公开 Issue #262）。
+  : "${MANAGER_DATA_DIR:=$LEGACY_MANAGER_DATA_DIR}"
   # 相对路径会让用户资料、内部备份与证书落到脚本当时的工作目录里，
   # 而这三样东西丢了就是丢了。宁可拒绝启动，不将就。
   [[ "$MANAGER_DATA_DIR" == /* ]] ||
