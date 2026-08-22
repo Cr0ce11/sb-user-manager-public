@@ -65,6 +65,7 @@
 | `sbm-deb13` | **4.25.24** | mihomo | `/etc/sb-user-manager` | 0／0 | 2f 全新安装出来的机器；上一轮没升 |
 | `sbm-mihomo` | **4.25.25** | mihomo | `/etc/sing-box` | 0／0 | 2f 之前装的，目录仍是老名字 |
 | `sbm-gate` | 未部署 | — | — | — | 只跑本地门禁 |
+| `sbm-upgrade` | **4.25.26** | sing-box | `/etc/sing-box` | 2／1 | **2026-08-22 新建**，OPS-007 的跨版直升演练机；从 v4.25.16 全新装出来再一步升到 v4.25.26。是目前唯一一台**带分流**的 sing-box 机器（分流用真实公网规则集 `geosite-openai.srs`），可作换内核演练与 sing-box 回归的对照。不再需要时可以直接 `orb delete sbm-upgrade` |
 
 `sbm-deb12` 与 `sbm-deb12b` 的管理配置里**没有** `PROXY_KERNEL` 这一行——它们是内核声明
 之前装的存量机器，内核由 `singbox_deployment_present` 判出来。这不是缺陷。
