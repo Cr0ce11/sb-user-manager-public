@@ -563,8 +563,12 @@ preview_channel_program='
     next
   }
   current != "" {
+    # 注释里提到这两个名字不算数：护栏要看的是真的调用了，不是有人写了一句
+    # 「这里判断过通道」。反面样本删掉那一行调用之后，函数里仍然留着一句
+    # 提到该函数名的注释——不跳过注释的话，那条反面样本会被它糊弄过去。
+    if ($0 ~ /^[[:space:]]*#/) next
     if ($0 ~ /deploy_environment[[:space:]]+false([[:space:]]|$)/) preserving=1
-    if ($0 ~ /current_singbox_channel/) channel=1
+    if ($0 ~ /singbox_preview_deployed/) channel=1
   }
   END {exit failed ? 1 : 0}
 '
@@ -573,7 +577,7 @@ if ! awk "$preview_channel_program" sb-user-manager.sh; then
   exit 1
 fi
 sed '/^check_updates() {$/,/^}$/ {
-  /current_channel="$(current_singbox_channel)"/ d
+  /if singbox_preview_deployed; then/ d
 }' sb-user-manager.sh > "$convention_fixture"
 if awk "$preview_channel_program" "$convention_fixture" 2>/dev/null; then
   echo 'preview-channel check must reject a repair flow that ignores the current channel' >&2
@@ -791,15 +795,7 @@ if grep -Eq 'tests/test-(controller|landing|manager-role-detection)|SB_LANDING|o
   echo 'retired v5 tests or elevated container capabilities remain in CI' >&2
   exit 1
 fi
-grep -Fq 'fetch_singbox_channel_releases()' sb-user-manager.sh
-grep -Fq 'singbox_release_metadata()' sb-user-manager.sh
-grep -Fq 'check_singbox_release_compatibility()' sb-user-manager.sh
 grep -Fq 'check_rule_set_with_binary()' sb-user-manager.sh
-grep -Fq 'prepare_singbox_release_binary()' sb-user-manager.sh
-grep -Fq 'perform_singbox_channel_switch()' sb-user-manager.sh
-grep -Fq 'write_singbox_channel_state()' sb-user-manager.sh
-grep -Fq 'update_current_singbox_channel()' sb-user-manager.sh
-grep -Fq 'singbox_channel_menu()' sb-user-manager.sh
 grep -Fq 'system_management_menu()' sb-user-manager.sh
 grep -Fq 'deployment_management_menu()' sb-user-manager.sh
 grep -Fq "deploy '部署与卸载'" sb-user-manager.sh
@@ -811,7 +807,6 @@ grep -Fq 'ensure_safe_ssh_for_complete_uninstall()' sb-user-manager.sh
 grep -Fq 'cleanup_internal_material_after_uninstall()' sb-user-manager.sh
 grep -Fq '完整卸载需要停止 %s，继续会立即中断当前连接' sb-user-manager.sh
 grep -Fq '加密迁移备份已保留在' sb-user-manager.sh
-grep -Fq "channel 'sing-box 版本管理'" sb-user-manager.sh
 grep -Fq 'audit_consistency()' sb-user-manager.sh
 grep -Fq 'is_public_ipv4()' sb-user-manager.sh
 grep -Fq 'https://api.ipify.org' sb-user-manager.sh
@@ -941,19 +936,19 @@ grep -Fq 'complete_environment_change()' sb-user-manager.sh
 # 这几个助手必须被复用而不是各写一份。调用点数量钉死，多出来一处通常意味着
 # 有人又抄了一遍实现；改动调用点时同步改这里的期望值，并想清楚新增的那一处
 # 为什么必须存在。
-# 这些数字在 2f 撤除「接管既有 sing-box 安装」之后整体降了一档：那条流程曾经是
-# 其中每一个的第二个调用点（公开 Issue #157）。
-# default_network_interface 的四处：全新部署、服务单元漂移的检查与修复（公开
-# Issue #190），以及换内核（公开 Issue #203）——后三处必须现场识别接口，不能读旧
-# 单元里的那个，那正是可能不对的东西。
-# activate_managed_services 的三处：部署、重写单元之后的重新激活（不 daemon-reload
-# 就等于「修了但没生效」），以及换内核之后启用新内核的服务。
-# restore_failed_environment_change 与 complete_environment_change 的四处：部署、
-# 卸载、换内核、清理 sing-box 残留——四条都是改环境的动作，必须走同一套事务与回滚。
-# 后面三个降到 1 之后这条断言只剩「别再抄一份实现」这一层意思，仍然值得留着。
-for shared_helper in default_network_interface:4 ensure_anytls_certificate:1 install_manager_binary:1 \
-  write_deployed_versions:1 activate_managed_services:3 restore_failed_environment_change:4 \
-  complete_environment_change:4; do
+# 这些数字在 2f 撤除「接管既有 sing-box 安装」之后整体降了一档（公开 Issue #157），
+# 又在 sing-box 线归档撤除换内核与清理残留之后再降一档（公开 Issue #256）。
+# default_network_interface 的三处：全新部署、服务单元漂移的检查与修复（公开
+# Issue #190）——后两处必须现场识别接口，不能读旧单元里的那个，那正是可能不对的
+# 东西。第四处曾经是换内核。
+# activate_managed_services 的两处：部署，以及重写单元之后的重新激活（不
+# daemon-reload 就等于「修了但没生效」）。第三处曾经是换内核之后启用新内核的服务。
+# restore_failed_environment_change 与 complete_environment_change 现在各剩部署
+# 这一处；卸载走的是自己那套。这几个降到 1 之后断言只剩「别再抄一份实现」这一层
+# 意思，仍然值得留着。
+for shared_helper in default_network_interface:3 ensure_anytls_certificate:1 install_manager_binary:1 \
+  write_deployed_versions:1 activate_managed_services:2 restore_failed_environment_change:1 \
+  complete_environment_change:1; do
   expected_calls="${shared_helper##*:}"
   shared_helper="${shared_helper%%:*}"
   shared_helper_calls="$(awk -v helper="$shared_helper" 'index($0, helper) && !index($0, helper "()") {count++} END {print count+0}' sb-user-manager.sh)"
@@ -972,9 +967,10 @@ grep -Fq 'run_managed_step()' sb-user-manager.sh
 grep -Fq 'begin_environment_transaction()' sb-user-manager.sh
 grep -Fq 'recover_environment_transaction()' sb-user-manager.sh
 grep -Fq 'acquire_operation_lock()' sb-user-manager.sh
-# 取锁的五处：部署、卸载、迁移恢复，加上换内核与清理 sing-box 残留（公开 Issue
-# #203）——都是改环境的动作，不取锁就会与别的写入撞车。接管既有安装曾经是第六处。
-[[ "$(grep -Fc 'if ! acquire_operation_lock; then' sb-user-manager.sh)" == 5 ]]
+# 取锁的三处：部署、卸载、迁移恢复——都是改环境的动作，不取锁就会与别的写入撞车。
+# 接管既有安装曾经是第四处（公开 Issue #157 的 2f 撤除），换内核与清理 sing-box
+# 残留曾经是第五、第六处（公开 Issue #256 撤除）。
+[[ "$(grep -Fc 'if ! acquire_operation_lock; then' sb-user-manager.sh)" == 3 ]]
 for serialized_recovery in recover_environment_transaction acquire_manager_handoff_lock; do
   if ! awk -v function_name="$serialized_recovery" '
       $0 == function_name "() {" {inside=1}
@@ -1033,15 +1029,33 @@ if ((managed_step_count < 50)); then
 fi
 # 改环境的三条流程都必须把会失败的步骤显式包进事务：部署、换内核、清理 sing-box
 # 残留。接管既有安装曾经是第四条，2f 之后已整段删掉（公开 Issue #157）。
+# 换内核与清理残留两条流程已随 sing-box 线归档撤除（公开 Issue #256），
+# 它们各自的步骤计数一并去掉；「这两条流程不得复活」由上面的 rollback_switch／
+# rollback_cleanup 断言看守。部署这一条仍在。
 deploy_step_count="$(grep -Ec '^[[:space:]]+run_step_or_rollback rollback_deploy ' sb-user-manager.sh || true)"
-switch_step_count="$(grep -Ec '^[[:space:]]+run_step_or_rollback rollback_switch ' sb-user-manager.sh || true)"
-cleanup_step_count="$(grep -Ec '^[[:space:]]+run_step_or_rollback rollback_cleanup ' sb-user-manager.sh || true)"
-if ((deploy_step_count < 10 || switch_step_count < 10 || cleanup_step_count < 2)); then
-  echo "environment flows must explicitly wrap failure-prone steps: deploy=$deploy_step_count switch=$switch_step_count cleanup=$cleanup_step_count" >&2
+if ((deploy_step_count < 10)); then
+  echo "environment flows must explicitly wrap failure-prone steps: deploy=$deploy_step_count" >&2
   exit 1
 fi
 if grep -Fq 'rollback_takeover' sb-user-manager.sh; then
   echo 'takeover flow should be gone; no rollback_takeover steps must remain' >&2
+  exit 1
+fi
+# sing-box 线归档时撤除的三段实现（公开 Issue #256）：正式版／测试版通道管理、
+# 换内核到 mihomo、清理 sing-box 残留。**整段删除而不是把入口藏起来**——留着一段
+# 谁都调不到的部署代码，迟早有人以为它还能用（同 2f 撤除接管流程时的处理）。
+# 这里钉住的不变量是「入口和实现一起没了」，因此连回滚标签一并看，光删菜单项
+# 不算数。
+if grep -Fq 'rollback_switch' sb-user-manager.sh; then
+  echo 'kernel switch flow should be gone; no rollback_switch steps must remain' >&2
+  exit 1
+fi
+if grep -Fq 'rollback_cleanup' sb-user-manager.sh; then
+  echo 'leftover cleanup flow should be gone; no rollback_cleanup steps must remain' >&2
+  exit 1
+fi
+if grep -Fq 'rollback_channel_switch' sb-user-manager.sh; then
+  echo 'sing-box channel switch should be gone; no rollback_channel_switch steps must remain' >&2
   exit 1
 fi
 if grep -Fq 'repair_consistency_step' sb-user-manager.sh; then
@@ -1073,24 +1087,24 @@ grep -Fq "trap 'handle_runtime_signal INT 130' INT" sb-user-manager.sh
 grep -Fq "trap 'handle_runtime_signal TERM 143' TERM" sb-user-manager.sh
 signal_rollback_count="$(grep -Ec '^[[:space:]]+set_signal_rollback rollback_' sb-user-manager.sh || true)"
 clear_rollback_count="$(grep -Ec '^[[:space:]]+clear_signal_rollback$' sb-user-manager.sh || true)"
-# 八处登记：部署、卸载、迁移恢复、用户与分流的写入路径，加上换内核与清理
-# sing-box 残留（公开 Issue #203）。接管既有安装曾经是第九处。收到 INT/TERM 时
-# 没登记回滚的那条路，会把机器停在改了一半的状态上。
-if [[ "$signal_rollback_count" != 8 ]]; then
-  echo "expected 8 signal rollback registrations, found $signal_rollback_count" >&2
+# 五处登记：部署、卸载、迁移恢复、用户与分流的写入路径。接管既有安装曾经是第六处
+# （公开 Issue #157 的 2f 撤除），换内核与清理 sing-box 残留曾经是另外两处
+# （公开 Issue #256 撤除）。收到 INT/TERM 时没登记回滚的那条路，会把机器停在
+# 改了一半的状态上。
+if [[ "$signal_rollback_count" != 5 ]]; then
+  echo "expected 5 signal rollback registrations, found $signal_rollback_count" >&2
   exit 1
 fi
-if [[ "$clear_rollback_count" != 13 ]]; then
-  echo "expected 13 signal rollback clears, found $clear_rollback_count" >&2
+if [[ "$clear_rollback_count" != 10 ]]; then
+  echo "expected 10 signal rollback clears, found $clear_rollback_count" >&2
   exit 1
 fi
 grep -Fq 'set_signal_rollback rollback_manager_handoff' sb-user-manager.sh
-# 换内核与清理 sing-box 残留这两处确认提示，必须当场清点服务器外的退路。
-# 操作前的完整环境快照只服务于自动回滚，菜单里没有手工恢复的入口（ADR 0032），
-# 因此这两处的退路只能是 .sbm 加密迁移备份。一处定义加两处调用。
-offsite_notice_count="$(grep -Fc 'print_offsite_recovery_status' sb-user-manager.sh || true)"
-if [[ "$offsite_notice_count" != 3 ]]; then
-  echo "expected 1 definition and 2 call sites of print_offsite_recovery_status, found $offsite_notice_count" >&2
+# print_offsite_recovery_status 随它仅有的两个调用点（换内核、清理 sing-box 残留）
+# 一并删除（公开 Issue #256）。ADR 0032 的配套要求本身没有作废——它现在由「完整
+# 卸载」自己那套更重的备份流程承担；再添一个不可逆操作时必须重新落实这条。
+if grep -Fq 'print_offsite_recovery_status' sb-user-manager.sh; then
+  echo 'offsite recovery notice lost its only call sites; it must not linger as dead code' >&2
   exit 1
 fi
 # 这两句旧文案承诺了一条并不存在的路，不得复活。

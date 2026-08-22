@@ -75,8 +75,9 @@ GitHub 分支保护要求 `validate`、`jq16-compat` 和 `debian-standalone-e2e`
 - 用户在提示里输入的十进制数字先用 `$((10#$value))` 归一再参与运算，
   否则 `08` 会被当成八进制。
 - 需要已部署环境的交互入口先调用 `ensure_management_environment_ready` 护栏。
-- 保留现有部署的流程（`deploy_environment false`）必须先判断 sing-box 通道，
-  不得把测试通道静默替换成正式版。
+- 保留现有部署的流程（`deploy_environment false`）必须先调用
+  `singbox_preview_deployed`，不得把一台装着 sing-box 测试版的存量机器静默换成
+  正式版。通道的管理入口已随 sing-box 线归档撤除，这条判据留了下来。
 - 测试断言不得写成独立成句的 `! cmd`。Bash 手册规定命令返回值被 `!` 取反时
   `set -e` 不会因它失败而退出，这类断言命中缺陷也不会让测试变红。改用
   `if cmd; then echo '说明为什么这是错的' >&2; exit 1; fi`。条件上下文中的 `!`

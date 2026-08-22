@@ -1509,13 +1509,12 @@ create_diagnostic_report() {
   # 正式版／测试版通道是 sing-box 独有的概念，mihomo 没有对应物：那里只印版本号，
   # 不印一个必定「未知」的通道。此前这里写死了 sing-box 的取值入口，mihomo 机器上
   # 因此每次都印出「sing-box：未知（未知）」，而同一份报告上一行印的是「代理内核：mihomo」。
+  # 通道的管理入口已随 sing-box 线归档撤除（公开 Issue #256），判据直接看版本号：
+  # sing-box 的测试版版本号带 `-`（如 1.14.0-alpha.44）。报告里仍然印出来，是因为
+  # 存量机器上确实可能装着一个测试版，排查时这一行有用。
   channel=""
   if [[ "$PROXY_KERNEL" == singbox && -x "$SINGBOX_BIN" ]]; then
-    case "$(current_singbox_channel)" in
-      preview) channel='（测试版）';;
-      stable) channel='（正式版）';;
-      *) channel='（未知通道）';;
-    esac
+    if [[ "$(installed_singbox_version)" == *-* ]]; then channel='（测试版）'; else channel='（正式版）'; fi
   fi
   recorded_version="$(sed -n 's/^SCRIPT_VERSION=//p' "$DEPLOYED_VERSIONS_FILE" 2>/dev/null | head -n1 || true)"
   [[ "$recorded_version" == "$SCRIPT_VERSION" ]] && recorded_version="一致（${SCRIPT_VERSION}）" || recorded_version="不一致（记录 ${recorded_version:-缺失}，当前 ${SCRIPT_VERSION}）"

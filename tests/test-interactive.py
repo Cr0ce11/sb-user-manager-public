@@ -60,16 +60,6 @@ uninstall_environment() {
   MENU_RETURNED=true
 }
 
-switch_kernel_to_mihomo() {
-  acquire_test_lock
-  echo 'mock switch kernel'
-}
-
-cleanup_singbox_leftovers() {
-  acquire_test_lock
-  echo 'mock cleanup singbox'
-}
-
 check_updates() {
   acquire_test_lock
   echo 'mock update check'
@@ -171,11 +161,6 @@ cleanup_diagnostic_reports() {
 import_migration_backup() {
   acquire_test_lock
   echo 'mock migration import'
-}
-
-singbox_channel_menu() {
-  acquire_test_lock
-  echo 'mock sing-box channel menu'
 }
 
 interactive_main
@@ -290,21 +275,10 @@ def main() -> None:
             send("\n")
             expect("部署与卸载")
             expect_choice_prompt()
-            # 换内核与清理 sing-box 残留是「部署与卸载」下新增的两项
-            # （公开 Issue #203）；它们插在卸载前面，卸载的编号因此变成 4。
+            # 换内核与清理 sing-box 残留两项已随 sing-box 线归档撤除
+            # （公开 Issue #256），「部署与卸载」下只剩安装／修复与完整卸载，
+            # 卸载的编号因此回到 2。
             send("2\n")
-            expect("mock switch kernel")
-            expect("按回车返回菜单…")
-            send("\n")
-            expect("部署与卸载")
-            expect_choice_prompt()
-            send("3\n")
-            expect("mock cleanup singbox")
-            expect("按回车返回菜单…")
-            send("\n")
-            expect("部署与卸载")
-            expect_choice_prompt()
-            send("4\n")
             expect("mock uninstall return")
             expect("部署与卸载")
             expect_choice_prompt()
@@ -457,10 +431,6 @@ def main() -> None:
             expect("默认连接域名（SNI）")
             expect_choice_prompt()
             send("0\n")
-            expect("系统管理")
-            expect_choice_prompt()
-            send("7\n")
-            expect("mock sing-box channel menu")
             expect("系统管理")
             expect_choice_prompt()
             send("0\n")

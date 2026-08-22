@@ -2239,9 +2239,11 @@ grep -Fq '另一个管理操作正在进行，请等待完成后再试' "$work/u
     LATEST_NFUSE_VERSION=0.1.11
     LATEST_MANAGER_VERSION="$SCRIPT_VERSION"
   }
-  fetch_singbox_channel_releases() { LATEST_PREVIEW_SINGBOX_VERSION=1.14.0-alpha.44; }
-  current_singbox_channel() { printf preview; }
+  # 装着测试版的存量 sing-box 机器。判据只看版本号带不带 `-`（公开 Issue #256），
+  # 不再有通道状态文件，因此两个取版本的入口必须给出同一个值——真机上它们读的
+  # 就是同一个二进制。
   installed_singbox_version() { printf '1.14.0-alpha.44\n'; }
+  installed_kernel_version() { printf '1.14.0-alpha.44\n'; }
   installed_nfuse_version() { printf '0.1.11\n'; }
   installed_manager_version() { printf '9.0.0\n'; }
   deploy_environment() { echo 'preview channel must not use stable deployment' >&2; return 1; }
@@ -2251,175 +2253,46 @@ grep -Fq '另一个管理操作正在进行，请等待完成后再试' "$work/u
     exit 1
   fi
 ) > "$work/preview-update-guard"
-grep -Fq '测试通道请在「sing-box 版本管理 → 更新当前通道」中更新' "$work/preview-update-guard"
+grep -Fq '本机装的是 sing-box 测试版' "$work/preview-update-guard"
+grep -Fq '不跟踪（测试版）' "$work/preview-update-guard"
 grep -Fq '其余组件已经是最新版本' "$work/preview-update-guard"
-
-release_fixture() {
-  local version="$1" prerelease="$2" digest="${3:-$(printf 'a%.0s' {1..64})}"
-  jq -cn --arg version "$version" --argjson prerelease "$prerelease" --arg digest "sha256:$digest" \
-    '{tag_name:("v"+$version),draft:false,prerelease:$prerelease,published_at:"2026-07-15T00:00:00Z",
-      assets:[{name:("sing-box-"+$version+"-linux-amd64.tar.gz"),browser_download_url:("https://example.com/sing-box-"+$version+"-linux-amd64.tar.gz"),digest:$digest}]}'
-}
-
-stable_release="$(release_fixture 1.13.14 false)"
-preview_release="$(release_fixture 1.14.0-alpha.44 true "$(printf 'b%.0s' {1..64})")"
-stable_metadata="$(singbox_release_metadata "$stable_release")"
-jq -e '.version == "1.13.14" and .asset == "sing-box-1.13.14-linux-amd64.tar.gz" and (.sha256 | length) == 64' <<<"$stable_metadata" >/dev/null
-[[ "$(singbox_channel_label 1.13.14)" == 正式版 ]]
-[[ "$(singbox_channel_label 1.14.0-alpha.44)" == 测试版 ]]
-if singbox_release_metadata "$(release_fixture 1.13.14 false invalid)" >/dev/null 2>&1; then
-  echo 'sing-box release without a trusted digest should be rejected' >&2
+# 反面：更新表里不得出现正式版号——出现就说明测试版被当成「可以升到 1.13.14」。
+if grep -Fq '1.13.14' "$work/preview-update-guard"; then
+  echo 'preview machine must not be offered the stable sing-box version' >&2
   exit 1
 fi
 
+# 对照：同样是 sing-box 机器，装的是正式版（版本号不带 `-`）。这一条证明上面那个
+# 判据不是恒真——正式版机器照常被告知有新版可升，也没有那句测试版提示。
 (
-  github_api_get() {
-    if [[ "$1" == */releases/latest ]]; then printf '%s\n' "$stable_release"
-    else jq -cn --argjson stable "$stable_release" --argjson preview "$preview_release" '[$stable,$preview]'
-    fi
-  }
-  fetch_singbox_channel_releases
-  [[ "$LATEST_STABLE_SINGBOX_VERSION" == 1.13.14 ]]
-  [[ "$LATEST_PREVIEW_SINGBOX_VERSION" == 1.14.0-alpha.44 ]]
-  [[ "$LATEST_PREVIEW_SINGBOX_SHA256" == "$(printf 'b%.0s' {1..64})" ]]
-)
-
-channel_config="$work/channel-config.json"
-channel_state="$work/channel-state.json"
-printf '%s\n' '{"route":{"rule_set":[{"type":"remote","url":"https://example.com/active.srs"},{"type":"remote","url":"https://example.com/shared.json"}]}}' > "$channel_config"
-printf '%s\n' '{"splits":[{"url":"https://example.com/shared.json"},{"url":"https://example.com/disabled.srs","status":"disabled"}]}' > "$channel_state"
-SINGBOX_CONFIG="$channel_config" STATE_FILE="$channel_state" list_singbox_rule_set_urls > "$work/channel-rule-urls"
-[[ "$(wc -l < "$work/channel-rule-urls" | tr -d ' ')" == 3 ]]
-grep -Fxq 'https://example.com/disabled.srs' "$work/channel-rule-urls"
-
-channel_target_bin="$work/channel-target-bin"
-channel_stable_bin="$work/channel-stable-bin"
-cat > "$channel_target_bin" <<'EOF'
-#!/usr/bin/env bash
-case "$1" in
-  check) exit 0;;
-  format) cat "$3";;
-  *) exit 1;;
-esac
-EOF
-cat > "$channel_stable_bin" <<'EOF'
-#!/usr/bin/env bash
-case "$1" in
-  check) echo 'field removed in stable' >&2; exit 1;;
-  *) exit 1;;
-esac
-EOF
-chmod +x "$channel_target_bin" "$channel_stable_bin"
-roundtrip_config="$work/roundtrip-config.json"
-empty_channel_state="$work/empty-channel-state.json"
-printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rule_set":[]}}' > "$roundtrip_config"
-printf '%s\n' '{"splits":[]}' > "$empty_channel_state"
-if ! (
   environment_is_deployed() { return 0; }
-  load_runtime_config() { SINGBOX_CONFIG="$roundtrip_config"; STATE_FILE="$empty_channel_state"; }
-  need_cmd() { :; }
-  # 通道兼容性检查按定义只对 sing-box 机器有意义；给一个存在的管理配置，
-  # 让内核解析走「以管理配置为准」那一支（从 2f 起没有配置就按 mihomo 算）。
-  CONF_FILE="$work/channel-roundtrip.conf"
+  load_runtime_config() { :; }
+  CONF_FILE="$work/deployed-singbox-stable-${RANDOM}.conf"
   : > "$CONF_FILE"
   PROXY_KERNEL=singbox
-  fetch_singbox_channel_releases() {
-    LATEST_STABLE_SINGBOX_VERSION=1.13.14
-    LATEST_STABLE_SINGBOX_ASSET=stable.tar.gz
-    LATEST_STABLE_SINGBOX_URL=https://example.com/stable.tar.gz
-    LATEST_STABLE_SINGBOX_SHA256="$(printf 'a%.0s' {1..64})"
-    LATEST_PREVIEW_SINGBOX_VERSION=1.14.0-alpha.44
-    LATEST_PREVIEW_SINGBOX_ASSET=preview.tar.gz
-    LATEST_PREVIEW_SINGBOX_URL=https://example.com/preview.tar.gz
-    LATEST_PREVIEW_SINGBOX_SHA256="$(printf 'b%.0s' {1..64})"
+  need_cmd() { :; }
+  LOCK_FILE="$work/stable-update-control.lock"
+  flock() { return 0; }
+  fetch_latest_releases() {
+    LATEST_KERNEL_VERSION=1.13.14
+    LATEST_KERNEL_URL=https://example.com/stable.tar.gz
+    LATEST_KERNEL_SHA256="$(printf 'a%.0s' {1..64})"
+    LATEST_NFUSE_VERSION=0.1.11
+    LATEST_MANAGER_VERSION="$SCRIPT_VERSION"
   }
-  prepare_singbox_release_binary() {
-    if [[ "$6" == target ]]; then PREPARED_SINGBOX_BINARY="$channel_target_bin"
-    else PREPARED_SINGBOX_BINARY="$channel_stable_bin"
-    fi
-  }
-  check_singbox_release_compatibility preview
-) > "$work/channel-roundtrip-check" 2>&1; then
-  cat "$work/channel-roundtrip-check" >&2
-  echo 'preview round-trip compatibility check should return to the menu cleanly' >&2
+  installed_singbox_version() { printf '1.13.0\n'; }
+  installed_kernel_version() { printf '1.13.0\n'; }
+  installed_nfuse_version() { printf '0.1.11\n'; }
+  installed_manager_version() { printf '9.0.0\n'; }
+  deploy_environment() { echo 'control must not deploy; the answer was no' >&2; return 1; }
+  printf 'n\n' | check_updates
+) > "$work/stable-update-control"
+grep -Fq '1.13.14' "$work/stable-update-control"
+grep -Fq '已取消更新' "$work/stable-update-control"
+if grep -Fq '本机装的是 sing-box 测试版' "$work/stable-update-control"; then
+  echo 'stable machine must not get the preview notice' >&2
   exit 1
 fi
-grep -Fq '测试版可以读取当前配置，但不满足安全往返要求' "$work/channel-roundtrip-check"
-grep -Fq '最新正式版无法读取' "$work/channel-roundtrip-check"
-grep -Fq '当前版本没有改变' "$work/channel-roundtrip-check"
-
-channel_switch_root="$work/channel-switch"
-mkdir -p "$channel_switch_root/bin" "$channel_switch_root/state"
-channel_installed_bin="$channel_switch_root/bin/sing-box"
-channel_candidate_bin="$channel_switch_root/bin/candidate"
-cat > "$channel_installed_bin" <<'EOF'
-#!/usr/bin/env bash
-if [[ "$1" == version ]]; then echo 'sing-box version 1.13.14'; else exit 0; fi
-EOF
-cat > "$channel_candidate_bin" <<'EOF'
-#!/usr/bin/env bash
-if [[ "$1" == version ]]; then echo 'sing-box version 1.14.0-alpha.44'; else exit 0; fi
-EOF
-chmod +x "$channel_installed_bin" "$channel_candidate_bin"
-printf '%s\n' '{"inbounds":[],"outbounds":[]}' > "$channel_switch_root/config.json"
-printf '%s\n' 'SCRIPT_VERSION=4.12.0' 'SINGBOX_VERSION=1.13.14' 'NFUSE_VERSION=0.1.11' > "$channel_switch_root/versions"
-(
-  SINGBOX_BIN="$channel_installed_bin"
-  SINGBOX_CONFIG="$channel_switch_root/config.json"
-  SINGBOX_CHANNEL_STATE="$channel_switch_root/state/channel.json"
-  SINGBOX_VERSION_STORE="$channel_switch_root/state/versions"
-  DEPLOYED_VERSIONS_FILE="$channel_switch_root/versions"
-  installed_singbox_version() { kernel_binary_version "$SINGBOX_BIN"; }
-  prepare_singbox_release_binary() { PREPARED_SINGBOX_BINARY="$channel_candidate_bin"; }
-  prepare_core() { :; }
-  create_environment_backup() { ENV_BACKUP="$channel_switch_root/snapshot"; }
-  begin_environment_transaction() { :; }
-  set_signal_rollback() { :; }
-  clear_signal_rollback() { :; }
-  release_operation_lock() { :; }
-  sync_transaction_path() { :; }
-  systemctl() { return 0; }
-  complete_environment_change() { trap - ERR; rm -rf -- "$1"; }
-  perform_singbox_channel_switch preview 1.14.0-alpha.44 preview.tar.gz https://example.com/preview.tar.gz "$(printf 'a%.0s' {1..64})"
-  [[ "$(installed_singbox_version)" == 1.14.0-alpha.44 ]]
-  [[ "$(kernel_binary_version "$SINGBOX_VERSION_STORE/stable/sing-box")" == 1.13.14 ]]
-  [[ "$(kernel_binary_version "$SINGBOX_VERSION_STORE/previous/sing-box")" == 1.13.14 ]]
-  jq -e '.channel == "preview" and .current_version == "1.14.0-alpha.44" and .previous.version == "1.13.14"' "$SINGBOX_CHANNEL_STATE" >/dev/null
-  grep -Fxq 'SINGBOX_VERSION=1.14.0-alpha.44' "$DEPLOYED_VERSIONS_FILE"
-) > "$work/channel-switch-output"
-grep -Fq '用户、分流、配额和流量记录均未修改' "$work/channel-switch-output"
-
-channel_failed_bin="$channel_switch_root/bin/failed-installed"
-cp "$channel_switch_root/state/versions/stable/sing-box" "$channel_failed_bin"
-set +e
-(
-  SINGBOX_BIN="$channel_failed_bin"
-  SINGBOX_CONFIG="$channel_switch_root/config.json"
-  SINGBOX_CHANNEL_STATE="$channel_switch_root/failed-state/channel.json"
-  SINGBOX_VERSION_STORE="$channel_switch_root/failed-state/versions"
-  DEPLOYED_VERSIONS_FILE="$channel_switch_root/versions"
-  installed_singbox_version() { kernel_binary_version "$SINGBOX_BIN"; }
-  prepare_singbox_release_binary() { PREPARED_SINGBOX_BINARY="$channel_candidate_bin"; }
-  prepare_core() { :; }
-  create_environment_backup() { ENV_BACKUP="$channel_switch_root/failed-snapshot"; }
-  begin_environment_transaction() { :; }
-  set_signal_rollback() { :; }
-  clear_signal_rollback() { :; }
-  release_operation_lock() { :; }
-  sync_transaction_path() { :; }
-  systemctl() { [[ "$1" != restart ]]; }
-  restore_failed_environment_change() {
-    install -m 755 "$SINGBOX_VERSION_STORE/previous/sing-box" "$SINGBOX_BIN"
-    printf 'rollback\n' >> "$channel_switch_root/rollback-marker"
-    rm -rf -- "$3"
-  }
-  perform_singbox_channel_switch preview 1.14.0-alpha.44 preview.tar.gz https://example.com/preview.tar.gz "$(printf 'a%.0s' {1..64})"
-) >/dev/null 2>&1
-failed_switch_rc=$?
-set -e
-[[ "$failed_switch_rc" != 0 ]]
-[[ "$(kernel_binary_version "$channel_failed_bin")" == 1.13.14 ]]
-[[ "$(wc -l < "$channel_switch_root/rollback-marker" | tr -d ' ')" == 1 ]]
 
 STATE_FILE="$work/state.json"
 BACKUP_DIR="$work/backups"
@@ -6324,7 +6197,7 @@ MIGRATION_REPORT_RETENTION=20
 unset MIGRATION_REPORT_DIR
 unset -f getent
 
-for nested_menu in diagnostic_report_menu global_sni_menu migration_backup_menu singbox_channel_menu; do
+for nested_menu in diagnostic_report_menu global_sni_menu migration_backup_menu; do
   nested_menu_output="$(printf '0\n' | "$nested_menu")"
   grep -Fq '返回上一级' <<<"$nested_menu_output"
   if grep -Fq '返回主菜单' <<<"$nested_menu_output"; then
@@ -7022,32 +6895,6 @@ load_migration_backups
 load_migration_reports
 [[ "$(basename "${MIGRATION_REPORTS[0]}")" == migration-restore-20000101.json ]]
 unset MIGRATION_BACKUP_DIR MIGRATION_REPORT_DIR
-
-# 不可逆操作之前的退路提示（ADR 0032）。两个分支都要验：只验「没有备份时会警告」
-# 分不清是护栏真的在看，还是这个函数无论如何都在喊同一句话。
-(
-  MIGRATION_BACKUP_DIR="$work/offsite-none"
-  mkdir -p "$MIGRATION_BACKUP_DIR"
-  none_notice="$(print_offsite_recovery_status)"
-  [[ "$none_notice" == *'没有任何加密迁移备份'* ]]
-  [[ "$none_notice" == *'没有事后手工恢复它的入口'* ]]
-
-  MIGRATION_BACKUP_DIR="$work/offsite-some"
-  mkdir -p "$MIGRATION_BACKUP_DIR"
-  printf '{}\n' > "$MIGRATION_BACKUP_DIR/sb-user-data-4.0.0-20000101-000000.sbm"
-  printf '{}\n' > "$MIGRATION_BACKUP_DIR/sb-user-data-4.0.0-20990101-000000.sbm"
-  python3 - "$MIGRATION_BACKUP_DIR" <<'PY_UTIME'
-import os, sys
-directory = sys.argv[1]
-os.utime(os.path.join(directory, "sb-user-data-4.0.0-20000101-000000.sbm"), (100, 100))
-os.utime(os.path.join(directory, "sb-user-data-4.0.0-20990101-000000.sbm"), (200, 200))
-PY_UTIME
-  some_notice="$(print_offsite_recovery_status)"
-  [[ "$some_notice" == *'2 份'* ]]
-  # 最新一份按 mtime 取，不是按文件名——名字里的日期可以与实际新旧相反。
-  [[ "$some_notice" == *'sb-user-data-4.0.0-20990101-000000.sbm'* ]]
-  [[ "$some_notice" != *'没有任何加密迁移备份'* ]]
-)
 
 # 状态恢复使用同目录临时文件和原子替换。
 atomic_restore_dir="$work/atomic-state-restore"
@@ -8749,8 +8596,14 @@ RestartSec=10s
 LimitNOFILE=infinity
 [Install]
 WantedBy=multi-user.target'
+  # 到期检查是管理器自己的东西，与内核无关，描述文字因此不再写死 sing-box
+  # （公开 Issue #256）。这一改会让每台存量机器的「服务与配置检查」多报一条
+  # 「[可自动修复] 服务单元与当前版本不一致」，直到在「检查与故障报告 →
+  # 服务与配置检查」里选一次自动修复——这是有意为之，不是回归。注意修复的入口
+  # 是这一条而不是「安装或修复环境」：后者在一台完好的机器上直接返回，不重写单元。
+  # `After=` 仍然跟着内核走。
   expected_expiry_service='[Unit]
-Description=Expire sing-box managed users
+Description=Expire sb-user-manager managed users
 After=sing-box.service nfuse.service
 [Service]
 Type=oneshot
@@ -9644,267 +9497,6 @@ Protocol version: TLSv1.2'
 )
 
 # ============================================================
-# 规则集从 sing-box 转到 mihomo（公开 Issue #203）
-# ============================================================
-# 这一组盯三件事：五类字段转得对、表达不了的字段一定拒绝、拒绝时不留半个文件。
-# 「转得对」里有三条是真机实测定下来的写法（IP 段必须带前缀长度、IP-CIDR 对
-# IPv6 同样有效、DOMAIN-REGEX 可用），改坏了这里会红。
-(
-  conv="$work/rule-convert"
-  mkdir -p "$conv"
-  MIHOMO_RULES_DIR="$conv/rules"
-  mkdir -p "$MIHOMO_RULES_DIR"
-
-  cat > "$conv/full.json" <<'JSON'
-{"version":1,"rules":[
-  {"domain":["a.example.com"],
-   "domain_suffix":[".b.example.com","c.example.com"],
-   "domain_keyword":"kw",
-   "domain_regex":"^x.*\\.example\\.com$",
-   "ip_cidr":["192.0.2.0/24","198.51.100.7","2001:db8::/32","2001:db8::1"]}
-]}
-JSON
-  singbox_rule_set_json_to_mihomo_yaml "$conv/full.json" "$conv/full.yaml" || {
-    echo '五类字段齐备的规则集必须转得出来' >&2
-    exit 1
-  }
-  cat > "$conv/full.expected" <<'YAML'
-payload:
-  - DOMAIN,a.example.com
-  - DOMAIN-SUFFIX,b.example.com
-  - DOMAIN-SUFFIX,c.example.com
-  - DOMAIN-KEYWORD,kw
-  - DOMAIN-REGEX,^x.*\.example\.com$
-  - IP-CIDR,192.0.2.0/24
-  - IP-CIDR,198.51.100.7/32
-  - IP-CIDR,2001:db8::/32
-  - IP-CIDR,2001:db8::1/128
-YAML
-  if ! diff -u "$conv/full.expected" "$conv/full.yaml"; then
-    echo '转换结果与期望不符' >&2
-    exit 1
-  fi
-  # 产物必须通过运行时那条护栏（转换器写错了要在这里红，不是等机器上线之后）
-  if [[ -n "$(mihomo_rule_file_mismatch "$conv/full.yaml" classical)" ]]; then
-    echo '转换产物没通过 classical 写法自检' >&2
-    exit 1
-  fi
-
-  # 表达不了的字段：逐个确认都会被拒绝，并且拒绝时不写出文件。
-  reject_case() {
-    local label="$1" json="$2" expect_key="$3"
-    printf '%s\n' "$json" > "$conv/bad.json"
-    rm -f "$conv/bad.yaml"
-    if singbox_rule_set_json_to_mihomo_yaml "$conv/bad.json" "$conv/bad.yaml" 2>"$conv/bad.err"; then
-      printf '含 %s 的规则集必须被拒绝\n' "$label" >&2
-      exit 1
-    fi
-    if [[ -n "$expect_key" ]] && ! grep -Fq "$expect_key" "$conv/bad.err"; then
-      printf '拒绝 %s 时要说出是哪个字段，实际输出：%s\n' "$label" "$(cat "$conv/bad.err")" >&2
-      exit 1
-    fi
-    if [[ -e "$conv/bad.yaml" ]]; then
-      printf '拒绝 %s 时不得写出文件\n' "$label" >&2
-      exit 1
-    fi
-  }
-  reject_case '端口' '{"version":1,"rules":[{"domain":["a.com"],"port":[443]}]}' port
-  reject_case '进程名' '{"version":1,"rules":[{"domain":["a.com"],"process_name":["curl"]}]}' process_name
-  reject_case '网络类型' '{"version":1,"rules":[{"domain":["a.com"],"network":["udp"]}]}' network
-  reject_case '来源地址' '{"version":1,"rules":[{"domain":["a.com"],"source_ip_cidr":["10.0.0.0/8"]}]}' source_ip_cidr
-  reject_case '取反' '{"version":1,"rules":[{"domain":["a.com"],"invert":true}]}' invert
-  reject_case '逻辑规则' '{"version":1,"rules":[{"type":"logical","mode":"and","rules":[{"domain":["a.com"]}]}]}' type
-  # 字段名必须**精确**匹配：jq 的 inside/contains 是子串语义，用它的话
-  # 一个叫 ip 的字段会被误当成 ip_cidr 的一部分放过去。
-  reject_case '子串型字段名' '{"version":1,"rules":[{"domain":["a.com"],"ip":["192.0.2.1"]}]}' ip
-  # 这两条要盯住**是哪条守卫**拒绝的：转换器自己那句「没有可以转换的规则」比
-  # 产物自检那句「payload 下面一条规则都没有」说得清楚，去掉它两条都还会被拒绝，
-  # 只断言「被拒绝」的话就分不出来。
-  reject_case '空规则集' '{"version":1,"rules":[]}' '没有可以转换的规则'
-  reject_case '一条规则都转不出来' '{"version":1,"rules":[{"domain":[]}]}' '没有可以转换的规则'
-
-  # 文件名：同一地址稳定、不同地址不撞、且一定是合法的规则文件名。
-  name_a="$(migrated_rule_file_name https://example.com/rule-set/geosite-openai.srs)"
-  name_a2="$(migrated_rule_file_name https://example.com/rule-set/geosite-openai.srs)"
-  name_b="$(migrated_rule_file_name https://example.com/other/geosite-openai.srs)"
-  name_c="$(migrated_rule_file_name 'https://example.com/a/b/../weird name!.json?x=1')"
-  [[ "$name_a" == "$name_a2" ]] || { echo '同一个地址应当算出同一个文件名' >&2; exit 1; }
-  [[ "$name_a" != "$name_b" ]] || { echo '不同地址不得算出同一个文件名' >&2; exit 1; }
-  [[ "$name_a" == geosite-openai-*.yaml ]] || { printf '文件名应当保留来源的可读部分：%s\n' "$name_a" >&2; exit 1; }
-  for candidate in "$name_a" "$name_b" "$name_c"; do
-    ( validate_mihomo_rule_file_name "$candidate" ) || {
-      printf '算出来的文件名必须是合法的规则文件名：%s\n' "$candidate" >&2
-      exit 1
-    }
-  done
-
-  # 取来源：.json 直接用，.srs 走本机 sing-box 反编译，非 HTTPS 与结构不对都要拒绝。
-  validate_public_rule_set_url() { [[ "$1" == https://* ]]; }
-  curl() {
-    local target=""
-    while (($#)); do
-      [[ "${1:-}" != --output ]] || { target="$2"; shift; }
-      shift
-    done
-    printf '%s\n' "$fetch_payload" > "$target"
-  }
-  kernel_rule_set_decompile() {
-    printf '%s\n' "$decompiled_payload" > "$3"
-  }
-  fetch_payload='{"version":1,"rules":[{"domain":["json.example.com"]}]}'
-  decompiled_payload='{"version":1,"rules":[{"domain":["srs.example.com"]}]}'
-  fetch_singbox_rule_set_json https://example.com/x.json "$conv/fetched.json" || {
-    echo '.json 来源应当直接可用' >&2; exit 1
-  }
-  grep -Fq json.example.com "$conv/fetched.json" || { echo '.json 来源的内容不对' >&2; exit 1; }
-  fetch_singbox_rule_set_json https://example.com/x.srs "$conv/fetched-srs.json" || {
-    echo '.srs 来源应当经反编译得到' >&2; exit 1
-  }
-  grep -Fq srs.example.com "$conv/fetched-srs.json" || { echo '.srs 来源的内容不对' >&2; exit 1; }
-  if fetch_singbox_rule_set_json http://example.com/x.json "$conv/nope.json" 2>/dev/null; then
-    echo '非 HTTPS 的来源必须被拒绝' >&2; exit 1
-  fi
-  fetch_payload='not-json-at-all'
-  if fetch_singbox_rule_set_json https://example.com/x.json "$conv/nope2.json" 2>/dev/null; then
-    echo '结构不对的规则集必须被拒绝' >&2; exit 1
-  fi
-)
-
-# ============================================================
-# 换内核：可以脱机断言的那几块（公开 Issue #203）
-# ============================================================
-# 整条流程要装二进制、写单元、停起服务，那部分只能真机演练。这一组盯的是流程
-# 里能脱机验的四块：要转哪些来源、状态怎么改写、前置检查拦不拦、切换后的自检
-# 与清理后的复检认不认账。
-(
-  sw="$work/switch-kernel"
-  mkdir -p "$sw/rules" "$sw/staged"
-  STATE_FILE="$sw/state.json"
-  MIHOMO_RULES_DIR="$sw/rules"
-  PROXY_KERNEL=singbox
-  SINGBOX_BIN="$sw/sing-box-stub"
-  SINGBOX_CONFIG="$sw/singbox-config.json"
-  SINGBOX_CHANNEL_STATE="$sw/singbox-channel.json"
-  printf '#!/bin/sh\nexit 0\n' > "$SINGBOX_BIN"
-  chmod +x "$SINGBOX_BIN"
-  printf '%s\n' '{
-    "schema_version":7,
-    "users":[{"name":"u1","status":"active","metered":false,
-              "endpoints":[{"protocol":"ss2022","transport":"direct","port":20001,
-                            "ss2022_password":"pw","method":"2022-blake3-aes-128-gcm"}]}],
-    "splits":[
-      {"name":"s1","url":"https://example.com/a.srs","scope":"all","status":"active",
-       "upstream":{"protocol":"shadowsocks","server":"up.example.com","server_port":8388,
-                   "method":"2022-blake3-aes-128-gcm","password":"pw"},
-       "outbound_tag":"s1-out","rule_set_tag":"s1-rule"},
-      {"name":"s2","url":"https://example.com/a.srs","scope":"all","status":"active",
-       "upstream":{"protocol":"shadowsocks","server":"up.example.com","server_port":8388,
-                   "method":"2022-blake3-aes-128-gcm","password":"pw"},
-       "outbound_tag":"s2-out","rule_set_tag":"s2-rule"}],
-    "outbound_presets":[],
-    "rule_presets":[{"name":"p1","url":"https://example.com/b.json"}]}' > "$STATE_FILE"
-
-  # 一、要转的来源：两条分流共用一个地址只算一次，预置里的那个也要算进来。
-  sources="$(singbox_rule_sources_in_state)"
-  expected_sources='https://example.com/a.srs
-https://example.com/b.json'
-  if [[ "$(printf '%s\n' "$sources" | LC_ALL=C sort)" != "$(printf '%s\n' "$expected_sources" | LC_ALL=C sort)" ]]; then
-    printf '要转换的来源不对：\n%s\n' "$sources" >&2
-    exit 1
-  fi
-
-  # 二、算计划：每个来源转出一个文件；任何一个转不了，整体就得失败。
-  fetch_json='{"version":1,"rules":[{"domain":["x.example.com"]}]}'
-  fetch_singbox_rule_set_json() { printf '%s\n' "$fetch_json" > "$2"; }
-  plan="$(plan_rule_set_migration "$sw/staged")" || { echo '计划应当能算出来' >&2; exit 1; }
-  if [[ "$(jq 'length' <<<"$plan")" != 2 ]]; then
-    printf '计划里应当有两个来源：%s\n' "$plan" >&2
-    exit 1
-  fi
-  while IFS= read -r staged_name; do
-    [[ -f "$sw/staged/$staged_name" ]] || { printf '计划里的文件没有落地：%s\n' "$staged_name" >&2; exit 1; }
-  done <<<"$(jq -r '.[]' <<<"$plan")"
-  # 对照：有一个来源取不到时必须整体失败，而不是少转一个继续往下走。
-  fetch_singbox_rule_set_json() {
-    [[ "$1" != https://example.com/b.json ]] || return 1
-    printf '%s\n' "$fetch_json" > "$2"
-  }
-  if plan_rule_set_migration "$sw/staged" >/dev/null 2>&1; then
-    echo '有来源取不到时，计划必须整体失败' >&2
-    exit 1
-  fi
-  fetch_singbox_rule_set_json() { printf '%s\n' "$fetch_json" > "$2"; }
-  plan="$(plan_rule_set_migration "$sw/staged")"
-
-  # 没有分流的机器是常态：计划必须是一个干干净净的空对象，不能是键为空串的假条目。
-  ( printf '%s\n' '{"schema_version":7,"users":[],"splits":[],"outbound_presets":[],"rule_presets":[]}' > "$sw/empty-state.json"
-    STATE_FILE="$sw/empty-state.json"
-    empty_plan="$(plan_rule_set_migration "$sw/staged")"
-    [[ "$empty_plan" == '{}' ]] || { printf '没有分流时计划应当是 {}，实际：%s\n' "$empty_plan" >&2; exit 1; }
-    apply_rule_set_migration "$empty_plan" "$sw/staged" || { echo '没有分流时状态改写也应当成功' >&2; exit 1; }
-  ) || exit 1
-
-  # 三、改写状态：url 换成 rule_file，写法一律 classical，url 必须消失。
-  apply_rule_set_migration "$plan" "$sw/staged" || { echo '状态改写应当成功' >&2; exit 1; }
-  if [[ "$(jq '[(.splits[], .rule_presets[]) | select(has("url"))] | length' "$STATE_FILE")" != 0 ]]; then
-    echo '改写之后状态里不得再有 url' >&2
-    exit 1
-  fi
-  if [[ "$(jq -r '[(.splits[], .rule_presets[]) | .rule_behavior] | unique | join(",")' "$STATE_FILE")" != classical ]]; then
-    echo '改写之后写法应当一律是 classical' >&2
-    exit 1
-  fi
-  if [[ "$(jq -r '.splits[0].rule_file' "$STATE_FILE")" != "$(jq -r '.splits[1].rule_file' "$STATE_FILE")" ]]; then
-    echo '同一个来源的两条分流应当指向同一个规则文件' >&2
-    exit 1
-  fi
-  while IFS= read -r installed; do
-    [[ -f "$MIHOMO_RULES_DIR/$installed" ]] || { printf '规则文件没有装进规则目录：%s\n' "$installed" >&2; exit 1; }
-  done <<<"$(jq -r '(.splits[], .rule_presets[]) | .rule_file' "$STATE_FILE")"
-
-  # 四、前置检查：已经是 mihomo 的机器、以及没有 sing-box 可执行文件时都要拒绝。
-  environment_is_deployed() { return 0; }
-  need_cmd() { return 0; }
-  if ( PROXY_KERNEL=mihomo; switch_kernel_preflight ) 2>/dev/null; then
-    echo '已经是 mihomo 的机器不该允许再切一次' >&2
-    exit 1
-  fi
-  if ( SINGBOX_BIN="$sw/missing"; switch_kernel_preflight ) 2>/dev/null; then
-    echo '没有 sing-box 可执行文件时必须拒绝：规则集就是靠它解出来的' >&2
-    exit 1
-  fi
-  switch_kernel_preflight || { echo '正常的 sing-box 机器应当可以切' >&2; exit 1; }
-
-  # 五、切换后的自检：状态里在用的端口必须真的被 mihomo 监听。
-  kernel_service_is_active() { return 0; }
-  systemctl() { [[ "${1:-}" != is-active ]] || return 0; return 0; }
-  ss() { printf '%s\n' 'tcp LISTEN 0 4096 *:20001 *:* users:(("mihomo",pid=1,fd=6))'; }
-  verify_kernel_switch || { echo '端口对得上时自检应当通过' >&2; exit 1; }
-  ss() { printf '%s\n' 'tcp LISTEN 0 4096 *:29999 *:* users:(("mihomo",pid=1,fd=6))'; }
-  if verify_kernel_switch 2>/dev/null; then
-    echo '端口没被监听时自检必须失败——一台切了一半的机器比没切更糟' >&2
-    exit 1
-  fi
-
-  # 六、清理 sing-box：清单是同一份，复检要盯住「真的没了」。
-  leftovers="$(singbox_leftover_paths)"
-  grep -Fxq /usr/local/bin/sing-box <<<"$leftovers" || { echo '清单里应当有 sing-box 可执行文件' >&2; exit 1; }
-  grep -Fxq "$SINGBOX_CONFIG" <<<"$leftovers" || { echo '清单里应当有 sing-box 的运行配置' >&2; exit 1; }
-  if grep -Fxq "$MANAGER_DATA_DIR" <<<"$leftovers"; then
-    echo '清单里绝不能有管理器的数据目录：用户资料、内部备份与证书都在里面' >&2
-    exit 1
-  fi
-  singbox_leftover_paths() { printf '%s\n' "$sw/leftover-a" "$sw/leftover-b"; }
-  : > "$sw/leftover-a"
-  if verify_singbox_cleanup 2>/dev/null; then
-    echo '还有残留时复检必须失败' >&2
-    exit 1
-  fi
-  rm -f "$sw/leftover-a"
-  verify_singbox_cleanup || { echo '残留清干净之后复检应当通过' >&2; exit 1; }
-)
-
-# ============================================================
 # 2f：全新安装只装 mihomo，并且用中立的数据目录（公开 Issue #157、#172）
 # ============================================================
 # 这一组最要紧的不是「新机器装 mihomo」，而是**存量机器一个字都不能变**：
@@ -10023,27 +9615,21 @@ https://example.com/b.json'
     exit 1
   fi
 
-  # 五、菜单：mihomo 机器上不出现「sing-box 版本管理」，sing-box 机器上照旧出现。
-  singbox_menu="$( PROXY_KERNEL=singbox; UI_MENU_COUNT=0; UI_MENU_ACTIONS=()
-    NO_COLOR=1 COLUMNS=60 ui_menu_items \
-      deploy '部署与卸载' update '检测更新' \
-      status '查看服务状态' diagnostics '检查与故障报告' \
-      backup '数据备份与恢复' sni '默认连接域名（SNI）'
-    [[ "$PROXY_KERNEL" != singbox ]] || NO_COLOR=1 COLUMNS=60 ui_menu_items channel 'sing-box 版本管理' )"
-  mihomo_menu="$( PROXY_KERNEL=mihomo; UI_MENU_COUNT=0; UI_MENU_ACTIONS=()
-    NO_COLOR=1 COLUMNS=60 ui_menu_items \
-      deploy '部署与卸载' update '检测更新' \
-      status '查看服务状态' diagnostics '检查与故障报告' \
-      backup '数据备份与恢复' sni '默认连接域名（SNI）'
-    [[ "$PROXY_KERNEL" != singbox ]] || NO_COLOR=1 COLUMNS=60 ui_menu_items channel 'sing-box 版本管理' )"
-  grep -Fq 'sing-box 版本管理' <<<"$singbox_menu" || { echo 'sing-box 机器上应当仍有版本管理这一项' >&2; exit 1; }
-  if grep -Fq 'sing-box 版本管理' <<<"$mihomo_menu"; then
-    echo 'mihomo 机器上不该出现 sing-box 版本管理' >&2
+  # 五、菜单：「sing-box 版本管理」已随 sing-box 线归档整项撤除（公开 Issue #256），
+  # 两个内核上都不该再出现。撤除的是**入口和实现一起**，因此这里连实现的名字
+  # 一并盯住——只删菜单项、把函数留着，正是当初决定不采用的做法。
+  if grep -Fq "channel 'sing-box 版本管理'" sb-user-manager.sh; then
+    echo 'sing-box 版本管理菜单项应当已经撤除' >&2
     exit 1
   fi
-  # 这一段是照抄菜单里的写法；照抄会漂移，因此顺带断言真实菜单里确实是这个条件。
-  grep -Fq '[[ "$PROXY_KERNEL" != singbox ]] || ui_menu_items channel' sb-user-manager.sh || {
-    echo '真实菜单里的条件与这一组测试不同步了' >&2
+  if grep -Fq 'singbox_channel_menu' sb-user-manager.sh; then
+    echo '版本管理的实现也必须一起删掉，不能只藏起入口' >&2
+    exit 1
+  fi
+  # 对照：同一层菜单里内核相关的另一项仍然按内核显示，证明上面两条不是因为
+  # 整个菜单都没了才通过的。
+  grep -Fq "[[ \"\$PROXY_KERNEL\" != mihomo ]] || ui_menu_items geo 'geo 数据源'" sb-user-manager.sh || {
+    echo 'geo 数据源仍应只在 mihomo 上显示；这一条是上面两条的对照' >&2
     exit 1
   }
 )

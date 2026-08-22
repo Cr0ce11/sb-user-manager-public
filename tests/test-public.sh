@@ -90,10 +90,11 @@ chmod 600 "$legacy_config"
     LATEST_NFUSE_VERSION=0.1.13
     LATEST_MANAGER_VERSION=9.9.9
   }
+  # 正式版号（不带 `-`）：singbox_preview_deployed 因此判为 stable，
+  # 更新流程照常按最新正式版走（公开 Issue #256）。
   installed_singbox_version() { printf '1.13.14'; }
   installed_nfuse_version() { printf '0.1.13'; }
   installed_manager_version() { printf '%s' "$SCRIPT_VERSION"; }
-  current_singbox_channel() { printf stable; }
   deploy_environment() { printf 'DEPLOY=%s,%s\n' "$1" "$2"; }
   exec() { printf 'EXEC=%s\n' "$*"; }
   printf 'y\n' | check_updates
