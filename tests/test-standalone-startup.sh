@@ -21,6 +21,11 @@ fail() {
   exit 1
 }
 
+# 下面的用例把编排里的每一步都打成桩，只验顺序。**权限修复那一步光验顺序不够**：
+# 它的价值全在真的 chmod 上（公开 Issue #252）。所以先把真实实现留一份，
+# 最后一个用例把它装回去，让启动编排真的跑到那次 chmod。
+real_repair_system_directory_modes="$(declare -f repair_system_directory_modes)"
+
 assert_log() {
   local expected="$1"
   [[ "$(<"$work/calls")" == "$expected" ]] || {
@@ -50,6 +55,12 @@ record_call() {
   printf '%s\n' "$1" >> "$work/calls"
 }
 
+# CONF_FILE 不经 SB_SYSTEM_ROOT，否则这里会读到跑测试那台机器的真实配置，
+# 用例的行为就会随宿主机而变。下面的编排用例一律按「本脚本部署过的机器」进行：
+# 权限修复那一步只在管理配置存在时才跑（公开 Issue #252）。
+CONF_FILE="$work/deployed-manager.conf"
+: > "$CONF_FILE"
+
 FAIL_AT=""
 
 record_stub_result() {
@@ -70,6 +81,7 @@ harden_existing_environment_backups() { record_call harden-backups; }
 ensure_manager_launch_copies_for_interactive_startup() { record_stub_result sync-launch-copy; }
 ensure_manager_shortcut_for_interactive_startup() { record_stub_result sync-shortcut; }
 recover_transaction_before_menu() { record_stub_result recover-state; }
+repair_system_directory_modes() { record_call repair-system-dirs; }
 migrate_backup_retention_once() { record_call migrate-backup-retention; }
 migrate_legacy_ss2022_udp_inbounds() { record_call migrate-udp; }
 migrate_empty_split_preset_fields() { record_call migrate-split-preset-fields; }
@@ -116,7 +128,16 @@ done
 # 交互启动保留原 standalone 顺序；全新服务器也只进入现有主菜单，不自动部署。
 reset_calls
 run_standalone_interactive_startup || fail 'interactive startup failed'
+assert_log $'recover-environment\nhandoff:interactive\nharden-backups\nsync-launch-copy\nsync-shortcut\nrecover-state\nrepair-system-dirs\nmigrate-backup-retention\nmigrate-udp\nmigrate-split-preset-fields\nmigrate-presets\nstandalone-menu'
+
+# 对照：一台没有管理配置的机器——只是把脚本下载下来打开菜单看看——不碰系统目录
+# 权限。缺了这条对照就分不清「修复挂在启动编排上」和「脚本一运行就改别人的
+# 系统目录」（公开 Issue #252）。
+mv -- "$CONF_FILE" "$CONF_FILE.away"
+reset_calls
+run_standalone_interactive_startup || fail 'interactive startup failed without a manager config'
 assert_log $'recover-environment\nhandoff:interactive\nharden-backups\nsync-launch-copy\nsync-shortcut\nrecover-state\nmigrate-backup-retention\nmigrate-udp\nmigrate-split-preset-fields\nmigrate-presets\nstandalone-menu'
+mv -- "$CONF_FILE.away" "$CONF_FILE"
 
 # 关键步骤在条件调用上下文中也必须显式失败即止，不能依赖 set -e。
 for failure_case in \
@@ -125,7 +146,7 @@ for failure_case in \
   'sync-launch-copy|recover-environment;handoff:interactive;harden-backups;sync-launch-copy' \
   'sync-shortcut|recover-environment;handoff:interactive;harden-backups;sync-launch-copy;sync-shortcut' \
   'recover-state|recover-environment;handoff:interactive;harden-backups;sync-launch-copy;sync-shortcut;recover-state' \
-  'standalone-menu|recover-environment;handoff:interactive;harden-backups;sync-launch-copy;sync-shortcut;recover-state;migrate-backup-retention;migrate-udp;migrate-split-preset-fields;migrate-presets;standalone-menu'; do
+  'standalone-menu|recover-environment;handoff:interactive;harden-backups;sync-launch-copy;sync-shortcut;recover-state;repair-system-dirs;migrate-backup-retention;migrate-udp;migrate-split-preset-fields;migrate-presets;standalone-menu'; do
   FAIL_AT="${failure_case%%|*}"
   expected_calls="${failure_case#*|}"
   expected_calls="${expected_calls//;/$'\n'}"
@@ -145,7 +166,7 @@ migrate_empty_split_preset_fields() { record_call migrate-split-preset-fields; r
 migrate_shared_preset_runtime_configs() { record_call migrate-presets; return 1; }
 reset_calls
 run_standalone_interactive_startup || fail 'warning path stopped the standalone menu'
-assert_log $'recover-environment\nhandoff:interactive\nharden-backups\nwarning\nsync-launch-copy\nsync-shortcut\nrecover-state\nmigrate-backup-retention\nwarning\nmigrate-udp\nwarning\nmigrate-split-preset-fields\nwarning\nmigrate-presets\nwarning\nstandalone-menu'
+assert_log $'recover-environment\nhandoff:interactive\nharden-backups\nwarning\nsync-launch-copy\nsync-shortcut\nrecover-state\nrepair-system-dirs\nmigrate-backup-retention\nwarning\nmigrate-udp\nwarning\nmigrate-split-preset-fields\nwarning\nmigrate-presets\nwarning\nstandalone-menu'
 
 # 全新或不完整环境中的无人值守到期任务必须失败关闭，不能移交或修改运行状态。
 rm -rf -- "$SB_SYSTEM_ROOT"
@@ -289,5 +310,46 @@ for retired_helper in sb-user-manager-landing-agent sb-user-manager-landing-appl
   fi
   grep -Fq 'v5 入口与落地能力已经退役' "$work/$retired_helper.out"
 done
+
+# 权限修复真的发生在启动编排里（公开 Issue #252）。上面的用例只验了它在顺序里的
+# 位置，这一条把真实实现装回去，造一台「目录是 700 + 已装新脚本」的机器，
+# **只运行一次交互启动、不做任何部署动作**，确认两个目录变回 755。
+#
+# 对照有两条，缺了任何一条都分不清「修复在起作用」和「它把什么都改成 755」：
+#   一、不是 700 的值不被覆盖——管理员自己设成 750 的目录必须原样留着。
+#   二、管理器自己的目录（/var/lib/sb-user-manager）故意就是 700，不能被顺手放宽。
+(
+  eval "$real_repair_system_directory_modes"
+  repair_root="$work/startup-repair-252"
+  SB_SYSTEM_ROOT="$repair_root"
+  mkdir -p "$repair_root/var/lib/sb-user-manager" "$repair_root/usr/local/sbin" "$repair_root/usr/local/bin"
+  # 这台机器是本脚本部署过的，管理配置在。
+  CONF_FILE="$work/deployed-manager.conf"
+  chmod 700 "$repair_root/var/lib" "$repair_root/usr/local/sbin"
+  chmod 700 "$repair_root/var/lib/sb-user-manager"
+  chmod 750 "$repair_root/usr/local/bin"
+
+  reset_calls
+  run_standalone_interactive_startup || fail 'startup with the real permission repair failed'
+
+  [[ "$(manager_file_mode "$repair_root/var/lib")" == 755 ]] || {
+    printf '/var/lib 没有被启动编排修回 755，实际：%s\n' "$(manager_file_mode "$repair_root/var/lib")" >&2
+    fail 'startup did not repair /var/lib'
+  }
+  [[ "$(manager_file_mode "$repair_root/usr/local/sbin")" == 755 ]] || {
+    printf '/usr/local/sbin 没有被启动编排修回 755，实际：%s\n' "$(manager_file_mode "$repair_root/usr/local/sbin")" >&2
+    fail 'startup did not repair /usr/local/sbin'
+  }
+  # 对照一：750 不是那个指纹，必须原样留着。
+  [[ "$(manager_file_mode "$repair_root/usr/local/bin")" == 750 ]] || {
+    printf '管理员自己设的 750 被覆盖了，实际：%s\n' "$(manager_file_mode "$repair_root/usr/local/bin")" >&2
+    fail 'startup repair overwrote a mode it must not touch'
+  }
+  # 对照二：管理器自己的目录仍然是 700。
+  [[ "$(manager_file_mode "$repair_root/var/lib/sb-user-manager")" == 700 ]] || {
+    printf '管理器自己的目录被放宽了，实际：%s\n' "$(manager_file_mode "$repair_root/var/lib/sb-user-manager")" >&2
+    fail 'startup repair widened the manager own directory'
+  }
+)
 
 echo 'standalone startup checks passed'

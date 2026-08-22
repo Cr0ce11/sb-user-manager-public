@@ -14247,6 +14247,24 @@ run_standalone_interactive_startup() {
   ensure_manager_launch_copies_for_interactive_startup || return 1
   ensure_manager_shortcut_for_interactive_startup || return 1
   recover_transaction_before_menu || return 1
+  # 一次性修回被旧版本改坏的系统目录权限（公开 Issue #246、#252）。
+  # **必须挂在这里，不能只挂在部署与修复上。** 「检测更新」那一次的部署是由
+  # **旧脚本**执行的——新脚本刚下载下来还没跑，跑 deploy_environment 的仍是当前
+  # 进程里那份把 /var/lib 与 /usr/local/sbin 改成 700 的旧代码。真机实测的顺序是
+  # 755 →（升级）→ 700，修复要等到下一次走部署或修复才生效，于是一台从旧版升上来
+  # 的机器升完仍然是 700，还得再点一次「安装或修复环境」。挂进启动编排之后，
+  # 升级完成 exec 进新脚本、或者下一次运行脚本时就自动修回。
+  # 函数幂等且只认 700 这个指纹，管理员自己设成别的值不会被覆盖。
+  #
+  # **先确认这是一台本脚本部署过的机器。** 缺陷只可能出现在跑过本脚本的机器上，
+  # 而这里是「运行脚本就会走到」的位置——不设门槛的话，一个人只是下载下来打开
+  # 菜单看看，脚本就动了他系统目录的权限。全新 Debian 12 上这两个目录本来就是
+  # 755（实测），因此不设门槛也基本不会触发；真正被误伤的是那种自己把 /var/lib
+  # 收紧到 700 的机器，那是别人的决定，不该由我们改回去。
+  # 判据用管理配置在不在，不用 environment_is_deployed：后者要看当前内核的核心
+  # 文件，而这一刻 PROXY_KERNEL 还是文件级默认值 sing-box，一台 mihomo 机器会被
+  # 判成没部署（同 #251 那个坑）。
+  [[ ! -f "$CONF_FILE" ]] || repair_system_directory_modes
   if ! migrate_backup_retention_once; then
     log '警告：旧的完整备份暂未能自动整理，不影响当前服务和数据；下次运行时会再次尝试'
   fi
