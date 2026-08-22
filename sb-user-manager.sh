@@ -11125,7 +11125,7 @@ deploy_environment() {
 # 换内核：把一台在跑的 sing-box 机器整机切到 mihomo（公开 Issue #203）
 # ============================================================
 # 这不是「改一下管理配置」——部署之后改内核会得到一台配置属于旧内核、服务属于新
-# 内核的半迁移机器（见 apply_test_only_kernel_selection 的注释）。因此走一次完整的
+# 内核的半迁移机器——配置属于旧内核、服务属于新内核。因此走一次完整的
 # 环境事务：先把要做的事整个算清楚，再动手，任何一步失败整体回到切换前。
 #
 # **分流规则集的转换是单向的**（.srs／.json → yaml 能做，反过来做不到）。所以回退
@@ -11475,26 +11475,10 @@ cleanup_singbox_leftovers() {
   log "sing-box 的残留已清理；清理前的完整环境快照在 $backup"
 }
 
-# 仅供测试使用的内核选择。菜单里没有这个入口：内核选择要等第二步 2f，
-# 而 2f 必须排在 2e 的审计护栏之后——把一台无法自检的机器交出去是不行的。
-# 只对尚未部署的机器生效：已部署机器的内核由管理配置决定，部署后不允许更改，
-# 中途改会得到一台配置属于旧内核、服务属于新内核的半迁移机器。
-apply_test_only_kernel_selection() {
-  local requested="${SB_DEPLOY_PROXY_KERNEL:-}"
-  [[ -n "$requested" ]] || return 0
-  if [[ -f "$CONF_FILE" ]]; then
-    log "提示：本机已完成部署，代理内核由管理配置决定，SB_DEPLOY_PROXY_KERNEL 已忽略"
-    return 0
-  fi
-  case "$requested" in
-    singbox|mihomo) PROXY_KERNEL="$requested" ;;
-    *) die "SB_DEPLOY_PROXY_KERNEL 只能是 singbox 或 mihomo：$requested" ;;
-  esac
-  log "提示：本次部署使用测试用的内核选择：$(kernel_display_name)"
-}
-
 # 确定本次安装或更新按哪个内核进行。
-# 已部署的机器一律以管理配置里的声明为准；只有尚未部署的机器才看测试用的选择。
+# 已部署的机器一律以管理配置里的声明为准；干净机器一律装 mihomo，不给选择
+# （公开 Issue #157 的 2f）。仅供测试的内核选择开关已于 sing-box 线归档后剥离
+# （公开 Issue #227）；要装一台 sing-box 机器只能用 v4.25.22 或更早的 Release。
 # 必须在这里显式确定，不能依赖文件级默认值：deploy_environment 内那次
 # load_runtime_config 发生在子进程里，父进程拿不到结果，而写单元文件、
 # 校验配置、挑选下载资产都发生在父进程。真机上验到的后果是——
@@ -11523,9 +11507,8 @@ resolve_deployment_kernel() {
   else
     PROXY_KERNEL=mihomo
   fi
-  apply_test_only_kernel_selection || return 1
-  # 中立数据目录只给新装的 mihomo 机器。用逃生口装 sing-box 时保持老目录，
-  # 那条路本来就是为了「装出一台与存量机器一样的机器」。
+  # 中立数据目录只给新装的 mihomo 机器。上面那条 sing-box 分支留给**存量**机器——
+  # 管理配置丢了、但机器上还有 sing-box 痕迹的那种，它们的数据目录必须保持老名字。
   [[ "$PROXY_KERNEL" != mihomo ]] || apply_fresh_install_manager_data_dir
 }
 
