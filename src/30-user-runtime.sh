@@ -827,11 +827,9 @@ check_new_user_conflicts() {
     [$tags[] as $wanted | select(any(.[$container][]?; .[$entry_key] == $wanted)) | $wanted][0] // empty
   ' <<<"$config_json")" || die "无法解析或格式化运行配置：$(kernel_runtime_config_path)"
   if [[ -n "$conflict_tag" ]]; then
-    if [[ "$protocol" == ss2022 ]]; then
-      die "sing-box 已存在 tag：$conflict_tag"
-    else
-      die "tag 已存在"
-    fi
+    # 两个分支说的是同一件事，此前一边带 tag 名一边不带；统一成带名字的说法，
+    # 便于直接定位是哪个入口撞了。内核名走适配层——这条路径与内核无关。
+    die "$(kernel_display_name) 已存在 tag：$conflict_tag"
   fi
   if [[ "$protocol" == anytls ]]; then
     anytls_certificate_ready || die "AnyTLS 证书不存在，请先重新安装环境"
@@ -879,16 +877,16 @@ check_new_endpoint_conflicts() {
   nfuse_port_exists "$port" && die "Nfuse 已管理端口：$port"
   if [[ "$kind" == anytls ]]; then
     anytls_certificate_ready || die "AnyTLS 证书不存在，请先重新安装环境"
-    tag_exists_in_config "anytls-$name" && die "sing-box 已存在 tag：anytls-$name"
+    tag_exists_in_config "anytls-$name" && die "$(kernel_display_name) 已存在 tag：anytls-$name"
   else
     jq -e --arg name "$name" 'any(.users[]? | select(.name == $name) | .endpoints[]?;
       .protocol == "ss2022" and .transport == "shadowtls")' "$STATE_FILE" >/dev/null && has_legacy=true
     if [[ "$has_legacy" == true ]]; then
-      tag_exists_in_config "ss-direct-$name" && die "sing-box 已存在 tag：ss-direct-$name"
+      tag_exists_in_config "ss-direct-$name" && die "$(kernel_display_name) 已存在 tag：ss-direct-$name"
     else
-      tag_exists_in_config "st-$name" && die "sing-box 已存在 tag：st-$name"
-      tag_exists_in_config "ss-$name" && die "sing-box 已存在 tag：ss-$name"
-      tag_exists_in_config "ss-udp-$name" && die "sing-box 已存在 tag：ss-udp-$name"
+      tag_exists_in_config "st-$name" && die "$(kernel_display_name) 已存在 tag：st-$name"
+      tag_exists_in_config "ss-$name" && die "$(kernel_display_name) 已存在 tag：ss-$name"
+      tag_exists_in_config "ss-udp-$name" && die "$(kernel_display_name) 已存在 tag：ss-udp-$name"
     fi
   fi
   return 0
@@ -1229,7 +1227,7 @@ prepare_user_enable() {
   fragment="$(make_user_inbounds_from_state "$user")" || return 1
   while IFS= read -r tag; do
     [[ -n "$tag" ]] || continue
-    tag_exists_in_config "$tag" && die "sing-box 已存在 tag：$tag"
+    tag_exists_in_config "$tag" && die "$(kernel_display_name) 已存在 tag：$tag"
   done < <(jq -r '.[].tag' <<<"$fragment")
   metered="$(jq -r '.metered // (.limit_gib != null)' <<<"$user")" || return 1
   [[ "$metered" == true || "$metered" == false ]] || return 1
