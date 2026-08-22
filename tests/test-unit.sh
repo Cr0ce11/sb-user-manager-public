@@ -1934,6 +1934,49 @@ if grep -Fq 'FLOW:deploy' "$work/install-unsafe-repair"; then
   exit 1
 fi
 
+# 同一条修复路径在 mihomo 上（公开 Issue #242）。此前这里写死了 sing-box 的形状
+# ——配置路径 /etc/sing-box/config.json、容器 .inbounds[]、标识 .tag——于是 mihomo
+# 机器必定停在「配置缺失」上，而那台机器本来就不该有 sing-box 的配置文件。
+# 两个方向都要验：能走到底（正向），以及安全护栏仍然拦得住（对照）。
+mihomo_flow_root="$work/install-flow-mihomo-root"
+mihomo_flow_state="$mihomo_flow_root/etc/sb-user-manager/managed-users.json"
+mkdir -p "$mihomo_flow_root/etc/mihomo" "$mihomo_flow_root/etc/sb-user-manager"
+printf '%s\n' '{"listeners":[],"proxies":[],"proxy-groups":[],"rules":[]}' > "$mihomo_flow_root/etc/mihomo/config.json"
+printf '%s\n' '{"schema_version":7,"users":[],"splits":[]}' > "$mihomo_flow_state"
+exercise_mihomo_install_repair() (
+  SB_SYSTEM_ROOT="$mihomo_flow_root"
+  PROXY_KERNEL=mihomo
+  MANAGER_DATA_DIR=/etc/sb-user-manager
+  STATE_FILE="$mihomo_flow_state"
+  ENVIRONMENT_CLASS=managed_partial
+  show_environment_diagnostics() { :; }
+  install_prerequisites() { printf 'FLOW:prerequisites\n'; }
+  fetch_latest_releases() { printf 'FLOW:fetch:%s\n' "$1"; }
+  deploy_environment() { printf 'FLOW:deploy:%s:%s\n' "$1" "${2:-}"; }
+  install_environment <<<'1'
+)
+exercise_mihomo_install_repair > "$work/install-repair-mihomo" 2>&1
+grep -Fxq 'FLOW:deploy:false:' "$work/install-repair-mihomo"
+if grep -Fq '配置缺失' "$work/install-repair-mihomo"; then
+  echo 'mihomo 机器上的自动修复不得因为找不到 sing-box 配置而停下' >&2
+  cat "$work/install-repair-mihomo" >&2
+  exit 1
+fi
+
+# 对照：mihomo 上的安全护栏也要拦得住——有用户入口、却没有用户资料时不能自动改。
+rm -f "$mihomo_flow_state"
+printf '%s\n' '{"listeners":[{"name":"anytls-orphan"}]}' > "$mihomo_flow_root/etc/mihomo/config.json"
+set +e
+exercise_mihomo_install_repair > "$work/install-unsafe-repair-mihomo" 2>&1
+unsafe_repair_mihomo_rc=$?
+set -e
+[[ "$unsafe_repair_mihomo_rc" == 1 ]]
+grep -Fq '已有用户连接配置，但用户资料缺失' "$work/install-unsafe-repair-mihomo"
+if grep -Fq 'FLOW:deploy' "$work/install-unsafe-repair-mihomo"; then
+  echo 'mihomo 上的安全护栏必须在部署之前拦住' >&2
+  exit 1
+fi
+
 set +e
 (
   environment_is_deployed() { return 0; }

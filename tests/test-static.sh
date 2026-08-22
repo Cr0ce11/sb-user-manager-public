@@ -963,7 +963,18 @@ grep -Fq 'migrate_backup_retention_once()' sb-user-manager.sh
 [[ "$(grep -Fc 'migrate_backup_retention_once' sb-user-manager.sh)" == 2 ]]
 grep -Fq 'SB_BACKUP_RETENTION_MIGRATION_MARKER' sb-user-manager.sh
 grep -Fq 'prompt_user_status_action()' sb-user-manager.sh
-grep -Fq 'config_path="$(system_path /etc/sing-box/config.json)"' sb-user-manager.sh
+# 「安装或修复环境」的自动修复分支：内核配置的位置必须**按内核取**，再经 system_path
+# 折算。两个不变量缺一不可——
+#   * 按内核取：此前这里写死 /etc/sing-box/config.json，mihomo 机器必定停在
+#     「配置缺失」上，而那台机器本来就不该有这个文件（公开 Issue #242）。
+#     原先这里钉的正是那句写死的写法，于是把缺陷一起钉住了。
+#   * 经 system_path：这条路径在管理配置载入之前跑，只能按系统路径判断。
+grep -Fq 'config_path="$(kernel_runtime_config_path)"' sb-user-manager.sh
+grep -Fq 'config_path="$(system_path "$config_path")"' sb-user-manager.sh
+if grep -Fq 'system_path /etc/sing-box/config.json' sb-user-manager.sh; then
+  echo 'repair branch must not hardcode the sing-box config path (see public issue #242)' >&2
+  exit 1
+fi
 grep -Fq 'if ! deploy_environment false "$update_manager"; then' sb-user-manager.sh
 if grep -Fq 'prompt_name_action' sb-user-manager.sh; then
   echo 'legacy free-form enable/disable user prompt should not remain' >&2
