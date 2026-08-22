@@ -15,6 +15,15 @@ apply_fresh_install_manager_data_dir() {
   BACKUP_DIR="$MANAGER_DATA_DIR/backups"
 }
 
+# 存量机器的数据目录。管理配置整个丢失、但机器上还有 sing-box 痕迹时走这条路：
+# 它们的用户资料、内部备份与证书都在老目录里，名字不能变。
+apply_legacy_manager_data_dir() {
+  MANAGER_DATA_DIR="$LEGACY_MANAGER_DATA_DIR"
+  resolve_manager_data_paths
+  STATE_FILE="$MANAGER_DATA_DIR/managed-users.json"
+  BACKUP_DIR="$MANAGER_DATA_DIR/backups"
+}
+
 # sing-box 部署的管理配置。内容与历史版本一字不变，**不写 PROXY_KERNEL**：
 # 管理配置的解析对未知键直接报错退出，写进去会让回退到旧脚本时启动不了。
 # 详见公开 Issue #158。
@@ -2006,7 +2015,16 @@ resolve_deployment_kernel() {
   fi
   # 中立数据目录只给新装的 mihomo 机器。上面那条 sing-box 分支留给**存量**机器——
   # 管理配置丢了、但机器上还有 sing-box 痕迹的那种，它们的数据目录必须保持老名字。
-  [[ "$PROXY_KERNEL" != mihomo ]] || apply_fresh_install_manager_data_dir
+  #
+  # **两条分支都必须显式给出数据目录。** 以前 sing-box 那一支什么都不做，靠的是
+  # 文件级默认值恰好就是 /etc/sing-box；那个默认值现在是「尚未解析」哨兵
+  # （公开 Issue #262），不显式设的话，这类机器会带着哨兵往下走，第一次派生证书
+  # 路径时就会停住。这正是把默认值换成哨兵想暴露的那种隐式依赖。
+  if [[ "$PROXY_KERNEL" == mihomo ]]; then
+    apply_fresh_install_manager_data_dir
+  else
+    apply_legacy_manager_data_dir
+  fi
 }
 
 install_environment() {

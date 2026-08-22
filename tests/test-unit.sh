@@ -8,6 +8,17 @@ export SB_USER_MANAGER_LIBRARY=true
 # shellcheck source=../sb-user-manager.sh
 source ./sb-user-manager.sh
 
+# **夹具必须自己声明这是一台什么机器。** 文件级默认值现在是「尚未解析」哨兵
+# （公开 Issue #262），提前使用会当场报错——这正是它的用处。整份测试历史上一直
+# 隐式跑在「sing-box + /etc/sing-box」这个形状上，这里把它显式写出来，取值与
+# 改动之前一字不差；需要别的形状的用例仍然在自己的子 shell 里覆盖这两个值。
+#
+# 这一条与 #251 的教训是同一件事：夹具的形状决定它能不能看见缺陷，所以形状要写
+# 在明面上，而不是从一个恰好合适的默认值里继承来。
+PROXY_KERNEL=singbox
+MANAGER_DATA_DIR=/etc/sing-box
+resolve_manager_data_paths
+
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 # 审计夹具必须带骨架，否则新增的骨架检查会在每个用例里额外报出缺项，
@@ -10137,6 +10148,131 @@ Protocol version: TLSv1.2'
   ( SB_SYSTEM_ROOT="$varlib_root"; repair_system_directory_modes >/dev/null )
   expect '管理器自己的目录不被放宽（对照）' 700 \
     "$(manager_file_mode "$varlib_root/var/lib/sb-user-manager")"
+)
+
+# ============================================================
+# 文件级默认值不再假装自己是 sing-box（公开 Issue #262）
+# ============================================================
+# 这一组盯两件事：**存量机器的解析结果一字不变**，以及**提前使用当场报错**。
+# 前者是这次改动的全部风险所在——MANAGER_DATA_DIR 指着用户资料、内部备份与
+# AnyTLS 证书，解析错了不会有任何一步报错，只会把证书重新签发一张，所有 AnyTLS
+# 用户当场连不上。
+(
+  shapes="$work/kernel-default-shapes"
+  mkdir -p "$shapes"
+
+  # 一台机器的解析结果：内核、数据目录、以及由数据目录派生的证书目录。
+  # 每种形状都在自己的子 shell 里跑，避免互相沿用取值。
+  resolve_shape() {
+    local conf="$1"
+    (
+      CONF_FILE="$conf"
+      load_runtime_config
+      printf '%s %s %s\n' "$PROXY_KERNEL" "$MANAGER_DATA_DIR" "$CERT_DIR"
+    )
+  }
+
+  # 形状一：两个键都写在配置里（2f 之后新装的 mihomo 机器）。
+  printf '%s\n' 'HANDSHAKE_PORT=443' 'PROXY_KERNEL="mihomo"' \
+    'MANAGER_DATA_DIR="/etc/sb-user-manager"' > "$shapes/both.conf"
+  chmod 600 "$shapes/both.conf"
+  both="$(resolve_shape "$shapes/both.conf")"
+  [[ "$both" == 'mihomo /etc/sb-user-manager /etc/sb-user-manager/cert' ]] || {
+    printf '两个键都有的机器解析错了：%s\n' "$both" >&2; exit 1; }
+
+  # 形状二：**只有 PROXY_KERNEL，没有 MANAGER_DATA_DIR**。这正是测试机
+  # sbm-mihomo 的形状——mihomo 内核，而管理器数据仍在老目录里，目录名只能由
+  # 兜底给出。**这一条是整组里最要紧的**：这类机器的 AnyTLS 证书目录没有别的
+  # 来源，兜底一旦失效，证书会被判定为不存在而重新签发。
+  printf '%s\n' 'HANDSHAKE_PORT=443' 'PROXY_KERNEL="mihomo"' > "$shapes/kernel-only.conf"
+  chmod 600 "$shapes/kernel-only.conf"
+  kernel_only="$(resolve_shape "$shapes/kernel-only.conf")"
+  [[ "$kernel_only" == 'mihomo /etc/sing-box /etc/sing-box/cert' ]] || {
+    printf '只写内核的存量机器解析错了：%s\n' "$kernel_only" >&2; exit 1; }
+
+  # 形状三：两个键都没有（sing-box 老机器，它们的配置里本来就不写内核）。
+  printf '%s\n' 'HANDSHAKE_PORT=443' > "$shapes/neither.conf"
+  chmod 600 "$shapes/neither.conf"
+  neither="$(resolve_shape "$shapes/neither.conf")"
+  [[ "$neither" == 'singbox /etc/sing-box /etc/sing-box/cert' ]] || {
+    printf '两个键都没有的老机器解析错了：%s\n' "$neither" >&2; exit 1; }
+
+  # **同一个进程里连载两份配置不得串味。** 真机上回滚或恢复之后就是这个场景：
+  # 先载入过一份中立目录的配置，再载入一份老配置，绝不能让老机器跟着去新目录
+  # 找用户资料。这一条正是 load_runtime_config 载入前清空那两个变量的理由。
+  crosstalk="$(
+    CONF_FILE="$shapes/both.conf"
+    load_runtime_config
+    CONF_FILE="$shapes/neither.conf"
+    load_runtime_config
+    printf '%s %s %s\n' "$PROXY_KERNEL" "$MANAGER_DATA_DIR" "$CERT_DIR"
+  )"
+  [[ "$crosstalk" == 'singbox /etc/sing-box /etc/sing-box/cert' ]] || {
+    printf '连载两份配置串味了：%s\n' "$crosstalk" >&2; exit 1; }
+
+  # 管理配置整个丢失时由 resolve_deployment_kernel 定夺，两条分支都必须显式
+  # 给出数据目录——以前 sing-box 那一支什么都不做，靠的正是文件级默认值。
+  missing_root="$shapes/no-conf"
+  mkdir -p "$missing_root/usr/local/bin"
+  : > "$missing_root/usr/local/bin/sing-box"
+  legacy="$(
+    SB_SYSTEM_ROOT="$missing_root"
+    CONF_FILE="$shapes/does-not-exist.conf"
+    PROXY_KERNEL="$KERNEL_UNRESOLVED"
+    MANAGER_DATA_DIR="$MANAGER_DATA_DIR_UNRESOLVED"
+    resolve_deployment_kernel
+    printf '%s %s %s\n' "$PROXY_KERNEL" "$MANAGER_DATA_DIR" "$CERT_DIR"
+  )"
+  [[ "$legacy" == 'singbox /etc/sing-box /etc/sing-box/cert' ]] || {
+    printf '配置丢失的 sing-box 存量机器解析错了：%s\n' "$legacy" >&2; exit 1; }
+
+  # 对照：真正干净的机器仍然按 2f 装 mihomo、用中立目录。缺了这条对照就分不清
+  # 「存量机器拿到老目录」和「所有机器都拿到老目录」。
+  fresh_root="$shapes/fresh"
+  mkdir -p "$fresh_root"
+  fresh="$(
+    SB_SYSTEM_ROOT="$fresh_root"
+    CONF_FILE="$shapes/does-not-exist.conf"
+    PROXY_KERNEL="$KERNEL_UNRESOLVED"
+    MANAGER_DATA_DIR="$MANAGER_DATA_DIR_UNRESOLVED"
+    resolve_deployment_kernel
+    printf '%s %s %s\n' "$PROXY_KERNEL" "$MANAGER_DATA_DIR" "$CERT_DIR"
+  )"
+  [[ "$fresh" == 'mihomo /etc/sb-user-manager /etc/sb-user-manager/cert' ]] || {
+    printf '干净机器解析错了：%s\n' "$fresh" >&2; exit 1; }
+)
+
+# 护栏：还没解析就用，必须当场报错。
+(
+  # 一、管理器数据路径的派生入口。
+  guard_out="$(
+    MANAGER_DATA_DIR="$MANAGER_DATA_DIR_UNRESOLVED"
+    resolve_manager_data_paths 2>&1 || true
+  )"
+  [[ "$guard_out" == *'还没有确定管理器数据目录'* ]] || {
+    printf '哨兵状态下派生数据路径应当报错，实际输出：%s\n' "$guard_out" >&2; exit 1; }
+  if ( MANAGER_DATA_DIR="$MANAGER_DATA_DIR_UNRESOLVED"; resolve_manager_data_paths >/dev/null 2>&1 ); then
+    echo '哨兵状态下派生数据路径必须返回非零' >&2
+    exit 1
+  fi
+  # 对照：解析之后同一个调用照常工作，且**真的把三条路径算了出来**。
+  resolved="$( MANAGER_DATA_DIR=/etc/sing-box; resolve_manager_data_paths && printf '%s' "$ANYTLS_KEY_FILE" )"
+  [[ "$resolved" == /etc/sing-box/cert/anytls.key ]] || {
+    printf '解析之后应当正常派生，实际：%s\n' "$resolved" >&2; exit 1; }
+
+  # 二、内核适配层。哨兵不是「配置里写错了内核名」，提示要说得出区别。
+  kernel_out="$( PROXY_KERNEL="$KERNEL_UNRESOLVED"; kernel_shadowtls_entry_prefixes 2>&1 || true )"
+  [[ "$kernel_out" == *'还没有确定本机的代理内核'* ]] || {
+    printf '哨兵状态下调用适配层应当报错，实际输出：%s\n' "$kernel_out" >&2; exit 1; }
+  # 对照一：写错了内核名仍然报的是另一句，两种情况的下一步不同。
+  wrong_out="$( PROXY_KERNEL=singbox2; kernel_shadowtls_entry_prefixes 2>&1 || true )"
+  [[ "$wrong_out" == *'代理内核名无法识别'* ]] || {
+    printf '未知内核名应当报另一句，实际输出：%s\n' "$wrong_out" >&2; exit 1; }
+  # 对照二：正常内核照常返回结果，证明上面两条不是因为这个函数总是失败。
+  ( PROXY_KERNEL=singbox; kernel_shadowtls_entry_prefixes >/dev/null ) || {
+    echo 'sing-box 机器上适配层应当正常工作' >&2; exit 1; }
+  ( PROXY_KERNEL=mihomo; kernel_shadowtls_entry_prefixes >/dev/null ) || {
+    echo 'mihomo 机器上适配层应当正常工作' >&2; exit 1; }
 )
 
 echo 'unit checks passed'

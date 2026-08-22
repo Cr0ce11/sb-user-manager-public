@@ -1058,6 +1058,41 @@ if grep -Fq 'rollback_channel_switch' sb-user-manager.sh; then
   echo 'sing-box channel switch should be gone; no rollback_channel_switch steps must remain' >&2
   exit 1
 fi
+
+# 文件级默认值不许再是一个「像真的」的取值（公开 Issue #262）。
+# 钉住的不变量：**载入管理配置之前读到这两个变量的代码，必须拿到一个用不了的值**，
+# 而不是一个看起来完全正常、实际可能完全错误的答案（#251 就是这么坏的）。
+# 存量机器的兼容兜底没有消失，只是挪进了 load_runtime_config，因此那两行 `:=`
+# 一并钉住——删掉它们，管理配置里不写这两个键的老机器就会拿到哨兵。
+grep -Fq 'PROXY_KERNEL="$KERNEL_UNRESOLVED"' sb-user-manager.sh
+grep -Fq 'MANAGER_DATA_DIR="$MANAGER_DATA_DIR_UNRESOLVED"' sb-user-manager.sh
+grep -Fq ': "${PROXY_KERNEL:=singbox}"' sb-user-manager.sh
+grep -Fq ': "${MANAGER_DATA_DIR:=$LEGACY_MANAGER_DATA_DIR}"' sb-user-manager.sh
+# 载入配置之前必须先把这两个变量清空，那两行 `:=` 才有机会生效。
+unresolved_reset_program='
+  $0 == "load_runtime_config() {" {inside=1; next}
+  inside && /^}$/ {inside=0; next}
+  inside && /^  PROXY_KERNEL=""$/ {kernel=1}
+  inside && /^  MANAGER_DATA_DIR=""$/ {data=1}
+  inside && /^  parse_runtime_config$/ {
+    if (!kernel || !data) {failed=1}
+  }
+  END {exit failed ? 1 : 0}
+'
+if ! awk "$unresolved_reset_program" sb-user-manager.sh; then
+  echo 'load_runtime_config must clear PROXY_KERNEL and MANAGER_DATA_DIR before parsing the config' >&2
+  exit 1
+fi
+sed '/^load_runtime_config() {$/,/^}$/ {
+  /^  MANAGER_DATA_DIR=""$/ d
+}' sb-user-manager.sh > "$convention_fixture"
+if awk "$unresolved_reset_program" "$convention_fixture" 2>/dev/null; then
+  echo 'the reset check must reject a load_runtime_config that keeps the previous data directory' >&2
+  exit 1
+fi
+# 哨兵到派生入口必须停住。
+grep -Fq '还没有确定管理器数据目录就去派生它下面的路径' sb-user-manager.sh
+grep -Fq '还没有确定本机的代理内核就调用了内核适配层' sb-user-manager.sh
 if grep -Fq 'repair_consistency_step' sb-user-manager.sh; then
   echo 'legacy consistency-only transaction step wrapper should not remain' >&2
   exit 1
