@@ -53,6 +53,12 @@ bash tests/test-public-snapshot.sh
 bash tests/test-release-workflow.sh
 ```
 
+**门禁命令不要接管道。** `bash tests/test-unit.sh | tail -5` 读到的退出码是 `tail` 的，
+永远是 0——失败信息滚过去了，看上去却像通过。要么让它直接输出，要么写成
+`bash tests/test-unit.sh > /tmp/u.log 2>&1; echo "退出码=$?"` 再看日志。
+这一条是 2026-08-22 用一次误判换来的：连着两轮把一个失败的单元门禁当成通过，
+直到 CI 报出来才发现。
+
 `tools/export-public-snapshot.sh` 只允许从干净、已提交并通过公开策略审计的工作区导出新目录；它拒绝覆盖已有目录和包含符号链接的源码树。公开仓库的初始提交必须来自这个导出结果，不能复制 `.git` 或手工挑文件。
 
 GitHub 分支保护要求 `validate`、`jq16-compat` 和 `debian-standalone-e2e`。Debian 检查只运行固定 Debian 12 容器中的 standalone 启动、旧私有版接管和公开就绪验证，不申请 `NET_ADMIN`、创建 SSH 账户或运行任何已退役的 v5 落地测试。
