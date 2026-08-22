@@ -15170,6 +15170,15 @@ EOF
 
 run_standalone_internal_expire() {
   [[ $# -eq 0 ]] || return 64
+  # **必须先确定内核，再检查环境完不完整。** 下面那条检查里内核相关的三项由适配层
+  # 按 PROXY_KERNEL 给出，而这一刻管理配置还没有载入（它在 prepare_core 里），
+  # PROXY_KERNEL 仍是文件级默认值 sing-box——于是一台 mihomo 机器会被判成
+  # 「没装好」，到期任务每 15 分钟失败一次，**到期用户永远不会被自动停用**
+  # （公开 Issue #251）。失败的是一个 oneshot 服务，不产生任何界面提示，
+  # 所以它可以坏很久而没人发现。
+  # 与 resolve_deployment_kernel 注释里记的那次事故同类：必须显式确定内核，
+  # 不能依赖文件级默认值。
+  resolve_deployment_kernel || return 1
   recover_environment_transaction || return 1
   if ! standalone_environment_is_complete; then
     echo '当前环境尚未完成单机部署，不执行到期任务。'
