@@ -8891,37 +8891,17 @@ STATE_FILE="'"$resolve_state"'"'
     echo '已部署的 sing-box 机器必须仍按 sing-box 进行' >&2
     exit 1
   fi
-  # 尚未部署的机器才轮到测试用的选择方式。
+  # 干净机器一律装 mihomo，不给选择（公开 Issue #157 的 2f）。仅供测试的内核选择
+  # 开关已在公开 Issue #227 剥离，因此这里不再有「让干净机器装 sing-box」的路径：
+  # 上一条断言里的 PROXY_KERNEL=singbox 是从调用者继承来的脏值，必须被覆盖掉。
   rm -f -- "$resolve_conf"
-  if [[ "$( CONF_FILE="$resolve_conf"; PROXY_KERNEL=singbox; SB_DEPLOY_PROXY_KERNEL=mihomo
+  if [[ "$( CONF_FILE="$resolve_conf"; PROXY_KERNEL=singbox
             resolve_deployment_kernel >/dev/null 2>&1; printf '%s' "$PROXY_KERNEL" )" != mihomo ]]; then
-    echo '未部署的机器应接受测试用的内核选择' >&2
+    echo '干净机器必须装 mihomo，且不受调用者残留的 PROXY_KERNEL 影响' >&2
     exit 1
   fi
 )
 
-# 仅供测试的内核选择：只对尚未部署的机器生效，未知取值必须拒绝。
-(
-  select_conf="$work/kernel-select.conf"
-  rm -f -- "$select_conf"
-  if [[ "$( CONF_FILE="$select_conf"; SB_DEPLOY_PROXY_KERNEL=mihomo
-            apply_test_only_kernel_selection >/dev/null; printf '%s' "$PROXY_KERNEL" )" != mihomo ]]; then
-    echo '未部署的机器应接受测试用的内核选择' >&2
-    exit 1
-  fi
-  printf 'HANDSHAKE_PORT=443\n' > "$select_conf"
-  if [[ "$( CONF_FILE="$select_conf"; PROXY_KERNEL=singbox; SB_DEPLOY_PROXY_KERNEL=mihomo
-            apply_test_only_kernel_selection >/dev/null; printf '%s' "$PROXY_KERNEL" )" != singbox ]]; then
-    echo '已部署的机器不得被环境变量改掉内核' >&2
-    exit 1
-  fi
-  rm -f -- "$select_conf"
-  if ( CONF_FILE="$select_conf"; SB_DEPLOY_PROXY_KERNEL=nosuchkernel
-       apply_test_only_kernel_selection >/dev/null 2>&1 ); then
-    echo '未知的测试内核选择必须被拒绝' >&2
-    exit 1
-  fi
-)
 
 
 # ============================================================
@@ -9904,6 +9884,10 @@ https://example.com/b.json'
   # 三、**第二道回归护栏**：管理配置丢了、但机器上还有 sing-box 痕迹时，必须仍按
   # sing-box 处理——「安装或修复环境」的修复分支走的正是这条路，认成 mihomo 就会
   # 把一台 sing-box 机器修成另一个内核。
+  # 这一条同时承担了原先第四条「装 sing-box 时数据目录保持 /etc/sing-box」的断言：
+  # 那一条靠 SB_DEPLOY_PROXY_KERNEL 造场景，该开关已随 sing-box 线归档剥离
+  # （公开 Issue #227）；改用 singbox_deployment_present 造场景之后它与本条完全重复，
+  # 因此并入这里而不是留一份一模一样的副本。
   mkdir -p "$fresh_work/root/usr/local/bin"
   : > "$fresh_work/root/usr/local/bin/sing-box"
   read -r damaged_kernel damaged_dir < <(
@@ -9930,22 +9914,8 @@ https://example.com/b.json'
     printf '%s\n' "$PROXY_KERNEL")
   [[ "$empty_kernel" == mihomo ]] || { printf '干净机器应当装 mihomo，得到：%s\n' "$empty_kernel" >&2; exit 1; }
 
-  # 四、逃生口仍在，且用它装 sing-box 时保持老目录。
-  read -r hatch_kernel hatch_dir < <(
-    CONF_FILE="$fresh_work/does-not-exist.conf"
-    PROXY_KERNEL=mihomo
-    MANAGER_DATA_DIR=/etc/sing-box
-    resolve_manager_data_paths
-    # 这几个变量在真实运行里由文件级初始化给出；整份测试跑到这里时它们已经
-    # 被前面的用例改过，因此显式摆回默认值，否则断言看到的是别人留下的值。
-    STATE_FILE="$MANAGER_DATA_DIR/managed-users.json"
-    BACKUP_DIR="$MANAGER_DATA_DIR/backups"
-    SB_DEPLOY_PROXY_KERNEL=singbox resolve_deployment_kernel >/dev/null 2>&1
-    printf '%s %s\n' "$PROXY_KERNEL" "$MANAGER_DATA_DIR")
-  [[ "$hatch_kernel" == singbox ]] || { printf '逃生口应当还能装 sing-box，得到：%s\n' "$hatch_kernel" >&2; exit 1; }
-  [[ "$hatch_dir" == /etc/sing-box ]] || { printf '用逃生口装 sing-box 时目录应当保持老样子，得到：%s\n' "$hatch_dir" >&2; exit 1; }
 
-  # 五、新装机器的管理配置必须**写出** MANAGER_DATA_DIR：不写的话下一次载入
+  # 四、新装机器的管理配置必须**写出** MANAGER_DATA_DIR：不写的话下一次载入
   # 配置时文件级默认值会赢，机器会去一个空目录里找用户资料。
   # chown 打桩：测试以普通用户运行，而写管理配置的最后一步是 chown root:root。
   ( CONF_FILE="$fresh_work/written.conf"
@@ -9983,7 +9953,7 @@ https://example.com/b.json'
     exit 1
   fi
 
-  # 六、菜单：mihomo 机器上不出现「sing-box 版本管理」，sing-box 机器上照旧出现。
+  # 五、菜单：mihomo 机器上不出现「sing-box 版本管理」，sing-box 机器上照旧出现。
   singbox_menu="$( PROXY_KERNEL=singbox; UI_MENU_COUNT=0; UI_MENU_ACTIONS=()
     NO_COLOR=1 COLUMNS=60 ui_menu_items \
       deploy '部署与卸载' update '检测更新' \
