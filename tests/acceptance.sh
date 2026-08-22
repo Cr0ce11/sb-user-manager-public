@@ -25,6 +25,7 @@ SNAPSHOT=""
 SS_USER=""
 ANYTLS_USER=""
 SPLIT_NAME=""
+GEO_SPLIT_NAME=""
 SPLIT_RULE_SOURCE=""
 SPLIT_RULE_SOURCE_UPDATED=""
 SPLIT_RULE_BEHAVIOR=""
@@ -331,6 +332,15 @@ cleanup_live_objects() {
   if rule_preset_exists "${SPLIT_NAME}-rule"; then
     run_mutation '清理测试预置规则' cmd_rule_preset_remove "${SPLIT_NAME}-rule"
   fi
+  if [[ -n "$GEO_SPLIT_NAME" ]] && split_exists "$GEO_SPLIT_NAME"; then
+    run_mutation '清理 geo 类别测试分流' cmd_split_remove "$GEO_SPLIT_NAME"
+  fi
+  if outbound_preset_exists "${GEO_SPLIT_NAME}-exit"; then
+    run_mutation '清理 geo 测试预置出口' cmd_outbound_preset_remove "${GEO_SPLIT_NAME}-exit"
+  fi
+  if rule_preset_exists "${GEO_SPLIT_NAME}-rule"; then
+    run_mutation '清理 geo 测试预置规则' cmd_rule_preset_remove "${GEO_SPLIT_NAME}-rule"
+  fi
   for name in "$SS_USER" "$ANYTLS_USER" "$MERGE_TARGET_USER"; do
     [[ -n "$name" ]] || continue
     if user_exists "$name"; then
@@ -422,6 +432,82 @@ run_split_lifecycle() {
   fi
 }
 
+# ============================================================
+# geo 类别分流的生命周期（公开 Issue #270）
+# ============================================================
+# 分流的规则集来源有三种，上面那一组走的是网址／本机规则文件两种。第三种是
+# GeoSite／GeoIP 类别（公开 Issue #219）：它既没有网址也没有规则文件，状态里
+# 只有一份类别清单。
+#
+# **这一组存在的理由是一次真实事故。** 公开 Issue #265 那个缺陷让任何带 geo
+# 类别分流的机器，「服务与配置检查」的自动修复必定失败并整体回滚，而且不说
+# 原因；它从 v4.25.24 引入 geo 类别起活了五个版本没被发现，最后是正式服务器
+# 撞出来的——因为门禁与验收里根本没有这种形状的机器。
+#
+# 所以这一组的重点**不是「geo 分流能不能加」**（那一条在引入时已经验过），
+# 而是**加了之后，那些「改动现有部署」的流程还走不走得通**。核心断言就是
+# 中间那一步：带着一条 geo 分流跑一次一致性自动修复。
+GEO_SPLIT_CATEGORY="${SB_ACCEPTANCE_GEO_CATEGORY:-GEOSITE,cn}"
+
+run_geo_split_lifecycle() {
+  local upstream password geo_json runtime_config
+  [[ "$PROXY_KERNEL" == mihomo ]] || {
+    skip 'geo 类别分流生命周期' 'GeoSite／GeoIP 类别只支持 mihomo 部署'
+    return 0
+  }
+  geo_json="$(jq -cn --arg category "$GEO_SPLIT_CATEGORY" '[$category]')"
+  runtime_config="$(kernel_runtime_config_path)" || return 1
+  # 类别名由 mihomo 当场认。认不了通常是这台机器取不到 geo 数据——那是环境问题，
+  # 不是缺陷。**明确跳过并说清原因，不假装通过**：这一组的全部价值就在于它真的
+  # 跑过，悄悄放行等于把覆盖缺口又盖回去。
+  if ! validate_geo_categories_with_kernel "$geo_json" >/dev/null 2>&1; then
+    skip 'geo 类别分流生命周期' "mihomo 认不出类别 ${GEO_SPLIT_CATEGORY}（通常是取不到 geo 数据）"
+    return 0
+  fi
+  password="$(generate_ss_password 2022-blake3-aes-128-gcm)"
+  upstream="$(jq -cn --arg password "$password" '{protocol:"shadowsocks",server:"127.0.0.1",server_port:9,method:"2022-blake3-aes-128-gcm",password:$password}')"
+  state_add_outbound_preset "${GEO_SPLIT_NAME}-exit" "$upstream"
+  state_add_rule_preset "${GEO_SPLIT_NAME}-rule" "" "" "" "$geo_json"
+  run_mutation '增加 geo 类别分流' cmd_split_add "$GEO_SPLIT_NAME" "" user "$ANYTLS_USER" \
+    "$upstream" "${GEO_SPLIT_NAME}-out" "${GEO_SPLIT_NAME}-rule" "${GEO_SPLIT_NAME}-exit" "" "" "$geo_json"
+  verify_state_value 'geo 分流状态为启用' \
+    ".splits[] | select(.name == \"$GEO_SPLIT_NAME\") | .status" active || return 1
+  # 三种来源互斥：geo 那种**不该**留下网址或规则文件的键。
+  if jq -e --arg name "$GEO_SPLIT_NAME" --argjson geo "$geo_json" '
+      .splits[] | select(.name == $name and .rule_geo == $geo and (has("url")|not) and (has("rule_file")|not))
+    ' "$STATE_FILE" >/dev/null; then pass 'geo 分流只记类别清单，不留网址或规则文件'
+  else fail 'geo 分流只记类别清单，不留网址或规则文件'; return 1; fi
+  # 类别真的进了运行配置——只在状态里躺着不算数。
+  if grep -Fq "$GEO_SPLIT_CATEGORY" "$runtime_config"; then
+    pass 'geo 类别已写进运行配置'
+  else fail 'geo 类别已写进运行配置' "运行配置里找不到 ${GEO_SPLIT_CATEGORY}"; return 1; fi
+
+  # **这一步就是这一组的理由**（公开 Issue #265）：一致性自动修复动手之前会逐条
+  # 校验分流记录，那道校验此前只认网址与规则文件两种来源，于是带 geo 分流的机器
+  # 必定失败并整体回滚。
+  run_mutation '带 geo 分流时的一致性自动修复' repair_consistency
+  if audit_consistency > "$WORK/geo-audit.txt" 2>&1; then
+    pass '修复之后一致性检查通过'
+  else fail '修复之后一致性检查通过' "$(tail -n 3 "$WORK/geo-audit.txt" | tr '\n' ' ')"; return 1; fi
+  # 修复不许把这条分流改坏：类别清单与启用状态都要原样还在。
+  if jq -e --arg name "$GEO_SPLIT_NAME" --argjson geo "$geo_json" '
+      .splits[] | select(.name == $name and .status == "active" and .rule_geo == $geo)
+    ' "$STATE_FILE" >/dev/null; then pass '修复之后 geo 分流原样保留'
+  else fail '修复之后 geo 分流原样保留'; return 1; fi
+  if grep -Fq "$GEO_SPLIT_CATEGORY" "$runtime_config"; then
+    pass '修复之后运行配置里的类别仍在'
+  else fail '修复之后运行配置里的类别仍在'; return 1; fi
+
+  run_mutation '停用 geo 分流' cmd_split_disable "$GEO_SPLIT_NAME"
+  verify_state_value 'geo 分流状态为停用' \
+    ".splits[] | select(.name == \"$GEO_SPLIT_NAME\") | .status" disabled || return 1
+  run_mutation '重新启用 geo 分流' cmd_split_enable "$GEO_SPLIT_NAME"
+  # geo 分流一律清理干净，full 模式的迁移基线因此不受影响。
+  run_mutation '删除 geo 分流' cmd_split_remove "$GEO_SPLIT_NAME"
+  run_mutation '删除 geo 测试预置出口' cmd_outbound_preset_remove "${GEO_SPLIT_NAME}-exit"
+  run_mutation '删除 geo 测试预置规则' cmd_rule_preset_remove "${GEO_SPLIT_NAME}-rule"
+}
+
 expire_acceptance_user() {
   state_set_expiry "$1" "$2"
   cmd_expire
@@ -465,6 +551,7 @@ run_lifecycle() {
   SS_USER="accss${suffix}"
   ANYTLS_USER="accat${suffix}"
   SPLIT_NAME="accsp${suffix}"
+  GEO_SPLIT_NAME="accgeo${suffix}"
   sni="${SB_ACCEPTANCE_SNI:-www.microsoft.com}"
   validate_shadowtls_sni "$sni"
   LIVE_STARTED=true
@@ -625,6 +712,7 @@ run_lifecycle() {
   fi
 
   run_split_lifecycle
+  run_geo_split_lifecycle
 }
 
 run_full_migration() {
